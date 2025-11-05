@@ -1,0 +1,716 @@
+"""esm_cli.py
+
+This module is designed to read a FASTA file with headers in this form (example):
+    >ID=A8D0M1_ADE02 AC=A8D0M1 OXX=10515,129951,10509,10508
+    MALTCRLRFPVPGFRGRMHRRRGMAGHGLTGGMRRAHHRRRRASHRRMRGGILPLLIPLIA
+cleans and batches the target sequence below each header, runs an ESM-2 model to obtain **per-residue** 
+embeddings, and writes to a compressed NPZ file of **ID --> (L, D) array** or individual PT files containing 
+each residue-level embedding per protein sequence, plus a CSV metadata file. 
+The script also writes structured logs to stdout to help monitor progress and debug any errors.
+
+For sequences that fit within the model token limit (residues + 2 <= 1024), embeddings are comouted in 
+a single pass with full-sequence context. For longer sequences, overlapping windows are used and stitched 
+by averaging overlaps to produce a full-length (L, D) matrix the token limit are excluded from embedding 
+generation.  
+
+This script can be ran on its own, but it is intended for HPC use (e.g., Monsoon). 
+See shell script `generateembeddings.sh` or `generateembeddings_cpu.sh` for typical usage.
+
+Usage
+-----
+>>> # HPC usage with shell script
+>>> sbatch --export=ALL,IN_FASTA=/scratch/<NAUIDD>/<targets>.fasta generateembeddings.sh
+
+>>> # general example usage (illustrative)
+>>> python esm_cli.py --fasta-file <input.fasta> --model-name esm2_t33_650M_UR50D \ 
+                      --batch-size <n> --log-dir <dir> [--log-json] --out-dir <dir>
+"""
+import os
+import re
+import json
+import logging
+import time
+from logging.handlers import RotatingFileHandler
+import argparse
+from pathlib import Path
+from datetime import datetime
+from typing import Optional, Iterable, Iterator, List, Tuple
+import esm
+import torch
+import numpy as np
+import pandas as pd
+
+def setup_logger(log_dir: Path, log_level: str = "INFO", json_lines: bool = False) -> logging.Logger:
+    """
+    Creates and sets up a configured logger for this CLI.
+
+    Parameters
+    ----------
+        log_dir : Path
+            Directory where log files will be written.
+        log_level : str
+            Minimum level for logs. Default is "INFO".
+        json_lines : bool
+            When True, formats logs as a JSON object. Default is False (`logging` library default format).
+
+    Returns
+    -------
+        logging.Logger
+            Logger named `esm_cli` with a file handler and a stream handler attached.
+    """
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_path = log_dir / f"esm_cli_{datetime.now().strftime('%Y-%m-%d_T%H_%M_%S')}.log"
+
+    class JSONFormatter(logging.Formatter):
+        def format(self, record):
+            payload = {"timestamp": datetime.now().isoformat(), 
+                       "level": record.levelname, 
+                       "message": record.getMessage(), 
+                       "logger": record.name, 
+                       "where": f"{record.pathname}:{record.lineno}"}
+            
+            # add all detailed logs using "extra" kwargs
+            if hasattr(record, "extra") and isinstance(record.extra, dict):
+                payload.update(record.extra)
+            
+            return json.dumps(payload, ensure_ascii=False, separators=(",", ":"), indent=2)
+    
+    # create named logger and reset any inherited handlers to avoid duplication
+    logger = logging.getLogger("esm_cli")
+    logger.setLevel(getattr(logging, log_level.upper(), logging.INFO))
+    logger.handlers[:] = [] # avoid duplicate handlers
+
+    # choose formatter style
+    formatter = JSONFormatter() if json_lines else logging.Formatter("[%(asctime)s] %(levelname)s %(message)s")
+    stream_formatter = JSONFormatter() if json_lines else logging.Formatter("%(levelname)s %(message)s")
+
+    # add rotating file handlers, ~10 MB of storage
+    file_handler = RotatingFileHandler(log_path, maxBytes=10_000_000, backupCount=3)
+    file_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
+
+    stream_handler = logging.StreamHandler()
+    stream_handler.setFormatter(stream_formatter)
+    logger.addHandler(stream_handler)
+
+    # initial log
+    context = {"SLURM_JOB_ID": os.getenv("SLURM_JOB_ID"), 
+               "SLURM_JOB_NAME": os.getenv("SLURM_JOB_NAME"), 
+               "CUDA_VISIBLE_DEVICES": os.getenv("CUDA_VISIBLE_DEVICES")}
+    logger.info("logging_init", extra={"extra": context})
+    
+    return logger
+
+def read_fasta(fasta_path: str | Path) -> pd.DataFrame:
+    """
+    Parse a FASTA file with PV1-style headers into a pandas DataFrame.
+
+    Expected pattern (example):
+    >ID=A8D0M1_ADE02 AC=A8D0M1 OXX=10515,129951,10509,10508
+    MALTCRLRFPVPGFRGRMHRRRGMAGHGLTGGMRRAHHRRRRASHRRMRGGILPLLIPLIAAAIGAVPGIASVALQAQRH
+
+    Parameters
+    ----------
+        fasta_path : str or Path
+            Path to the FASTA file.
+
+    Returns
+    -------
+        pd.DataFrame
+            FASTA data parsed in to a pandas DataFrame object with columns ID, AC, OXX, and Sequence.
+
+    Raises
+    ------
+        ValueError
+            If a header line does not match the expected pattern of if a sequence line is seen before
+            any header.
+    """
+    header_pattern = re.compile(r"^>ID=([^\s]+)\s+AC=([^\s]+)\s+OXX=([^\s]+)\s*$")
+    rows = []
+    curr = None
+
+    # stream through the file and build rows
+    with open(fasta_path, "r", encoding="utf-8") as fasta:
+        for raw in fasta:
+            line = raw.strip()
+
+            # skip any empty lines
+            if not line:
+                continue
+
+            # get each fasta header + sequence
+            if line.startswith(">"):
+                if curr:
+                    curr["Sequence"] = "".join(curr["Sequence"])
+                    rows.append(curr)
+
+                # validate and extract fields from header
+                match_ = header_pattern.match(line)
+                if not match_:
+                    raise ValueError(f"Header does not match expected format: '{line}'")
+
+                curr = {"ID": match_.group(1), 
+                        "AC": match_.group(2), 
+                        "OXX": match_.group(3), 
+                        "Sequence": []} # sequence could be multiple lines
+            else:
+                # header must be seen before a sequence
+                if curr is None:
+                    raise ValueError("Found sequence before any header")
+                curr["Sequence"].append(line)
+
+    # add final record if applicable
+    if curr:
+        curr["Sequence"] = "".join(curr["Sequence"])
+        rows.append(curr)
+
+    return pd.DataFrame(rows, columns=["ID", "AC", "OXX", "Sequence"])
+
+def clean_seq(seq: str) -> str:
+    """
+    Normalize a protein sequence and drop any odd characters.
+
+    Parameters
+    ----------
+        seq : str
+            Raw sequence as a string.
+
+    Returns
+    -------
+        str
+            Cleaned sequence without any odd characters or whitespace.
+    """
+    seq = (seq or "").upper().strip()
+    allowed = set("ACDEFGHIKLMNPQRSTVWYBZXUO")
+    return "".join([aa for aa in seq if aa in allowed])
+
+def token_packed_batches(pairs: Iterable[Tuple[str, str]], 
+                         max_tokens: int, 
+                         max_tokens_per_seq: int = 1022) -> Iterator[List[Tuple[str, str]]]:
+    """
+    Yields batches of (id, seq) pairs such that the sum of per sequence token counts in each batch stays
+    under a token budget. This reduces padding and keeps the model efficiently filled when sequence lengths
+    vary. 
+
+    Parameters
+    ----------
+        pairs : Iterable[Tuple[str, str]]
+            Iterable of (id, seq) pairs. For best efficiency, ensure these are sorted by ascending sequence
+            length before calling.
+        max_tokens : int
+            Total token budget for one batch. 1022 multiplied by the batch size is a good choice for ESM-2.
+        max_tokens_per_seq : int
+            Maximum tokens used per sequence. Default is 1022.
+
+    Yields
+    ------
+        Iterator[List[Tuple[str, str]]]
+            An iterator of a list of (id, seq) pairs whose items combined token count is within the budget.
+    
+    Notes
+    -----
+    The token budget should reflect the model limit minus special tokens. For ESM2, the effective residue
+    budget is typically 1022 per sequence. When using windowed encoding for long sequences, this function 
+    still governs batching of the original full sequences.
+    """
+    batch = []
+    used = 0
+    for pid, seq in pairs:
+        # tokens we expect to use for this sequence
+        need = min(len(seq), max_tokens_per_seq)
+        
+        # if adding seq exceeds budget and batch not empty, yield current batch and start new one
+        if used and (used + need) > max_tokens:
+            yield batch
+            batch, used = [], 0
+        
+        # add to batch and update total
+        batch.append((pid, seq))
+        used += need
+
+    # flush out remaining items
+    if batch:
+        yield batch
+
+def compute_window_embedding(token: torch.Tensor, 
+                             model: torch.nn.Module, 
+                             layer: int, 
+                             device: str, 
+                             window_size: int = 1000, 
+                             stride: int = 900) -> torch.Tensor:
+    """
+    Compute per residue ESM representations for a long sequence using sliding windows.
+
+    Parameters
+    ----------
+        token : torch.Tensor
+            Tokenized sequence including CLS and EOS, shape 1 x T.
+        model : torch.nn.Module
+            ESM model in eval mode.
+        layer : int
+            Representation layer index to extract.
+        device : str
+            Device string `cpu` or `cuda`.
+        window_size : int
+            Number of residue tokens to include per window. Default is 1000.
+        stride : int
+            Step between window starts in residue tokens. Overlap equals `window_size` minus `stride`.
+            Default is 900.
+
+    Returns
+    -------
+        torch.Tensor
+        ------------
+            An array of shape (L, D) where L is the number of residues (excluding CLS and EOS), and D is
+            the embedding dimension for the chosen layer.
+    """
+    seq_len = token.size(1) - 2 # remove CLS and EOS tokens
+
+    if device.startswith("cuda"):
+        token = token.to(device, non_blocking=True)
+    cls_token = token[:, :1]
+    eos_token = token[:, -1:]
+
+    # determine embedding dimension (either simply or by running model)
+    D = getattr(model, "embed_dim", None)
+    if D is None:
+        with torch.inference_mode():
+            probe_end = min(window_size, seq_len)
+            probe_tokens = torch.cat([cls_token, token[:, 1:1 + probe_end], eos_token], dim=1)
+            if device.startswith("cuda"):
+                probe_tokens = probe_tokens.to(device, non_blocking=True)
+            probe_out = model(probe_tokens, repr_layers=[layer], return_contacts=False)
+            D = int(probe_out["representations"][layer].shape[-1])
+            del probe_out, probe_tokens
+
+    # account for sums of parallel counter of contributions per position
+    full = torch.zeros((seq_len, D), device="cpu")
+    counts = torch.zeros((seq_len,), device="cpu", dtype=torch.int32)
+
+    # start window position using the stride
+    start_positions = list(range(0, seq_len, stride))
+
+    # when GPUs are not available
+    if not device.startswith("cuda"):
+        with torch.inference_mode():
+            for start in start_positions:
+                # compute inclusive end index for residue span
+                end = min(start + window_size, seq_len)
+                window_len = end - start
+
+                # rebuild window with CLS and EOS tokens around slice
+                window_tokens = torch.cat(
+                    [cls_token, token[:, 1 + start:1 + end], eos_token], 
+                    dim=1)
+                output = model(window_tokens, repr_layers=[layer], return_contacts=False)
+                rep = output["representations"][layer][0, 1:1 + window_len]
+
+                # store segment and window slide count
+                full[start:end] += rep
+                counts[start:end] += 1
+
+                # clear from memory manually
+                del output, rep, window_tokens
+
+                # exit early once we covered tail of the sequence
+                if end == seq_len:
+                    break
+
+        counts = counts.clamp_min(1).unsqueeze(1).to(full.dtype)
+        return full / counts
+    
+    # when GPUs are available
+    autocast_ctx = torch.amp.autocast
+    with torch.inference_mode(), autocast_ctx("cuda", enabled=True):
+        starts_list = list(start_positions)
+        i = 0
+        while i < len(starts_list):
+            batch_starts = starts_list[i:i + 1]
+            windows = []
+            spans = []
+            for start in batch_starts:
+                # compute exclusive end index for residue span
+                end = min(start + window_size, seq_len)
+                # rebuild window with CLS and EOS tokens around slice
+                window_tokens = torch.cat([cls_token, token[:, 1 + start:1 + end], eos_token], dim=1).to(device, non_blocking=True)
+
+                # store window tokens and spans
+                windows.append(window_tokens)
+                spans.append((start, end))
+            batch_tokens = torch.cat(windows, dim=0)
+            # manually free list
+            del windows
+
+            output = model(batch_tokens, repr_layers=[layer], return_contacts=False)
+            result = output["representations"][layer]
+
+            # overlap-ad on device
+            for batch, (start, end) in enumerate(spans):
+                window_len = end - start
+                rep = result[batch, 1:1 + window_len].to("cpu", non_blocking=True)
+                full[start:end] += rep
+                counts[start:end] += 1
+
+            # manually free memory
+            del output, result, batch_tokens, spans
+            
+            # increment by windows per call
+            i += 1
+
+    return (full / counts.clamp_min(1).unsqueeze(1).to(full.dtype))
+    
+def esm_embeddings_from_fasta(fasta_df: pd.DataFrame, 
+                              id_col: str = "ID", 
+                              seq_col: str = "Sequence", 
+                              model_name: str = "esm2_t33_650M_UR50D", 
+                              max_tokens: int = 1022, 
+                              batch_size: int = 8,  
+                              save_mode: str = "pt", 
+                              per_seq_dir: Path | str = "esm2_per_seq", 
+                              npz_path: Path | str = "esm2_seq_embeddings.npz", 
+                              index_csv_path: Path | str = "esm2_seq_index.csv", 
+                              logger: Optional[logging.Logger] = None) -> Tuple[pd.DataFrame, List[str]]:
+    """
+    Generate per residue ESM embeddings for sequences in a DataFrame and write outputs.
+
+    Parameters
+    ----------
+        fasta_df : pandas.DataFrame
+            Must contain `id_col` and `seq_col` with valid sequences.
+        id_col : str
+            Column name for record IDs used as keys in the NPZ.
+        seq_col : str
+            Column name for sequences.
+        model_name : str
+            Name of the `esm.pretrained` model factory to call.
+        max_tokens : int
+            The maximum number of tokens in the model's context window excluding start 
+            and end tokens.
+        batch_size : int
+            Number of sequences processed together when possible.
+        save_mode : str
+            How to save the residue-level embeddings per protein sequence.
+            `pt` saves individual ID-named .pt files per protein sequence (memory efficient).
+            `npz` saves all embeddings to a .npz file at the end (computationally expensive).
+        per_seq_dir : str or Path
+            The directoyy to store .pt files to if `save_mode` is set to "pt".
+        npz_path : str or Path
+            Output NPZ mapping ID to NumPy array with shape L by D per sequence.
+        index_csv_path : str or Path
+            Output CSV with metadata about stored arrays.
+        logger : logging.Logger or None
+            Logger to use. If None, uses esm_cli logger.
+
+    Returns
+    -------
+        Tuple[pd.DataFrame, List[str]]
+            `(index_df, failed_seqs)` where `index_df` summarizes embeddings and `failed_seqs`
+            lists ids that could not be processed.
+    """
+    # set up logger and start timer
+    logger = logger or logging.getLogger("esm_cli")
+    index_records = []
+    t0 = time.perf_counter()
+
+    # set up directories to save results
+    os.makedirs(os.path.dirname(npz_path) or ".", exist_ok=True)
+    if save_mode == "pt":
+        per_seq_dir.mkdir(parents=True, exist_ok=True)
+    
+    # clean sequences
+    df = fasta_df[[id_col, seq_col]].dropna().copy()
+    df[seq_col] = df[seq_col].map(clean_seq)
+    df = df[df[seq_col].str.len() > 0].reset_index(drop=True)
+    logger.info("embedding_start", extra={"extra": {"total_sequences": len(df)}})
+
+    # load ESM embedding model
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model, alphabet = getattr(esm.pretrained, model_name)()
+    model.eval().to(device)
+    batch_converter = alphabet.get_batch_converter()
+
+    # choose representation layer based on model size
+    layer = 33 if "t33" in model_name else 30 if "t30" in model_name else 12 if "t12" in model_name else 6
+    logger.info("model_loaded", extra={"extra": {
+        "device": device, 
+        "layer": layer, 
+        "max_tokens": max_tokens, 
+        "model_name": model_name
+    }})
+
+    # prepare batches
+    ids = df[id_col].tolist()
+    seqs = df[seq_col].tolist()
+    seq_pairs = list(zip(ids, seqs))
+
+    seq_embeddings = {}
+    failed_seqs = []
+
+    # process in batches
+    total = len(seq_pairs)
+    done = 0
+    for batch in token_packed_batches(seq_pairs, max_tokens=(max_tokens * batch_size)):
+        b_start = time.perf_counter()
+
+        # convert batch of id - seq pairs into model tokens
+        data = [(id, seq) for id, seq in batch]
+        _labels, strings, tokens = batch_converter(data)
+
+        # compute token lengths and determine which exceed model window
+        token_lens = [len(s) for s in strings]
+        short_idxs = [i for i, len_ in enumerate(token_lens) if len_ + 2 <= max_tokens]
+        long_idxs = [i for i in range(len(batch)) if i not in short_idxs]
+
+        logger.info("batch_start", extra={"extra": {
+            "batch_size": len(batch), 
+            "num_short": len(short_idxs), 
+            "num_longs": len(long_idxs)
+        }})
+        with torch.no_grad():
+            # handle short sequences first
+            if short_idxs:
+                batch_tokens = tokens[short_idxs].to(device)
+                output = model(batch_tokens, repr_layers=[layer], return_contacts=False)
+                reprs = output["representations"][layer]
+
+                # for each item in the short slice, keep per-residue (L, D) embeddings
+                for j, batch_idx in enumerate(short_idxs):
+                    len_ = token_lens[batch_idx]
+                    per_residue = reprs[j, 1:1 + len_] # L by D
+                    # per-residue embeddings
+                    res_vec = per_residue.cpu().numpy().astype(np.float32)
+                    seq_id = batch[batch_idx][0]
+
+                    # save as .pt per sequence or to .npz for full dataset 
+                    if save_mode == "pt":
+                        torch.save(torch.from_numpy(res_vec), per_seq_dir / f"{seq_id}.pt")
+                    else:
+                        seq_embeddings[seq_id] = res_vec
+
+                    # save logs per-residue embeddings for short sequences
+                    index_records.append({"id": seq_id, 
+                                          "length": int(res_vec.shape[0]),       # L
+                                          "embed_dim": int(res_vec.shape[1]),    # D
+                                          "original_seq_len": int(len_),         # entire sequence length
+                                          "handle": "short", 
+                                          "model": model_name, 
+                                          "storage": save_mode, 
+                                          "path": str(per_seq_dir / f"{seq_id}.pt" 
+                                                      if save_mode == "pt" else str(npz_path))})
+
+            # handle long sequences
+            for batch_idx in long_idxs:
+                protein_id, _protein_seq = batch[batch_idx]
+                try:
+                    single_token = tokens[batch_idx:batch_idx + 1]
+                    # default uses sliding window to cover entirety of long sequence
+                    res_vec = compute_window_embedding(single_token, model, layer, device).cpu().numpy().astype(np.float32)
+
+                    # save logs per-residue embeddings for sliding window long sequences
+                    index_records.append({"id": protein_id, 
+                                            "length": int(res_vec.shape[0]), 
+                                            "embed_dim": int(res_vec.shape[1]), 
+                                            "original_seq_len": len(_protein_seq), 
+                                            "handle": "long", 
+                                            "model": model_name, 
+                                            "storage": save_mode, 
+                                            "path": str(per_seq_dir / f"{protein_id}.pt" 
+                                                    if save_mode == "pt" else str(npz_path))})
+                    # save as .pt per sequence or to .npz for full dataset 
+                    if save_mode == "pt":
+                        torch.save(torch.from_numpy(res_vec), per_seq_dir / f"{protein_id}.pt")
+                    else:
+                        seq_embeddings[protein_id] = res_vec
+                except Exception as e:
+                    logger.error("sequence_failed", extra={"extra": {
+                        "id": protein_id, "error": repr(e)
+                    }})
+                    failed_seqs.append(protein_id)
+
+        # make regular progress updates
+        done += len(batch)
+        logger.info("batch_done", extra={"extra": {
+            "done": done, 
+            "total": total, 
+            "percent": round(100.0 * done / total, 2), 
+            "batch_duration_s": round(time.perf_counter() - b_start, 3)
+        }})
+
+    # save results to npz if applicable
+    if save_mode == "npz":
+        # save temp file incase of program failure before overwrite
+        temp_npz = str(npz_path) + ".tmp"
+        with open(temp_npz, "wb") as temp:
+            np.savez_compressed(temp, **seq_embeddings)
+            temp.flush()
+            os.fsync(temp.fileno()) # ensure bytes reach disk
+        os.replace(temp_npz, npz_path)
+
+    # metadata to describe embeddings
+    index_df = pd.DataFrame(index_records, columns=[
+        "id", "length", "embed_dim", "original_seq_len", "handle", "model"
+    ])
+    if save_mode == "npz":
+        index_df["file_path"] = str(Path(npz_path).resolve())
+    else:
+        base = Path(per_seq_dir).resolve()
+        index_df["file_path"] = index_df["id"].astype(str).map(lambda s: str(base / f"{s}.pt"))
+    index_df.to_csv(index_csv_path, index=False)
+
+    # summarize in log
+    elapsed = time.perf_counter() - t0
+    ok_count = len(index_records) if save_mode == "pt" else len(seq_embeddings)
+    by_handle = index_df["handle"].value_counts().to_dict()
+    logger.info("embedding_done", extra={"extra": {
+        "ok": ok_count, 
+        "failed": len(failed_seqs), 
+        "handled_short": int(by_handle.get("short", 0)), 
+        "handled_long": int(by_handle.get("long", 0)), 
+        "total_duration_s": round(elapsed, 3), 
+        "artifacts_path": str(os.path.abspath(npz_path)) if save_mode == "npz" else str(os.path.abspath(per_seq_dir)), 
+        "index_csv_path": str(os.path.abspath(index_csv_path))
+    }})
+
+    return index_df, failed_seqs
+
+def main() -> None:
+    """
+    Parse CLI arguments, set up logging, run embedding generation script, and save results.
+    """
+    parser = argparse.ArgumentParser(description="Make ESM-2 embeddings from PV1 targets fasta file.")
+    parser.add_argument("--log-dir", 
+                        action="store", 
+                        dest="log_dir", 
+                        type=Path, 
+                        default=Path("logs"), 
+                        help="Directory for log files.")
+    parser.add_argument("--log-level", 
+                        action="store", 
+                        dest="log_level", 
+                        type=str, 
+                        default="INFO", 
+                        choices=["DEBUG", "INFO", "WARNING", "ERROR"], 
+                        help="Logging level choice.")
+    parser.add_argument("--log-json", 
+                        action="store_true", 
+                        dest="log_json", 
+                        default=False, 
+                        help="Emit logs as JSON lines for simple parsing.")
+    parser.add_argument("--save-mode", 
+                        action="store", 
+                        dest="save_mode", 
+                        type=str, 
+                        choices=["pt", "npz"], 
+                        default="npz", 
+                        help="The pt option streams one file per sequence, npz saves a single archive at the end.")
+    parser.add_argument("--per-seq-dir", 
+                        action="store", 
+                        dest="per_seq_dir", 
+                        type=Path, 
+                        default=Path(f"artifacts/pts"), 
+                        help="Directory for individual .pt files when save mode is set to 'pt'.")
+    parser.add_argument("--npz-path", 
+                        action="store", 
+                        dest="npz_path", 
+                        type=Path, 
+                        default=Path(f"artifacts/esm_seq_embs_{datetime.now().strftime('%Y-%m-%d_T%H_%M_%S')}.npz"), 
+                        help="File path to NumPy ZIP file containing embeddings.")
+    parser.add_argument("--index-csv-path", 
+                        action="store", 
+                        dest="idx_csv_path", 
+                        type=Path, 
+                        default=Path(f"artifacts/esm_seq_idx_{datetime.now().strftime('%Y-%m-%d_T%H_%M_%S')}.csv"), 
+                        help="File path to CSV file containing indices for ESM embeddings.")
+    parser.add_argument("--out-dir", 
+                        action="store", 
+                        dest="out_dir", 
+                        type=Path, 
+                        required=True, 
+                        help="Output directory for all generated files.")
+    parser.add_argument("-f", "--fasta-file", 
+                        action="store", 
+                        dest="fasta_file", 
+                        type=Path, 
+                        required=True, 
+                        help="Fasta file containing antigens")
+    parser.add_argument("-i", "--id-column", 
+                        action="store", 
+                        dest="id_col", 
+                        type=str, 
+                        default="ID", 
+                        help="Name of ID column.")
+    parser.add_argument("-s", "--seq-column", 
+                        action="store", 
+                        dest="seq_col", 
+                        type=str, 
+                        default="Sequence", 
+                        help="Name of sequence column.")
+    parser.add_argument("-m", "--model-name", 
+                        action="store", 
+                        dest="model_name", 
+                        type=str, 
+                        default="esm2_t33_650M_UR50D", 
+                        help="ESM model name to use to generate target embeddings.")
+    parser.add_argument("-t", "--max-tokens", 
+                        action="store", 
+                        dest="max_tokens", 
+                        type=int, 
+                        default=1022, 
+                        help="Size of context window for ESM model.")
+    parser.add_argument("-b", "--batch-size", 
+                        action="store", 
+                        dest="batch_size", 
+                        type=int, 
+                        default=8, 
+                        help="Batch size for processing targets into ESM embeddings.")
+    
+    args = parser.parse_args()
+    out_dir = args.out_dir
+    logger = setup_logger(out_dir / args.log_dir, 
+                          log_level=args.log_level, 
+                          json_lines=args.log_json)
+
+    # read input fasta file and sort by sequence length
+    fasta_df = read_fasta(args.fasta_file)
+    fasta_df["len"] = fasta_df[args.seq_col].str.len()
+    fasta_df = fasta_df.sort_values("len").reset_index(drop=True)
+
+    # parse out command line arguments
+    model_name = args.model_name
+    max_tokens = args.max_tokens
+    batch_size = args.batch_size
+    save_mode = args.save_mode
+    per_seq_dir = args.per_seq_dir
+    npz_path = args.npz_path
+    idx_csv_path = args.idx_csv_path
+    logger.info("run_start", 
+                extra={"extra": {
+                    "model_name": model_name, 
+                    "max_tokens": max_tokens, 
+                    "batch_size": batch_size,  
+                    "output_path": str(os.path.abspath(out_dir)), 
+                    "device": "cuda" if torch.cuda.is_available() else "cpu", 
+                    "torch_version": torch.__version__, 
+                    "esm_version": esm.__version__, 
+                    "n_sequences": len(fasta_df)
+                }})
+
+
+    index_df, failed_seqs = esm_embeddings_from_fasta(fasta_df, 
+                                                      id_col=args.id_col, 
+                                                      seq_col=args.seq_col, 
+                                                      model_name=model_name, 
+                                                      max_tokens=max_tokens, 
+                                                      batch_size=batch_size, 
+                                                      save_mode=save_mode, 
+                                                      per_seq_dir=out_dir/per_seq_dir, 
+                                                      npz_path=out_dir/npz_path, 
+                                                      index_csv_path=out_dir/idx_csv_path, 
+                                                      logger=logger)
+    logger.info("run_end", extra={"extra": {
+        "failed_count": len(failed_seqs), 
+        "index_rows": len(index_df)
+    }})
+                    
+if __name__ == "__main__":
+    main()

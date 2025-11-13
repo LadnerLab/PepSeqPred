@@ -4,20 +4,18 @@ import argparse
 from pathlib import Path
 import pandas as pd
 import logging
-from logging.handlers import RotatingFileHandler
+import time
 from datetime import datetime
 from read import read_fasta, read_metadata, read_zscores
 from process import merge_fasta_metadata, merge_zscores_metadata, apply_z_threshold
 from typing import Optional
 
-def setup_logger(log_dir: Path, log_level: str = "INFO", json_lines: bool = False) -> logging.Logger:
+def setup_logger(log_level: str = "INFO", json_lines: bool = False) -> logging.Logger:
     """
     Creates and sets up a configured logger for this CLI.
 
     Parameters
     ----------
-        log_dir : Path
-            Directory where log files will be written.
         log_level : str
             Minimum level for logs. Default is "INFO".
         json_lines : bool
@@ -26,11 +24,8 @@ def setup_logger(log_dir: Path, log_level: str = "INFO", json_lines: bool = Fals
     Returns
     -------
         logging.Logger
-            Logger named `esm_cli` with a file handler and a stream handler attached.
+            Logger named `preprocess_cli` with a stream handler attached.
     """
-    log_dir.mkdir(parents=True, exist_ok=True)
-    log_path = log_dir / f"preprocess_cli_{datetime.now().strftime('%Y-%m-%d_T%H_%M_%S')}.log"
-
     class JSONFormatter(logging.Formatter):
         def format(self, record):
             payload = {"timestamp": datetime.now().isoformat(), 
@@ -53,11 +48,6 @@ def setup_logger(log_dir: Path, log_level: str = "INFO", json_lines: bool = Fals
     # choose formatter style
     formatter = JSONFormatter() if json_lines else logging.Formatter("[%(asctime)s] %(levelname)s %(message)s")
     stream_formatter = JSONFormatter() if json_lines else logging.Formatter("%(levelname)s %(message)s")
-
-    # add rotating file handlers, ~10 MB of storage
-    file_handler = RotatingFileHandler(log_path, maxBytes=10_000_000, backupCount=3)
-    file_handler.setFormatter(formatter)
-    logger.addHandler(file_handler)
 
     stream_handler = logging.StreamHandler()
     stream_handler.setFormatter(stream_formatter)
@@ -123,21 +113,48 @@ def preprocess(meta_path: Path | str,
         epitope location training/predictions. Optionally, saves DataFrame to a TSV file if `save_path` argument
         is passed to function.
     """
+    t0 = time.perf_counter()
     meta_df = read_metadata(meta_path, id_col=fname_col)
     fasta_df = read_fasta(fasta_path, full_name=True)
     z_df = read_zscores(z_path, meta_id_col=code_col)
+    logger.info("read_files", 
+                extra={"extra": {
+                    "meta_size": len(meta_df), 
+                    "fasta_size": len(fasta_df), 
+                    "z_size": len(z_df), 
+                    "read_duration_s": round(time.perf_counter() - t0, 3)
+                }})
 
+    t1 = time.perf_counter()
     fasta_meta_df = merge_fasta_metadata(fasta_df, meta_df, 
                                          id_col=fname_col, seq_col=seq_col, out_col=protein_col)
+    logger.info("merged_fasta_and_meta", 
+                extra={"extra": {
+                    "merged_size": len(fasta_meta_df), 
+                    "merged_on": fname_col, 
+                    "merge1_duration_s": round(time.perf_counter() - t1, 3)
+                }})
     
+    t2 = time.perf_counter()
     z_df_targets = apply_z_threshold(z_df, 
                                      is_epitope_z_min=is_epitope_z_min, 
                                      is_epitope_min_subjects=is_epitope_min_subjects, 
                                      not_epitope_z_max=not_epitope_z_max, 
                                      not_epitope_max_subjects=not_epitope_max_subjects, 
                                      prefix=prefix)
+    logger.info("applied_z_score_thresh", 
+                extra={"extra": {
+                    "z_one_hot_encoding_duration_s": round(time.perf_counter() - t2, 3)
+                }})
     
+    t3 = time.perf_counter()
     all_df = merge_zscores_metadata(z_df_targets, fasta_meta_df, id_col=code_col, save_path=save_path)
+    logger.info("merged_z_and_meta", 
+                extra={"extra": {
+                    "merged_size": len(all_df), 
+                    "merged_on": code_col, 
+                    "merge2_duration_s": round(time.perf_counter() - t3, 3)
+                }})
 
     return all_df
 
@@ -145,6 +162,7 @@ def main() -> None:
     """
     Parse CLI arguments, set up logging, run data preprocessing script, and save results.
     """
+    t0 = time.perf_counter()
     parser = argparse.ArgumentParser(description="Preprocess and label model input data from PV1 metadata, targets fasta file, and z-score reactivity datasets.")
     parser.add_argument("meta_file", 
                         type=Path, 
@@ -198,7 +216,7 @@ def main() -> None:
                         help="Maximum z-score required for peptide to NOT contain epitopes.")
     parser.add_argument("--not-epi-max-subs", 
                         action="store", 
-                        dest="is_epi_max_subs", 
+                        dest="not_epi_max_subs", 
                         type=int, 
                         default=None, 
                         help="Maximum # of subjects required to be at or below maximum z-score for peptide to NOT contain epitopes. Default is 'None' which means every column is used to disqualify a peptide from containing epitopes.")
@@ -215,6 +233,7 @@ def main() -> None:
                         help="Store results in a .tsv output file to be used in model training.")
     
     args = parser.parse_args()
+    logger = setup_logger(json_lines=True)
 
     if args.save_path:
         if args.is_epi_max_subs is None:
@@ -224,6 +243,19 @@ def main() -> None:
     else:
         save_path = None
 
+    is_epitope_z_min = args.is_epi_z_min, 
+    is_epitope_min_subjects = args.is_epi_min_subs, 
+    not_epitope_z_max = args.not_epi_z_max, 
+    not_epitope_max_subjects = args.not_epi_max_subs, 
+    logger.info("run_start", 
+                extra={"extra": {
+                    "is_epi_z_min": is_epitope_z_min, 
+                    "is_epi_min_subs": is_epitope_min_subjects, 
+                    "not_epi_z_max": not_epitope_z_max, 
+                    "not_epi_max_subs": not_epitope_max_subjects, 
+                    "save_path": save_path
+                }})
+
     full_df = preprocess(args.meta_file, 
                          args.fasta_file, 
                          args.z_file, 
@@ -231,15 +263,19 @@ def main() -> None:
                          code_col=args.code_col, 
                          seq_col=args.seq_col, 
                          protein_col=args.protein_col, 
-                         is_epitope_z_min=args.is_epi_z_min, 
-                         is_epitope_min_subjects=args.is_epi_min_subs, 
-                         not_epitope_z_max=args.not_epi_z_max, 
-                         not_epitope_max_subjects=args.is_epi_max_subs, 
+                         is_epitope_z_min=is_epitope_z_min, 
+                         is_epitope_min_subjects=is_epitope_min_subjects, 
+                         not_epitope_z_max=not_epitope_z_max, 
+                         not_epitope_max_subjects=not_epitope_max_subjects, 
                          prefix=args.subject_prefix, 
                          save_path=save_path)
     
-    print("Preprocessing done...\n")
-    print(full_df.head())
+    logger.info("preprocessing_done", 
+                extra={"extra": {
+                    "dataframe_size": len(full_df), 
+                    "output_file_path": save_path, 
+                    "total_duration_s": round(time.perf_counter() - t0, 3)
+                }})
 
 if __name__ == "__main__":
     main()

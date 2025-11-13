@@ -8,6 +8,27 @@ def merge_fasta_metadata(fasta_df: pd.DataFrame,
                          id_col: str = "FullName", 
                          seq_col: str = "Sequence", 
                          out_col: str = "Protein") -> pd.DataFrame:
+    """
+    Performs a left merge using FASTA and metadata DataFrames on the ID column.
+
+    Parameters
+    ----------
+        fasta_df : pd.DataFrame
+            DataFrame containing an ID column and protein sequences.
+        meta_df : pd.DataFrame
+            DataFrame containing populated metadata columns for PV1 style peptides.
+        id_col : str
+            The column to merge the DataFrame's on.
+        seq_col : str
+            Name of protein sequence column in FASTA DataFrame.
+        out_col : str
+            Name of the protein sequence column to be used in the final output DataFrame.
+    
+    Returns
+    -------
+        pd.DataFrame
+            The DataFrame left merged the ID column name.
+    """
     merged = meta_df.merge(fasta_df[[id_col, seq_col]], on=id_col, how="left", validate="m:1")
     merged[out_col] = merged[seq_col]
     merged.drop(columns=[seq_col], inplace=True)
@@ -18,7 +39,28 @@ def merge_zscores_metadata(z_df: pd.DataFrame,
                            meta_df: pd.DataFrame, 
                            id_col: str = "CodeName", 
                            target_cols: List[str] = ["Def epitope", "Uncertain", "Not epitope"], 
-                           save_path: Optional[Path | str] = None):
+                           save_path: Optional[Path | str] = None) -> pd.DataFrame:
+    """
+    Performs a left merge using the z-score reactivity and metadata DataFrames on the ID column.
+
+    Parameters
+    ----------
+        z_df : pd.DataFrame
+            DataFrame containing the z-score reactivity data.
+        meta_df : pd.DataFrame
+            DataFrame containing populated metadata columns for PV1 style peptides.
+        id_col : str
+            The column to merge the DataFrame's on.
+        target_cols : List[str]
+            The names of the target columns to be added to the output DataFrame.
+        save_path : Path or str or None
+            An optional path to save the merged output DataFrame to a TSV file.
+
+    Returns
+    -------
+        pd.DataFrame
+            The DataFrame left merged on the ID column name.
+    """
     merged = meta_df.merge(z_df[[id_col, *target_cols]], on=id_col, how="left")
 
     if save_path:
@@ -32,6 +74,34 @@ def apply_z_threshold(z_df: pd.DataFrame,
                       not_epitope_z_max: float = 10.0, 
                       not_epitope_max_subjects: Optional[int] = None, 
                       prefix: str = "VW_") -> pd.DataFrame:
+    """
+    Adds three new one-hot encoded columns to the z-score reactivity DataFrame to classify each row as 
+    definitely containing an epitope, uncertain about containing an epitope, or does not contain any epitopes.
+
+    Parameters
+    ----------
+        z_df : pd.DataFrame
+            DataFrame containing the z-score reactivity data.
+        is_epitope_z_min : float
+            The minimum z-score to be used to determine if a peptide could contain an epitope.
+        is_epitope_min_subjects : int
+            The minimum number of subjects required to be greater than or equal to `is_epitope_z_min`
+            in order for the row to be classified as an epitope.
+        not_epitope_z_max : float
+            The maximum z-score to be used to determine if a peptide does not contain an epitope.
+        not_epitope_max_subjects : int or None
+            The maximum number of subjects required to be less than `not_epitope_z_max` in order for the 
+            row to be classified as not an epitope. Default behavior uses every subject column.
+        prefix : str
+            The prefix of subject column names. For example, if subject columns are named "VW_010", the prefix
+            would be "VW_".
+
+    Returns
+    -------
+        pd.DataFrame
+            The z-score reactivity DataFrame with columns "Def epitope", "Uncertain", and "Not epitope" 
+            appended and one-hot encoded.
+    """
     # assuming df passed in full
     subject_cols = [col for col in z_df.columns if col.startswith(prefix)]
 

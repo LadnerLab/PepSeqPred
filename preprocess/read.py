@@ -3,6 +3,33 @@ from pathlib import Path
 import pandas as pd
 
 def read_fasta(fasta_path: Path | str, full_name: bool = False) -> pd.DataFrame:
+    """
+    Parses a FASTA file with PV1-style headers into a pandas DataFrame.
+
+    Expected pattern (example):
+    >ID=A8D0M1_ADE02 AC=A8D0M1 OXX=10515,129951,10509,10508
+    MALTCRLRFPVPGFRGRMHRRRGMAGHGLTGGMRRAHHRRRRASHRRMRGGILPLLIPLIAAAIGAVPGIASVALQAQRH
+
+    Parameters
+    ----------
+        fasta_path : str or Path
+            Path to the FASTA file.
+        full_name : bool
+            If set to `True`, the header is parsed as one string into one column. Default behavior (`False`)
+            parses each part of the header into individual columns ID, AC, and OXX.
+
+    Returns
+    -------
+        pd.DataFrame
+            FASTA data parsed in to a pandas DataFrame object with columns FullName and Sequence if 
+            `full_name=False` or ID, AC, OXX if `full_name=True`.
+
+    Raises
+    ------
+        ValueError
+            If a header line does not match the expected pattern of if a sequence line is seen before
+            any header.
+    """
     header_pattern = re.compile(r"^>ID=([^\s]+)\s+AC=([^\s]+)\s+OXX=([^\s]+)\s*$")
     rows = []
     curr = None
@@ -50,6 +77,32 @@ def read_metadata(meta_path: Path | str,
                   category: str = "Category", 
                   peptide_start_idx: str = "AlignStart", 
                   peptide_end_idx: str = "AlignStop") -> pd.DataFrame:
+    """
+    Parses a metadata TSV file with PV1-style headers into a pandas DataFrame.
+
+    Expected columns:
+    CodeName, Category, SpeciesID, Species, Protein, AlignStart, AlignStop, FullName, 
+    Peptide, and Encoding.
+
+    Parameters
+    ----------
+        meta_path: Path or str
+            Path to metadata file.
+        id_col : str
+            Column name used to get full names of peptides.
+        category : str
+            Column used to determine category. We only care about SetCover (peptides we already have data for).
+        peptide_start_idx : 
+            Name of column to store the peptide start index within the overall protein sequence.
+        peptide_end_idx : str
+            Name of column to store the peptide stop index within the overall protein sequence.
+
+    Returns
+    -------
+        pd.DataFrame
+            Metadata file parsed into a DataFrame with populated AlignStart and AlignStop columns, and 
+            indices removed from the FullName column.
+    """
     meta_df = pd.read_csv(meta_path, sep="\t", dtype=str)
     meta_df = meta_df[meta_df[category] == "SetCover"]
 
@@ -74,6 +127,26 @@ def read_metadata(meta_path: Path | str,
 def read_zscores(z_path: Path | str, 
                  z_id_col: str = "Sequence name", 
                  meta_id_col: str = "CodeName") -> pd.DataFrame:
+    """
+    Parses a z-score reactivity TSV file with one ID column and 1 or more subject columns.
+
+    Expected columns:
+    Sequence name, VW_001, VW_002, ..., VW_400.
+
+    Parameters
+    ----------
+        z_path: Path or str
+            Path to metadata file.
+        z_id_col : str
+            Column name used to get ID codename of peptides.
+        meta_id_col : str
+            Column name we map `z_id_col` to in order to maintain same IDs across DataFrames.
+
+    Returns
+    -------
+        pd.DataFrame
+            Z-score reactivity file parsed into a DataFrame with ID column name changed to match metadata file.
+    """
     z_df = pd.read_csv(z_path, sep="\t")
     z_df.rename(columns={z_id_col: meta_id_col}, inplace=True)
 

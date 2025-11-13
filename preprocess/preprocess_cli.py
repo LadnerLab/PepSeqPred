@@ -1,9 +1,69 @@
+import os
+import json
 import argparse
 from pathlib import Path
 import pandas as pd
+import logging
+from logging.handlers import RotatingFileHandler
+from datetime import datetime
 from read import read_fasta, read_metadata, read_zscores
 from process import merge_fasta_metadata, merge_zscores_metadata, apply_z_threshold
 from typing import Optional
+
+def setup_logger(log_dir: Path, log_level: str = "INFO", json_lines: bool = False) -> logging.Logger:
+    """
+    Creates and sets up a configured logger for this CLI.
+
+    Parameters
+    ----------
+        log_dir : Path
+            Directory where log files will be written.
+        log_level : str
+            Minimum level for logs. Default is "INFO".
+        json_lines : bool
+            When True, formats logs as a JSON object. Default is False (`logging` library default format).
+
+    Returns
+    -------
+        logging.Logger
+            Logger named `esm_cli` with a file handler and a stream handler attached.
+    """
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_path = log_dir / f"preprocess_cli_{datetime.now().strftime('%Y-%m-%d_T%H_%M_%S')}.log"
+
+    class JSONFormatter(logging.Formatter):
+        def format(self, record):
+            payload = {"timestamp": datetime.now().isoformat(), 
+                       "level": record.levelname, 
+                       "message": record.getMessage(), 
+                       "logger": record.name, 
+                       "where": f"{record.pathname}:{record.lineno}"}
+            
+            # add all detailed logs using "extra" kwargs
+            if hasattr(record, "extra") and isinstance(record.extra, dict):
+                payload.update(record.extra)
+            
+            return json.dumps(payload, ensure_ascii=False, separators=(",", ":"), indent=2)
+    
+    # create named logger and reset any inherited handlers to avoid duplication
+    logger = logging.getLogger("preprocess_cli")
+    logger.setLevel(getattr(logging, log_level.upper(), logging.INFO))
+    logger.handlers[:] = [] # avoid duplicate handlers
+
+    # choose formatter style
+    formatter = JSONFormatter() if json_lines else logging.Formatter("[%(asctime)s] %(levelname)s %(message)s")
+    stream_formatter = JSONFormatter() if json_lines else logging.Formatter("%(levelname)s %(message)s")
+
+    # add rotating file handlers, ~10 MB of storage
+    file_handler = RotatingFileHandler(log_path, maxBytes=10_000_000, backupCount=3)
+    file_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
+
+    stream_handler = logging.StreamHandler()
+    stream_handler.setFormatter(stream_formatter)
+    logger.addHandler(stream_handler)
+    
+    return logger
 
 def preprocess(meta_path: Path | str, 
                fasta_path: Path | str, 
@@ -17,7 +77,52 @@ def preprocess(meta_path: Path | str,
                not_epitope_z_max: float = 10.0, 
                not_epitope_max_subjects: Optional[int] = None, 
                prefix: str = "VW_", 
-               save_path: Optional[str | Path] = None) -> pd.DataFrame:
+               save_path: Optional[str | Path] = None, 
+               logger: Optional[logging.Logger] = None) -> pd.DataFrame:
+    """
+    Runs the entire data preprocessing step for ESM-2 embedding generation and machine learning epitope 
+    predictions.
+
+    Parameters
+    ----------
+        meta_path: Path or str
+            Path to metadata file.
+        fasta_path : str or Path
+            Path to the FASTA file.
+        z_path: Path or str
+            Path to metadata file.
+        fname_col : str
+            Column name used to get full names of peptides.
+        code_col : str
+            Code name column for IDing peptides across files.
+        seq_col : str
+            Name of protein sequence column in FASTA DataFrame.
+        protein_col : str
+            Name of the protein sequence column to be used in the final output DataFrame.
+        is_epitope_z_min : float
+            The minimum z-score to be used to determine if a peptide could contain an epitope.
+        is_epitope_min_subjects : int
+            The minimum number of subjects required to be greater than or equal to `is_epitope_z_min`
+            in order for the row to be classified as an epitope.
+        not_epitope_z_max : float
+            The maximum z-score to be used to determine if a peptide does not contain an epitope.
+        not_epitope_max_subjects : int or None
+            The maximum number of subjects required to be less than `not_epitope_z_max` in order for the 
+            row to be classified as not an epitope. Default behavior uses every subject column.
+        prefix : str
+            The prefix of subject column names. For example, if subject columns are named "VW_010", the prefix
+            would be "VW_".
+        save_path : Path or str or None
+            An optional path to save the merged output DataFrame to a TSV file.
+        logger : logging.Logger or None
+            Logger to use. If None, uses `preprocess_cli` logger.
+
+    Returns
+    -------
+        Fully populated PV1 metadata style DataFrame for use in ESM-2 embedding generation and machine learning
+        epitope location training/predictions. Optionally, saves DataFrame to a TSV file if `save_path` argument
+        is passed to function.
+    """
     meta_df = read_metadata(meta_path, id_col=fname_col)
     fasta_df = read_fasta(fasta_path, full_name=True)
     z_df = read_zscores(z_path, meta_id_col=code_col)
@@ -37,6 +142,9 @@ def preprocess(meta_path: Path | str,
     return all_df
 
 def main() -> None:
+    """
+    Parse CLI arguments, set up logging, run data preprocessing script, and save results.
+    """
     parser = argparse.ArgumentParser(description="Preprocess and label model input data from PV1 metadata, targets fasta file, and z-score reactivity datasets.")
     parser.add_argument("meta_file", 
                         type=Path, 

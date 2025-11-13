@@ -2,7 +2,7 @@ import re
 from pathlib import Path
 import pandas as pd
 
-def read_fasta(fasta_path, full_name=False):
+def read_fasta(fasta_path: Path | str, full_name: bool = False) -> pd.DataFrame:
     header_pattern = re.compile(r"^>ID=([^\s]+)\s+AC=([^\s]+)\s+OXX=([^\s]+)\s*$")
     rows = []
     curr = None
@@ -45,11 +45,11 @@ def read_fasta(fasta_path, full_name=False):
     else: 
         return pd.DataFrame(rows, columns=["FullName", "Sequence"])
     
-def read_metadata(meta_path, 
-                  id_col="FullName", 
-                  category="Category", 
-                  peptide_start_idx="AlignStart", 
-                  peptide_end_idx="AlignStop"):
+def read_metadata(meta_path: Path | str, 
+                  id_col: str = "FullName", 
+                  category: str = "Category", 
+                  peptide_start_idx: str = "AlignStart", 
+                  peptide_end_idx: str = "AlignStop") -> pd.DataFrame:
     meta_df = pd.read_csv(meta_path, sep="\t", dtype=str)
     meta_df = meta_df[meta_df[category] == "SetCover"]
 
@@ -71,7 +71,9 @@ def read_metadata(meta_path,
     
     return meta_df
 
-def read_zscores(z_path, z_id_col="Sequence name", meta_id_col="CodeName"):
+def read_zscores(z_path: Path | str, 
+                 z_id_col: str = "Sequence name", 
+                 meta_id_col: str = "CodeName") -> pd.DataFrame:
     z_df = pd.read_csv(z_path, sep="\t")
     z_df.rename(columns={z_id_col: meta_id_col}, inplace=True)
 

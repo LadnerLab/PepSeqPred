@@ -1,18 +1,24 @@
 from pathlib import Path
 import pandas as pd
 from read import read_fasta, read_metadata, read_zscores
+from typing import Optional, List
 
-def merge_fasta_metadata(fasta_df, meta_df, id_col="FullName", seq_col="Sequence", out_col="Protein"):
+def merge_fasta_metadata(fasta_df: pd.DataFrame, 
+                         meta_df: pd.DataFrame, 
+                         id_col: str = "FullName", 
+                         seq_col: str = "Sequence", 
+                         out_col: str = "Protein") -> pd.DataFrame:
     merged = meta_df.merge(fasta_df[[id_col, seq_col]], on=id_col, how="left", validate="m:1")
     merged[out_col] = merged[seq_col]
     merged.drop(columns=[seq_col], inplace=True)
 
     return merged
 
-def merge_zscores_metadata(z_df, meta_df, 
-                           id_col="CodeName", 
-                           target_cols=["Def epitope", "Uncertain", "Not epitope"], 
-                           save_path=None):
+def merge_zscores_metadata(z_df: pd.DataFrame, 
+                           meta_df: pd.DataFrame, 
+                           id_col: str = "CodeName", 
+                           target_cols: List[str] = ["Def epitope", "Uncertain", "Not epitope"], 
+                           save_path: Optional[Path | str] = None):
     merged = meta_df.merge(z_df[[id_col, *target_cols]], on=id_col, how="left")
 
     if save_path:
@@ -20,12 +26,12 @@ def merge_zscores_metadata(z_df, meta_df,
 
     return merged
 
-def apply_z_threshold(z_df, 
-                      is_epitope_z_min=20.0, 
-                      is_epitope_min_subjects=4, 
-                      not_epitope_z_max=10.0, 
-                      not_epitope_max_subjects=None, 
-                      prefix="VW_"):
+def apply_z_threshold(z_df: pd.DataFrame, 
+                      is_epitope_z_min: float = 20.0, 
+                      is_epitope_min_subjects: int = 4, 
+                      not_epitope_z_max: float = 10.0, 
+                      not_epitope_max_subjects: Optional[int] = None, 
+                      prefix: str = "VW_") -> pd.DataFrame:
     # assuming df passed in full
     subject_cols = [col for col in z_df.columns if col.startswith(prefix)]
 

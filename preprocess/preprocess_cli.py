@@ -3,20 +3,21 @@ from pathlib import Path
 import pandas as pd
 from read import read_fasta, read_metadata, read_zscores
 from process import merge_fasta_metadata, merge_zscores_metadata, apply_z_threshold
+from typing import Optional
 
-def preprocess(meta_path, 
-               fasta_path, 
-               z_path, 
-               fname_col="FullName", 
-               code_col="CodeName", 
-               seq_col="Sequence", 
-               protein_col="Protein", 
-               is_epitope_z_min=20.0, 
-               is_epitope_min_subjects=4, 
-               not_epitope_z_max=10.0, 
-               not_epitope_max_subjects=None, 
-               prefix="VW_", 
-               save_path=None):
+def preprocess(meta_path: Path | str, 
+               fasta_path: Path | str, 
+               z_path: Path | str, 
+               fname_col: str = "FullName", 
+               code_col: str = "CodeName", 
+               seq_col: str = "Sequence", 
+               protein_col: str = "Protein", 
+               is_epitope_z_min: float = 20.0, 
+               is_epitope_min_subjects: int = 4, 
+               not_epitope_z_max: float = 10.0, 
+               not_epitope_max_subjects: Optional[int] = None, 
+               prefix: str = "VW_", 
+               save_path: Optional[str | Path] = None) -> pd.DataFrame:
     meta_df = read_metadata(meta_path, id_col=fname_col)
     fasta_df = read_fasta(fasta_path, full_name=True)
     z_df = read_zscores(z_path, meta_id_col=code_col)
@@ -35,7 +36,7 @@ def preprocess(meta_path,
 
     return all_df
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(description="Preprocess and label model input data from PV1 metadata, targets fasta file, and z-score reactivity datasets.")
     parser.add_argument("meta_file", 
                         type=Path, 
@@ -131,3 +132,6 @@ def main():
     
     print("Preprocessing done...\n")
     print(full_df.head())
+
+if __name__ == "__main__":
+    main()

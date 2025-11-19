@@ -1,6 +1,7 @@
 import re
 from pathlib import Path
 import pandas as pd
+from typing import Optional, Iterable
 
 def read_fasta(fasta_path: Path | str, full_name: bool = False) -> pd.DataFrame:
     """
@@ -76,7 +77,8 @@ def read_metadata(meta_path: Path | str,
                   id_col: str = "FullName", 
                   category: str = "Category", 
                   peptide_start_idx: str = "AlignStart", 
-                  peptide_end_idx: str = "AlignStop") -> pd.DataFrame:
+                  peptide_end_idx: str = "AlignStop", 
+                  drop_cols: Optional[Iterable[str]] = None) -> pd.DataFrame:
     """
     Parses a metadata TSV file with PV1-style headers into a pandas DataFrame.
 
@@ -96,12 +98,14 @@ def read_metadata(meta_path: Path | str,
             Name of column to store the peptide start index within the overall protein sequence.
         peptide_end_idx : str
             Name of column to store the peptide stop index within the overall protein sequence.
+        drop_cols : Iterable[str] or None
+            The names of the columns to drop from the metadata DataFrame.
 
     Returns
     -------
         pd.DataFrame
-            Metadata file parsed into a DataFrame with populated AlignStart and AlignStop columns, and 
-            indices removed from the FullName column.
+            Metadata file parsed into a DataFrame with populated AlignStart and AlignStop columns, 
+            indices removed from the FullName column, and unecessary columns dropped.
     """
     meta_df = pd.read_csv(meta_path, sep="\t", dtype=str)
     meta_df = meta_df[meta_df[category] == "SetCover"]
@@ -121,6 +125,10 @@ def read_metadata(meta_path: Path | str,
         lambda m: m.group(1) + ",".join(part.split("_", 1)[0] 
                                         for part in m.group(2).split(",")), 
         regex=True)
+    
+    if drop_cols:
+        actual_drop_cols = [col for col in drop_cols if col in meta_df.columns]
+        meta_df.drop(columns=actual_drop_cols, inplace=True)
     
     return meta_df
 
@@ -160,7 +168,7 @@ if __name__ == "__main__":
 
     fasta_test = read_fasta(Path("../data/fulldesign_2019-02-27_wGBKsw.fasta"), full_name=True)
     print(fasta_test.head())
-    metadata_test = read_metadata(Path("../data/PV1_meta_2020-11-23.tsv"))
+    metadata_test = read_metadata(Path("../data/PV1_meta_2020-11-23.tsv"), drop_cols=["Category", "SpeciesID", "Protein", "Encoding"])
     print(metadata_test.head())
     zscores_test = read_zscores(Path("../data/SHERC_combined_wSB_4-24-24_Z-HDI95_avg_round.tsv"))
     print(zscores_test.head())

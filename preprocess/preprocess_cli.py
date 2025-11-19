@@ -189,6 +189,7 @@ def main() -> None:
                         action="store", 
                         dest="seq_col", 
                         type=str, 
+                        default="Sequence", 
                         help="Name of the column containing protein sequences.")
     parser.add_argument("--protein-col", 
                         action="store", 

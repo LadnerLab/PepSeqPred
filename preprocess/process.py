@@ -1,8 +1,10 @@
 from pathlib import Path
+from warnings import deprecated
 import pandas as pd
 from read import read_fasta, read_metadata, read_zscores
 from typing import Optional, List
 
+@deprecated("process.py is deprecated and will be removed in the future.")
 def merge_fasta_metadata(fasta_df: pd.DataFrame, 
                          meta_df: pd.DataFrame, 
                          id_col: str = "FullName", 

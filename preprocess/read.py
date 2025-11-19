@@ -106,7 +106,7 @@ def read_metadata(meta_path: Path | str,
     meta_df = pd.read_csv(meta_path, sep="\t", dtype=str)
     meta_df = meta_df[meta_df[category] == "SetCover"]
 
-    oxx_idx_pattern = re.compile(r"OXX=[^\s,]+(?:,[^\s,]+)*_(?P<align_start>\d+)_(?P<align_stop>\d+)")
+    oxx_idx_pattern = re.compile(r"OXX=[^\s,]*(?:,[^\s,]*)*_(?P<align_start>\d+)_(?P<align_stop>\d+)")
     oxx_match = meta_df[id_col].str.extract(oxx_idx_pattern)
 
     meta_df[peptide_start_idx] = (pd.to_numeric(oxx_match["align_start"], 

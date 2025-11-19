@@ -46,7 +46,6 @@ def setup_logger(log_level: str = "INFO", json_lines: bool = False) -> logging.L
     logger.handlers[:] = [] # avoid duplicate handlers
 
     # choose formatter style
-    formatter = JSONFormatter() if json_lines else logging.Formatter("[%(asctime)s] %(levelname)s %(message)s")
     stream_formatter = JSONFormatter() if json_lines else logging.Formatter("%(levelname)s %(message)s")
 
     stream_handler = logging.StreamHandler()
@@ -112,7 +111,7 @@ def preprocess(meta_path: Path | str,
             location training/predictions.
     """
     t0 = time.perf_counter()
-    meta_df = read_metadata(meta_path, id_col=fname_col)
+    meta_df = read_metadata(meta_path, id_col=fname_col, drop_cols=["Category", "SpeciesID", "Protein", "Encoding"])
     fasta_df = read_fasta(fasta_path, full_name=True)
     z_df = read_zscores(z_path, meta_id_col=code_col)
     logger.info("read_files", 
@@ -195,7 +194,7 @@ def main() -> None:
                         action="store", 
                         dest="not_epi_max_subs", 
                         type=int, 
-                        default=None, 
+                        default=0, 
                         help="Maximum # of subjects required to be at or below maximum z-score for peptide to NOT contain epitopes. Default is 'None' which means every column is used to disqualify a peptide from containing epitopes.")
     parser.add_argument("--subject-prefix", 
                         action="store", 
@@ -212,28 +211,29 @@ def main() -> None:
     args = parser.parse_args()
     logger = setup_logger(json_lines=True)
 
+    not_epitope_max_subjects = args.not_epi_max_subs if args.not_epi_max_subs != 0 else None
+
     if args.save_path:
-        if args.is_epi_max_subs is None:
-            save_path = Path(f"input_data_{args.is_epi_z_min}_{args.is_epi_min_subs}_{args.not_epi_z_max}_all")
+        if not_epitope_max_subjects is None:
+            save_path = Path(f"input_data_{int(args.is_epi_z_min)}_{args.is_epi_min_subs}_{int(args.not_epi_z_max)}_all.tsv")
         else:
-            save_path = Path(f"input_data_{args.is_epi_z_min}_{args.is_epi_min_subs}_{args.not_epi_z_max}_{args.is_epi_max_subs}")
+            save_path = Path(f"input_data_{int(args.is_epi_z_min)}_{args.is_epi_min_subs}_{int(args.not_epi_z_max)}_{not_epitope_max_subjects}.tsv")
     else:
         save_path = None
 
     is_epitope_z_min = args.is_epi_z_min, 
     is_epitope_min_subjects = args.is_epi_min_subs, 
-    not_epitope_z_max = args.not_epi_z_max, 
-    not_epitope_max_subjects = args.not_epi_max_subs, 
+    not_epitope_z_max = args.not_epi_z_max,  
     logger.info("run_start", 
                 extra={"extra": {
                     "is_epi_z_min": is_epitope_z_min, 
                     "is_epi_min_subs": is_epitope_min_subjects, 
                     "not_epi_z_max": not_epitope_z_max, 
                     "not_epi_max_subs": not_epitope_max_subjects, 
-                    "save_path": save_path
+                    "save_path": str(save_path)
                 }})
 
-    full_df = preprocess(args.meta_file, 
+    meta_df, fasta_df = preprocess(args.meta_file, 
                          args.fasta_file, 
                          args.z_file, 
                          fname_col=args.fname_col, 
@@ -243,12 +243,14 @@ def main() -> None:
                          not_epitope_z_max=not_epitope_z_max, 
                          not_epitope_max_subjects=not_epitope_max_subjects, 
                          prefix=args.subject_prefix, 
-                         save_path=save_path)
+                         save_path=save_path, 
+                         logger=logger)
     
     logger.info("preprocessing_done", 
                 extra={"extra": {
-                    "dataframe_size": len(full_df), 
-                    "output_file_path": save_path, 
+                    "meta_size": len(meta_df), 
+                    "fasta_size": len(fasta_df), 
+                    "output_file_path": str(save_path), 
                     "total_duration_s": round(time.perf_counter() - t0, 3)
                 }})
 

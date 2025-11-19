@@ -7,8 +7,8 @@ import logging
 import time
 from datetime import datetime
 from read import read_fasta, read_metadata, read_zscores
-from process import merge_fasta_metadata, merge_zscores_metadata, apply_z_threshold
-from typing import Optional
+from process import merge_zscores_metadata, apply_z_threshold
+from typing import Optional, Tuple
 
 def setup_logger(log_level: str = "INFO", json_lines: bool = False) -> logging.Logger:
     """
@@ -60,15 +60,13 @@ def preprocess(meta_path: Path | str,
                z_path: Path | str, 
                fname_col: str = "FullName", 
                code_col: str = "CodeName", 
-               seq_col: str = "Sequence", 
-               protein_col: str = "Protein", 
                is_epitope_z_min: float = 20.0, 
                is_epitope_min_subjects: int = 4, 
                not_epitope_z_max: float = 10.0, 
                not_epitope_max_subjects: Optional[int] = None, 
                prefix: str = "VW_", 
                save_path: Optional[str | Path] = None, 
-               logger: Optional[logging.Logger] = None) -> pd.DataFrame:
+               logger: Optional[logging.Logger] = None) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
     Runs the entire data preprocessing step for ESM-2 embedding generation and machine learning epitope 
     predictions.
@@ -83,10 +81,6 @@ def preprocess(meta_path: Path | str,
             Path to metadata file.
         fname_col : str
             Column name used to get full names of peptides.
-        code_col : str
-            Code name column for IDing peptides across files.
-        seq_col : str
-            Name of protein sequence column in FASTA DataFrame.
         protein_col : str
             Name of the protein sequence column to be used in the final output DataFrame.
         is_epitope_z_min : float
@@ -109,9 +103,13 @@ def preprocess(meta_path: Path | str,
 
     Returns
     -------
-        Fully populated PV1 metadata style DataFrame for use in ESM-2 embedding generation and machine learning
-        epitope location training/predictions. Optionally, saves DataFrame to a TSV file if `save_path` argument
-        is passed to function.
+        fully_pop_meta_df : pd.DataFrame
+            Fully populated PV1 metadata style DataFrame for use in ESM-2 embedding generation and machine learning
+            epitope location training/predictions. Optionally, saves DataFrame to a TSV file if `save_path` argument
+            is passed to function.
+        fasta_df : pd.DataFrame
+            The fasta file read into a DataFrame for use in ESM-2 embedding generation and machine learning epitope 
+            location training/predictions.
     """
     t0 = time.perf_counter()
     meta_df = read_metadata(meta_path, id_col=fname_col)
@@ -124,18 +122,8 @@ def preprocess(meta_path: Path | str,
                     "z_size": len(z_df), 
                     "read_duration_s": round(time.perf_counter() - t0, 3)
                 }})
-
-    t1 = time.perf_counter()
-    fasta_meta_df = merge_fasta_metadata(fasta_df, meta_df, 
-                                         id_col=fname_col, seq_col=seq_col, out_col=protein_col)
-    logger.info("merged_fasta_and_meta", 
-                extra={"extra": {
-                    "merged_size": len(fasta_meta_df), 
-                    "merged_on": fname_col, 
-                    "merge1_duration_s": round(time.perf_counter() - t1, 3)
-                }})
     
-    t2 = time.perf_counter()
+    t1 = time.perf_counter()
     z_df_targets = apply_z_threshold(z_df, 
                                      is_epitope_z_min=is_epitope_z_min, 
                                      is_epitope_min_subjects=is_epitope_min_subjects, 
@@ -144,19 +132,19 @@ def preprocess(meta_path: Path | str,
                                      prefix=prefix)
     logger.info("applied_z_score_thresh", 
                 extra={"extra": {
-                    "z_one_hot_encoding_duration_s": round(time.perf_counter() - t2, 3)
+                    "z_one_hot_encoding_duration_s": round(time.perf_counter() - t1, 3)
                 }})
     
-    t3 = time.perf_counter()
-    all_df = merge_zscores_metadata(z_df_targets, fasta_meta_df, id_col=code_col, save_path=save_path)
+    t2 = time.perf_counter()
+    fully_pop_meta_df = merge_zscores_metadata(z_df_targets, meta_df, id_col=code_col, save_path=save_path)
     logger.info("merged_z_and_meta", 
                 extra={"extra": {
-                    "merged_size": len(all_df), 
+                    "merged_size": len(fully_pop_meta_df), 
                     "merged_on": code_col, 
-                    "merge2_duration_s": round(time.perf_counter() - t3, 3)
+                    "merge_duration_s": round(time.perf_counter() - t2, 3)
                 }})
 
-    return all_df
+    return fully_pop_meta_df, fasta_df
 
 def main() -> None:
     """
@@ -185,18 +173,6 @@ def main() -> None:
                         type=str, 
                         default="CodeName", 
                         help="Name of column containing codenames to map between metadata and z-score files.")
-    parser.add_argument("--seq-col", 
-                        action="store", 
-                        dest="seq_col", 
-                        type=str, 
-                        default="Sequence", 
-                        help="Name of the column containing protein sequences.")
-    parser.add_argument("--protein-col", 
-                        action="store", 
-                        dest="protein_col", 
-                        type=str, 
-                        default="Protein", 
-                        help="Name of output column that will contain protein sequences.")
     parser.add_argument("--is-epi-z-thresh", 
                         action="store", 
                         dest="is_epi_z_min", 
@@ -261,9 +237,7 @@ def main() -> None:
                          args.fasta_file, 
                          args.z_file, 
                          fname_col=args.fname_col, 
-                         code_col=args.code_col, 
-                         seq_col=args.seq_col, 
-                         protein_col=args.protein_col, 
+                         code_col=args.code_col,  
                          is_epitope_z_min=is_epitope_z_min, 
                          is_epitope_min_subjects=is_epitope_min_subjects, 
                          not_epitope_z_max=not_epitope_z_max, 

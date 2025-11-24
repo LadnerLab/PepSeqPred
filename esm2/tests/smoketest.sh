@@ -49,13 +49,11 @@ python3 "$SCRIPT" \
     --out-dir "$TEST_DIR"
 
 # verify output
-# python3 - << PY
-# import numpy as np, pandas as pd, sys
-# npz = np.load(r"$NPZ")
-# print(f"NPZ keys: {list(npz.keys())}")
-# print(f"J9Z4E7_9ADEN shape: {npz['J9Z4E7_9ADEN'].shape} (expecting (320,))")
-# print(f"J9Z4E7_9ADEN embedding:\n{npz['J9Z4E7_9ADEN']}")
-# print(pd.read_csv(r"$IDX").head())
-# PY
+python3 - << PY
+import torch
+pt = torch.load("$TEST_DIR/$OUT_DIR/pts/A0A077B1I6_CHIKV.pt")
+print(f"Embedding dim: {pt.shape} (expected Lx321)")
+print(f"PT at position we expect seq len: {pt[0, -1]}")
+PY
 
 echo "Smoke test complete ============================================================"

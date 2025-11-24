@@ -2,12 +2,12 @@
 #SBATCH --job-name=generate_esm_embeddings
 #SBATCH --partition=gpu
 #SBATCH --array=0-3
-#SBATCH --gpus-per-task=1
+#SBATCH --gpus=1
 #SBATCH --cpus-per-gpu=8
 #SBATCH --mem-per-gpu=16G
-#SBATCH --time=02:00:00
-#SBATCH --output=/scratch/%u/slurm/logs/%x_%j.out
-#SBATCH --error=/scratch/%u/slurm/logs/%x_%j.err
+#SBATCH --time=00:30:00
+#SBATCH --output=/scratch/%u/esm_slurm/%x_%j.out
+#SBATCH --error=/scratch/%u/esm_slurm/%x_%j.err
 
 # if error, fail loudly
 set -euo pipefail

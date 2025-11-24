@@ -57,7 +57,6 @@ srun python -u "${ESM_CLI}" \
     --shard-id "${SHARD_ID}" \
     --log-dir "${LOG_DIR}" \
     --log-json \
-    --save-mode pt \
     --out-dir "${OUT_DIR}"
 
 # USAGE: sbatch --export=ALL,IN_FASTA=/scratch/<NAUIDD>/<targets>.fasta generateembeddings.sh

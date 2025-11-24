@@ -688,6 +688,18 @@ def main() -> None:
                         type=int, 
                         default=8, 
                         help="Batch size for processing targets into ESM embeddings.")
+    parser.add_argument("--num-shards", 
+                        action="store", 
+                        dest="num_shards", 
+                        type=int, 
+                        default=1, 
+                        help="Number of shards to split input fasta into for parallel processing.")
+    parser.add_argument("--shard-id", 
+                        action="store", 
+                        dest="shard_id", 
+                        type=int, 
+                        default=0, 
+                        help="0-based index of this shard in [0, num_shards).")
     
     args = parser.parse_args()
     out_dir = args.out_dir
@@ -700,6 +712,17 @@ def main() -> None:
     fasta_df["len"] = fasta_df[args.seq_col].str.len()
     fasta_df = fasta_df.sort_values("len").reset_index(drop=True)
 
+    total_seqs = len(fasta_df)
+    num_shards = args.num_shards
+    shard_id = args.shard_id
+    if num_shards < 1:
+        raise ValueError(f"num_shards must be >= 1, got {num_shards}.")
+    if not 0 <= shard_id < num_shards:
+        raise ValueError(f"shard_id must be in [0, {num_shards}), got {shard_id}.")
+    if num_shards > 1:
+        # take every num_shards-th row starting at shard_id
+        fasta_df = fasta_df.iloc[shard_id::num_shards].reset_index(drop=True)
+
     # parse out command line arguments
     model_name = args.model_name
     max_tokens = args.max_tokens
@@ -708,6 +731,19 @@ def main() -> None:
     per_seq_dir = args.per_seq_dir
     npz_path = args.npz_path
     idx_csv_path = args.idx_csv_path
+
+    # if running sharded mode, create per-shard output paths
+    if num_shards > 1:
+        shard_suffix = f"_shard{shard_id:03d}_of_{num_shards:03d}"
+        per_seq_dir = per_seq_dir / f"shard_{shard_id:03d}"
+        
+        # add suffix to npz path if applicable
+        if save_mode == "npz":
+            npz_path = npz_path.with_name(npz_path.stem + shard_suffix + npz_path.suffix)
+        
+        # add suffix to index csv path
+        idx_csv_path = idx_csv_path.with_name(idx_csv_path.stem + shard_suffix + idx_csv_path.suffix)
+
     logger.info("run_start", 
                 extra={"extra": {
                     "model_name": model_name, 
@@ -717,7 +753,10 @@ def main() -> None:
                     "device": "cuda" if torch.cuda.is_available() else "cpu", 
                     "torch_version": torch.__version__, 
                     "esm_version": esm.__version__, 
-                    "n_sequences": len(fasta_df)
+                    "num_shards": num_shards, 
+                    "shard_id": shard_id, 
+                    "total_sequences": total_seqs, 
+                    "n_sequences_shard": len(fasta_df)
                 }})
 
 

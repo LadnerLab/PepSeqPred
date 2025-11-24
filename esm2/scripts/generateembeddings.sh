@@ -1,15 +1,20 @@
 #!/bin/bash
 #SBATCH --job-name=generate_esm_embeddings
 #SBATCH --partition=gpu
-#SBATCH --gpus=1
+#SBATCH --array=0-3
+#SBATCH --gpus-per-task=1
 #SBATCH --cpus-per-gpu=8
 #SBATCH --mem-per-gpu=16G
-#SBATCH --time=00:25:00
+#SBATCH --time=02:00:00
 #SBATCH --output=/scratch/%u/slurm/logs/%x_%j.out
 #SBATCH --error=/scratch/%u/slurm/logs/%x_%j.err
 
 # if error, fail loudly
 set -euo pipefail
+
+# get shard information from SLURM
+NUM_SHARDS=${SLURM_ARRAY_TASK_COUNT:-1}
+SHARD_ID=${SLURM_ARRAY_TASK_ID:-0}
 
 # required input
 : "${IN_FASTA:?Set IN_FASTA to the input FASTA path}"
@@ -48,6 +53,8 @@ srun python -u "${ESM_CLI}" \
     --model-name "${MODEL_NAME}" \
     --max-tokens "${MAX_TOKENS}" \
     --batch-size "${BATCH_SIZE}" \
+    --num-shards "${NUM_SHARDS}" \
+    --shard-id "${SHARD_ID}" \
     --log-dir "${LOG_DIR}" \
     --log-json \
     --save-mode pt \

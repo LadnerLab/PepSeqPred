@@ -2,10 +2,10 @@
 #SBATCH --job-name=generate_esm_embeddings
 #SBATCH --partition=gpu
 #SBATCH --array=0-3
-#SBATCH --gpus=1
-#SBATCH --cpus-per-gpu=8
-#SBATCH --mem-per-gpu=16G
-#SBATCH --time=00:30:00
+#SBATCH --gpus=a100
+#SBATCH --cpus-per-gpu=2
+#SBATCH --mem-per-gpu=8G
+#SBATCH --time=01:00:00
 #SBATCH --output=/scratch/%u/esm_slurm/%x_%j.out
 #SBATCH --error=/scratch/%u/esm_slurm/%x_%j.err
 
@@ -22,7 +22,7 @@ SHARD_ID=${SLURM_ARRAY_TASK_ID:-0}
 # simple script defaults
 MODEL_NAME="${MODEL_NAME:-esm2_t33_650M_UR50D}" # see ESM-2 documentation for other models
 MAX_TOKENS="${MAX_TOKENS:-1022}" # max number of tokens in model's context window
-BATCH_SIZE="${BATCH_SIZE:-8}" # can probably get away with 16 or 24 on V100, double on A100
+BATCH_SIZE="${BATCH_SIZE:-32}" # can probably get away with 16 or 24 on V100, double on A100
 
 # HPC helpful variables
 NAUID="${NAUID:-$USER}"

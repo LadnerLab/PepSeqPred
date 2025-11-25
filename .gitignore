@@ -8,6 +8,7 @@ venv/
 ENV/
 .vscode/
 smoketest/
+data/
 *.fasta
 *.csv
 *.tsv

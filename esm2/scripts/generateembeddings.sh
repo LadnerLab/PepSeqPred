@@ -1,13 +1,13 @@
 #!/bin/bash
-#SBATCH --job-name=generate_esm_embeddings
+#SBATCH --job-name=gen_esm_embs
 #SBATCH --partition=gpu
 #SBATCH --array=0-3
 #SBATCH --gpus=a100
 #SBATCH --cpus-per-gpu=2
 #SBATCH --mem-per-gpu=8G
 #SBATCH --time=01:00:00
-#SBATCH --output=/scratch/%u/esm_slurm/%x_%j.out
-#SBATCH --error=/scratch/%u/esm_slurm/%x_%j.err
+#SBATCH --output=/scratch/%u/esm2_slurm/%x_%j.out
+#SBATCH --error=/scratch/%u/esm2_slurm/%x_%j.err
 
 # if error, fail loudly
 set -euo pipefail
@@ -38,11 +38,11 @@ EMBEDDING_DIR="artifacts"
 mkdir -p "${OUT_DIR}/${LOG_DIR}" "${OUT_DIR}/${EMBEDDING_DIR}"
 
 # load Python conda env (make sure you have all packages installed)
+module purge
 module load anaconda3
+module load cuda
 source $CONDA_PREFIX/etc/profile.d/conda.sh
-conda activate hura
-conda install -y pip numpy pytorch pandas
-pip install fair-esm
+conda activate pepseqpred
 
 # set CUDA environment variables
 export PYTORCH_CUDA_ALLOC_CONF="max_split_size_mb:128,expandable_segments:True"
@@ -59,4 +59,4 @@ srun python -u "${ESM_CLI}" \
     --log-json \
     --out-dir "${OUT_DIR}"
 
-# USAGE: sbatch --export=ALL,IN_FASTA=/scratch/<NAUIDD>/<targets>.fasta generateembeddings.sh
+# MONSOON USAGE: sbatch --export=ALL,IN_FASTA=/scratch/$USER/data/<targets>.fasta generateembeddings.sh

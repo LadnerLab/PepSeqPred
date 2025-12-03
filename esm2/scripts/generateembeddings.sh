@@ -9,9 +9,6 @@
 #SBATCH --output=/scratch/%u/esm2_slurm/%x_%j.out
 #SBATCH --error=/scratch/%u/esm2_slurm/%x_%j.err
 
-# if error, fail loudly
-set -euo pipefail
-
 # get shard information from SLURM
 NUM_SHARDS=${SLURM_ARRAY_TASK_COUNT:-1}
 SHARD_ID=${SLURM_ARRAY_TASK_ID:-0}

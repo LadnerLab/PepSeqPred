@@ -4,9 +4,9 @@ This module is designed to read a FASTA file with headers in this form (example)
     >ID=A8D0M1_ADE02 AC=A8D0M1 OXX=10515,129951,10509,10508
     MALTCRLRFPVPGFRGRMHRRRGMAGHGLTGGMRRAHHRRRRASHRRMRGGILPLLIPLIA
 cleans and batches the target sequence below each header, runs an ESM-2 model to obtain **per-residue** 
-embeddings, and writes to a compressed NPZ file of **ID --> (L, D+1) array** or individual PT files containing 
-each residue-level embedding per protein sequence, plus a CSV metadata file. 
-The script also writes structured logs to stdout to help monitor progress and debug any errors.
+embeddings, and writes to individual PT files containing each residue-level embedding per protein sequence, 
+plus a CSV metadata file. The script also writes structured logs to stdout to help monitor progress and debug 
+any errors.
 
 For sequences that fit within the model token limit (residues + 2 <= 1024), embeddings are comouted in 
 a single pass with full-sequence context. For longer sequences, overlapping windows are used and stitched 
@@ -383,10 +383,8 @@ def esm_embeddings_from_fasta(fasta_df: pd.DataFrame,
                               seq_col: str = "Sequence", 
                               model_name: str = "esm2_t33_650M_UR50D", 
                               max_tokens: int = 1022, 
-                              batch_size: int = 8,  
-                              save_mode: str = "pt", 
+                              batch_size: int = 8, 
                               per_seq_dir: Path | str = "esm2_per_seq", 
-                              npz_path: Path | str = "esm2_seq_embeddings.npz", 
                               index_csv_path: Path | str = "esm2_seq_index.csv", 
                               logger: Optional[logging.Logger] = None) -> Tuple[pd.DataFrame, List[str]]:
     """
@@ -397,7 +395,7 @@ def esm_embeddings_from_fasta(fasta_df: pd.DataFrame,
         fasta_df : pandas.DataFrame
             Must contain `id_col` and `seq_col` with valid sequences.
         id_col : str
-            Column name for record IDs used as keys in the NPZ.
+            Column name for record IDs used as .pt filenames.
         seq_col : str
             Column name for sequences.
         model_name : str
@@ -407,14 +405,8 @@ def esm_embeddings_from_fasta(fasta_df: pd.DataFrame,
             and end tokens.
         batch_size : int
             Number of sequences processed together when possible.
-        save_mode : str
-            How to save the residue-level embeddings per protein sequence.
-            `pt` saves individual ID-named .pt files per protein sequence (memory efficient).
-            `npz` saves all embeddings to a .npz file at the end (computationally expensive).
         per_seq_dir : str or Path
-            The directoyy to store .pt files to if `save_mode` is set to "pt".
-        npz_path : str or Path
-            Output NPZ mapping ID to NumPy array with shape L by D per sequence.
+            The directoyy to store .pt files.
         index_csv_path : str or Path
             Output CSV with metadata about stored arrays.
         logger : logging.Logger or None
@@ -432,9 +424,7 @@ def esm_embeddings_from_fasta(fasta_df: pd.DataFrame,
     t0 = time.perf_counter()
 
     # set up directories to save results
-    os.makedirs(os.path.dirname(npz_path) or ".", exist_ok=True)
-    if save_mode == "pt":
-        per_seq_dir.mkdir(parents=True, exist_ok=True)
+    per_seq_dir.mkdir(parents=True, exist_ok=True)
     
     # clean sequences
     df = fasta_df[[id_col, seq_col]].dropna().copy()
@@ -462,7 +452,6 @@ def esm_embeddings_from_fasta(fasta_df: pd.DataFrame,
     seqs = df[seq_col].tolist()
     seq_pairs = list(zip(ids, seqs))
 
-    seq_embeddings = {}
     failed_seqs = []
 
     # process in batches
@@ -503,11 +492,8 @@ def esm_embeddings_from_fasta(fasta_df: pd.DataFrame,
                     # append sequence length column
                     res_vec = append_seq_len(res_vec, len_) # (L, D+1)
 
-                    # save as .pt per sequence or to .npz for full dataset 
-                    if save_mode == "pt":
-                        torch.save(torch.from_numpy(res_vec), per_seq_dir / f"{seq_id}.pt")
-                    else:
-                        seq_embeddings[seq_id] = res_vec
+                    # save as .pt per sequence
+                    torch.save(torch.from_numpy(res_vec), per_seq_dir / f"{seq_id}.pt")
 
                     # save logs per-residue embeddings for short sequences
                     index_records.append({"id": seq_id, 
@@ -516,9 +502,8 @@ def esm_embeddings_from_fasta(fasta_df: pd.DataFrame,
                                           "original_seq_len": int(len_),         # entire sequence length
                                           "handle": "short", 
                                           "model": model_name, 
-                                          "storage": save_mode, 
-                                          "path": str(per_seq_dir / f"{seq_id}.pt" 
-                                                      if save_mode == "pt" else str(npz_path))})
+                                          "storage": ".pt", 
+                                          "path": str(per_seq_dir / f"{seq_id}.pt")})
 
             # handle long sequences
             for batch_idx in long_idxs:
@@ -538,14 +523,10 @@ def esm_embeddings_from_fasta(fasta_df: pd.DataFrame,
                                           "original_seq_len": len(protein_seq), 
                                           "handle": "long", 
                                           "model": model_name, 
-                                          "storage": save_mode, 
-                                          "path": str(per_seq_dir / f"{protein_id}.pt" 
-                                                    if save_mode == "pt" else str(npz_path))})
-                    # save as .pt per sequence or to .npz for full dataset 
-                    if save_mode == "pt":
-                        torch.save(torch.from_numpy(res_vec), per_seq_dir / f"{protein_id}.pt")
-                    else:
-                        seq_embeddings[protein_id] = res_vec
+                                          "storage": ".pt", 
+                                          "path": str(per_seq_dir / f"{protein_id}.pt")})
+
+                    torch.save(torch.from_numpy(res_vec), per_seq_dir / f"{protein_id}.pt")
                 except Exception as e:
                     logger.error("sequence_failed", extra={"extra": {
                         "id": protein_id, "error": repr(e)
@@ -561,30 +542,18 @@ def esm_embeddings_from_fasta(fasta_df: pd.DataFrame,
             "batch_duration_s": round(time.perf_counter() - b_start, 3)
         }})
 
-    # save results to npz if applicable
-    if save_mode == "npz":
-        # save temp file incase of program failure before overwrite
-        temp_npz = str(npz_path) + ".tmp"
-        with open(temp_npz, "wb") as temp:
-            np.savez_compressed(temp, **seq_embeddings)
-            temp.flush()
-            os.fsync(temp.fileno()) # ensure bytes reach disk
-        os.replace(temp_npz, npz_path)
-
     # metadata to describe embeddings
     index_df = pd.DataFrame(index_records, columns=[
         "id", "length", "embed_dim", "original_seq_len", "handle", "model"
     ])
-    if save_mode == "npz":
-        index_df["file_path"] = str(Path(npz_path).resolve())
-    else:
-        base = Path(per_seq_dir).resolve()
-        index_df["file_path"] = index_df["id"].astype(str).map(lambda s: str(base / f"{s}.pt"))
+
+    base = Path(per_seq_dir).resolve()
+    index_df["file_path"] = index_df["id"].astype(str).map(lambda s: str(base / f"{s}.pt"))
     index_df.to_csv(index_csv_path, index=False)
 
     # summarize in log
     elapsed = time.perf_counter() - t0
-    ok_count = len(index_records) if save_mode == "pt" else len(seq_embeddings)
+    ok_count = len(index_records)
     by_handle = index_df["handle"].value_counts().to_dict()
     logger.info("embedding_done", extra={"extra": {
         "ok": ok_count, 
@@ -592,7 +561,7 @@ def esm_embeddings_from_fasta(fasta_df: pd.DataFrame,
         "handled_short": int(by_handle.get("short", 0)), 
         "handled_long": int(by_handle.get("long", 0)), 
         "total_duration_s": round(elapsed, 3), 
-        "artifacts_path": str(os.path.abspath(npz_path)) if save_mode == "npz" else str(os.path.abspath(per_seq_dir)), 
+        "artifacts_path": str(os.path.abspath(per_seq_dir)), 
         "index_csv_path": str(os.path.abspath(index_csv_path))
     }})
 
@@ -621,25 +590,12 @@ def main() -> None:
                         dest="log_json", 
                         default=False, 
                         help="Emit logs as JSON lines for simple parsing.")
-    parser.add_argument("--save-mode", 
-                        action="store", 
-                        dest="save_mode", 
-                        type=str, 
-                        choices=["pt", "npz"], 
-                        default="npz", 
-                        help="The pt option streams one file per sequence, npz saves a single archive at the end.")
     parser.add_argument("--per-seq-dir", 
                         action="store", 
                         dest="per_seq_dir", 
                         type=Path, 
                         default=Path(f"artifacts/pts"), 
                         help="Directory for individual .pt files when save mode is set to 'pt'.")
-    parser.add_argument("--npz-path", 
-                        action="store", 
-                        dest="npz_path", 
-                        type=Path, 
-                        default=Path(f"artifacts/esm_seq_embs_{datetime.now().strftime('%Y-%m-%d_T%H_%M_%S')}.npz"), 
-                        help="File path to NumPy ZIP file containing embeddings.")
     parser.add_argument("--index-csv-path", 
                         action="store", 
                         dest="idx_csv_path", 
@@ -688,6 +644,18 @@ def main() -> None:
                         type=int, 
                         default=8, 
                         help="Batch size for processing targets into ESM embeddings.")
+    parser.add_argument("--num-shards", 
+                        action="store", 
+                        dest="num_shards", 
+                        type=int, 
+                        default=1, 
+                        help="Number of shards to split input fasta into for parallel processing.")
+    parser.add_argument("--shard-id", 
+                        action="store", 
+                        dest="shard_id", 
+                        type=int, 
+                        default=0, 
+                        help="0-based index of this shard in [0, num_shards).")
     
     args = parser.parse_args()
     out_dir = args.out_dir
@@ -700,14 +668,32 @@ def main() -> None:
     fasta_df["len"] = fasta_df[args.seq_col].str.len()
     fasta_df = fasta_df.sort_values("len").reset_index(drop=True)
 
+    total_seqs = len(fasta_df)
+    num_shards = args.num_shards
+    shard_id = args.shard_id
+    if num_shards < 1:
+        raise ValueError(f"num_shards must be >= 1, got {num_shards}.")
+    if not 0 <= shard_id < num_shards:
+        raise ValueError(f"shard_id must be in [0, {num_shards}), got {shard_id}.")
+    if num_shards > 1:
+        # take every num_shards-th row starting at shard_id
+        fasta_df = fasta_df.iloc[shard_id::num_shards].reset_index(drop=True)
+
     # parse out command line arguments
     model_name = args.model_name
     max_tokens = args.max_tokens
     batch_size = args.batch_size
-    save_mode = args.save_mode
     per_seq_dir = args.per_seq_dir
-    npz_path = args.npz_path
     idx_csv_path = args.idx_csv_path
+
+    # if running sharded mode, create per-shard output paths
+    if num_shards > 1:
+        shard_suffix = f"_shard{shard_id:03d}_of_{num_shards:03d}"
+        per_seq_dir = per_seq_dir / f"shard_{shard_id:03d}"
+        
+        # add suffix to index csv path
+        idx_csv_path = idx_csv_path.with_name(idx_csv_path.stem + shard_suffix + idx_csv_path.suffix)
+
     logger.info("run_start", 
                 extra={"extra": {
                     "model_name": model_name, 
@@ -717,7 +703,10 @@ def main() -> None:
                     "device": "cuda" if torch.cuda.is_available() else "cpu", 
                     "torch_version": torch.__version__, 
                     "esm_version": esm.__version__, 
-                    "n_sequences": len(fasta_df)
+                    "num_shards": num_shards, 
+                    "shard_id": shard_id, 
+                    "total_sequences": total_seqs, 
+                    "n_sequences_shard": len(fasta_df)
                 }})
 
 
@@ -727,9 +716,7 @@ def main() -> None:
                                                       model_name=model_name, 
                                                       max_tokens=max_tokens, 
                                                       batch_size=batch_size, 
-                                                      save_mode=save_mode, 
-                                                      per_seq_dir=out_dir/per_seq_dir, 
-                                                      npz_path=out_dir/npz_path, 
+                                                      per_seq_dir=out_dir/per_seq_dir,
                                                       index_csv_path=out_dir/idx_csv_path, 
                                                       logger=logger)
     logger.info("run_end", extra={"extra": {

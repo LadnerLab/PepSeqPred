@@ -1,15 +1,17 @@
 #!/bin/bash
-#SBATCH --job-name=generate_esm_embeddings
+#SBATCH --job-name=gen_esm_embs
 #SBATCH --partition=gpu
-#SBATCH --gpus=1
-#SBATCH --cpus-per-gpu=8
-#SBATCH --mem-per-gpu=16G
-#SBATCH --time=00:25:00
-#SBATCH --output=/scratch/%u/slurm/logs/%x_%j.out
-#SBATCH --error=/scratch/%u/slurm/logs/%x_%j.err
+#SBATCH --array=0-3
+#SBATCH --gpus=a100
+#SBATCH --cpus-per-gpu=2
+#SBATCH --mem-per-gpu=8G
+#SBATCH --time=01:00:00
+#SBATCH --output=/scratch/%u/esm2_slurm/%x_%j.out
+#SBATCH --error=/scratch/%u/esm2_slurm/%x_%j.err
 
-# if error, fail loudly
-set -euo pipefail
+# get shard information from SLURM
+NUM_SHARDS=${SLURM_ARRAY_TASK_COUNT:-1}
+SHARD_ID=${SLURM_ARRAY_TASK_ID:-0}
 
 # required input
 : "${IN_FASTA:?Set IN_FASTA to the input FASTA path}"
@@ -17,7 +19,7 @@ set -euo pipefail
 # simple script defaults
 MODEL_NAME="${MODEL_NAME:-esm2_t33_650M_UR50D}" # see ESM-2 documentation for other models
 MAX_TOKENS="${MAX_TOKENS:-1022}" # max number of tokens in model's context window
-BATCH_SIZE="${BATCH_SIZE:-8}" # can probably get away with 16 or 24 on V100, double on A100
+BATCH_SIZE="${BATCH_SIZE:-32}" # can probably get away with 16 or 24 on V100, double on A100
 
 # HPC helpful variables
 NAUID="${NAUID:-$USER}"
@@ -33,11 +35,11 @@ EMBEDDING_DIR="artifacts"
 mkdir -p "${OUT_DIR}/${LOG_DIR}" "${OUT_DIR}/${EMBEDDING_DIR}"
 
 # load Python conda env (make sure you have all packages installed)
+module purge
 module load anaconda3
+module load cuda
 source $CONDA_PREFIX/etc/profile.d/conda.sh
-conda activate hura
-conda install -y pip numpy pytorch pandas
-pip install fair-esm
+conda activate pepseqpred
 
 # set CUDA environment variables
 export PYTORCH_CUDA_ALLOC_CONF="max_split_size_mb:128,expandable_segments:True"
@@ -48,9 +50,10 @@ srun python -u "${ESM_CLI}" \
     --model-name "${MODEL_NAME}" \
     --max-tokens "${MAX_TOKENS}" \
     --batch-size "${BATCH_SIZE}" \
+    --num-shards "${NUM_SHARDS}" \
+    --shard-id "${SHARD_ID}" \
     --log-dir "${LOG_DIR}" \
     --log-json \
-    --save-mode pt \
     --out-dir "${OUT_DIR}"
 
-# USAGE: sbatch --export=ALL,IN_FASTA=/scratch/<NAUIDD>/<targets>.fasta generateembeddings.sh
+# MONSOON USAGE: sbatch --export=ALL,IN_FASTA=/scratch/$USER/data/<targets>.fasta generateembeddings.sh

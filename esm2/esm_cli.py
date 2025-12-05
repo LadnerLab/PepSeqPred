@@ -92,12 +92,6 @@ def setup_logger(log_dir: Path, log_level: str = "INFO", json_lines: bool = Fals
     stream_handler = logging.StreamHandler()
     stream_handler.setFormatter(stream_formatter)
     logger.addHandler(stream_handler)
-
-    # initial log
-    context = {"SLURM_JOB_ID": os.getenv("SLURM_JOB_ID"), 
-               "SLURM_JOB_NAME": os.getenv("SLURM_JOB_NAME"), 
-               "CUDA_VISIBLE_DEVICES": os.getenv("CUDA_VISIBLE_DEVICES")}
-    logger.info("logging_init", extra={"extra": context})
     
     return logger
 
@@ -442,6 +436,7 @@ def esm_embeddings_from_fasta(fasta_df: pd.DataFrame,
     layer = 33 if "t33" in model_name else 30 if "t30" in model_name else 12 if "t12" in model_name else 6
     logger.info("model_loaded", extra={"extra": {
         "device": device, 
+        "first_param_device": next(model.parameters()).device.type, 
         "layer": layer, 
         "max_tokens": max_tokens, 
         "model_name": model_name
@@ -662,6 +657,16 @@ def main() -> None:
     logger = setup_logger(out_dir / args.log_dir, 
                           log_level=args.log_level, 
                           json_lines=args.log_json)
+    
+    # initial log
+    logger.info("cuda_status", 
+                extra={"extra": {
+                    "SLURM_JOB_ID": os.getenv("SLURM_JOB_ID"), 
+                    "SLURM_JOB_NAME": os.getenv("SLURM_JOB_NAME"), 
+                    "cuda_is_available": torch.cuda.is_available(), 
+                    "device_count": torch.cuda.device_count(), 
+                    "visible_devices": os.getenv("CUDA_VISIBLE_DEVICES")
+                }})
 
     # read input fasta file and sort by sequence length
     fasta_df = read_fasta(args.fasta_file)

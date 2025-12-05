@@ -117,7 +117,7 @@ class PeptideDatasetBuilder:
             emb_tensor = torch.stack(embeddings, dim=0) # (N, L, D)
 
         return PeptideDataset(embeddings=emb_tensor, 
-                                 targets=torch.stack(targets, dim=0), # (N, 3)
+                                 targets=targets, 
                                  code_names=code_names, 
                                  protein_ids=protein_ids, 
                                  peptides=peptides, 

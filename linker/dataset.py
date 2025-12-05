@@ -1,19 +1,39 @@
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Tuple
 import torch
 import torch.serialization as ts
+from torch.utils.data import Dataset
 
 @dataclass
-class PeptideDataset:
+class PeptideDataset(Dataset):
     embeddings: torch.Tensor | List[torch.Tensor]
-    targets: List[torch.Tensor]
+    targets: torch.Tensor | List[torch.Tensor]
     code_names: List[str]
     protein_ids: List[str]
     peptides: List[str]
     align_starts: List[int]
     align_stops: List[int]
 
+    def __post_init__(self) -> None:
+        # normalize embeddings to a single tensor (N, L, D)
+        if isinstance(self.embeddings, list):
+            self.embeddings = torch.stack(self.embeddings, dim=0)
+
+        # normalize targets to a single tensor
+        if isinstance(self.targets, list):
+            self.targets = torch.stack(self.targets, dim=0)
+
+    # ----- Dataset API -----
+    def __len__(self) -> int:
+        return self.targets.size(0)
+    
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        X = self.embeddings[idx] # (L, D)
+        y = self.targets[idx] # (3,)
+        return X, y
+    
+    # ----- Convenient props -----
     @property
     def n_samples(self) -> int:
         return self.targets.size(0)

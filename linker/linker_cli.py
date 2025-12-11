@@ -60,7 +60,7 @@ def main() -> None:
                         type=Path, 
                         help="Path to the directory storing .pt embedding files.")
     parser.add_argument("save_path", 
-                        type=str, 
+                        type=Path, 
                         help="Name of output file to save training data to.")
     
     args = parser.parse_args()
@@ -74,6 +74,7 @@ def main() -> None:
                                     emb_dir=args.emb_dir, 
                                     logger=logger)
     data = builder.build()
+    args.save_path.parent.mkdir(parents=True, exist_ok=True)
     data.save(args.save_path)
 
     logger.info("linking_done", 

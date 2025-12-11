@@ -54,7 +54,9 @@ class PeptideDataset(Dataset):
                 "align_stops": self.align_stops}
     
     def save(self, save_path: Path | str) -> None:
-        torch.save(self, save_path)
+        path = Path(save_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(self, path)
 
     @classmethod
     def load(cls, path: Path | str) -> "PeptideDataset":

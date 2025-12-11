@@ -9,7 +9,7 @@ import torch
 from dataset import PeptideDataset
 
 def parse_id_from_fullname(fullname: str) -> str:
-    fullname_pattern = re.compile(r"^>ID=([^\s]+)\s+AC=([^\s]+)\s+OXX=([^\s]+)\s*$")
+    fullname_pattern = re.compile(r"^ID=([^\s]+)\s+AC=([^\s]+)\s+OXX=([^\s]+)\s*$")
     match_ = fullname_pattern.match(fullname)
     if not match_:
         raise ValueError(f"Could not parse ID from fullname: '{fullname}'")
@@ -80,7 +80,12 @@ class PeptideDatasetBuilder:
             fullname = str(row["FullName"])
             protein_id = parse_id_from_fullname(fullname)
 
-            full_emb = self._get_full_embedding(protein_id) # (L_full, D)
+            # skip missing embedding files
+            try:
+                full_emb = self._get_full_embedding(protein_id) # (L_full, D)
+            except FileNotFoundError:
+                continue
+ 
             L_full = full_emb.size(0)
 
             if align_start < 0 or align_stop > L_full:
@@ -89,10 +94,23 @@ class PeptideDatasetBuilder:
             
             pep_emb = full_emb[align_start:align_stop] # (L_pep, D), usually (30, 1281)
             L_pep = pep_emb.size(0)
+            parsed_pep_seq_len = len(peptide_seq)
 
-            if L_pep != peptide_len:
-                # handle as either error or log warning?
-                pass
+            if L_pep != peptide_len or L_pep != parsed_pep_seq_len:
+                # log warning then skip peptide
+                self.logger.warning("length_mismatch", 
+                                    extra={"extra": {
+                                        "row_index": index,
+                                        "protein_id": protein_id,
+                                        "code_name": code_name,
+                                        "align_start": align_start,
+                                        "align_stop": align_stop,
+                                        "peptide_len_from_param": peptide_len,
+                                        "embedding_len": L_pep,
+                                        "peptide_seq_len": parsed_pep_seq_len,
+                                        "peptide_seq": peptide_seq,
+                                    }})
+                continue
 
             target_vec = load_one_hot_target(row)
 

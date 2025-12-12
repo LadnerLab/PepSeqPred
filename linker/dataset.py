@@ -56,13 +56,16 @@ class PeptideDataset(Dataset):
     def save(self, save_path: Path | str) -> None:
         path = Path(save_path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        torch.save(self, path)
+        payload = self.to_dict()
+        torch.save(payload, path)
 
     @classmethod
     def load(cls, path: Path | str) -> "PeptideDataset":
         with ts.safe_globals([cls]):
             obj = torch.load(path, map_location="cpu")
+
+        if isinstance(obj, dict):
+            return cls(**obj)
         
-        if not isinstance(obj, cls):
-            raise TypeError(f"Object in {path} is not of type {cls.__name__}")
-        return obj
+        raise TypeError(f"Unrecognized object in {path}. "
+                        f"Expected dict payload, got {type(obj)}.")

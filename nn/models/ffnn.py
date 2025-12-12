@@ -6,7 +6,7 @@ from typing import Iterable, Sequence
 class PepSeqFFNN(PepSeqClassifierBase):
     def __init__(self, emb_dim: int = 1281, 
                  hidden_sizes: Sequence[int] = (150, 120, 45), 
-                 dropouts: Sequence[float] = (0.7, 0.7, 0.7), 
+                 dropouts: Sequence[float] = (0.2, 0.2, 0.2), 
                  num_classes: int = 3):
         super().__init__(emb_dim=emb_dim, num_classes=num_classes)
 

@@ -1,41 +1,6 @@
 from pathlib import Path
-from warnings import deprecated
 import pandas as pd
-from read import read_fasta, read_metadata, read_zscores
 from typing import Optional, List
-
-@deprecated("process.py is deprecated and will be removed in the future.")
-def merge_fasta_metadata(fasta_df: pd.DataFrame, 
-                         meta_df: pd.DataFrame, 
-                         id_col: str = "FullName", 
-                         seq_col: str = "Sequence", 
-                         out_col: str = "Protein") -> pd.DataFrame:
-    """
-    Performs a left merge using FASTA and metadata DataFrames on the ID column.
-
-    Parameters
-    ----------
-        fasta_df : pd.DataFrame
-            DataFrame containing an ID column and protein sequences.
-        meta_df : pd.DataFrame
-            DataFrame containing populated metadata columns for PV1 style peptides.
-        id_col : str
-            The column to merge the DataFrame's on.
-        seq_col : str
-            Name of protein sequence column in FASTA DataFrame.
-        out_col : str
-            Name of the protein sequence column to be used in the final output DataFrame.
-    
-    Returns
-    -------
-        pd.DataFrame
-            The DataFrame left merged the ID column name.
-    """
-    merged = meta_df.merge(fasta_df[[id_col, seq_col]], on=id_col, how="left", validate="m:1")
-    merged[out_col] = merged[seq_col]
-    merged.drop(columns=[seq_col], inplace=True)
-
-    return merged
 
 def merge_zscores_metadata(z_df: pd.DataFrame, 
                            meta_df: pd.DataFrame, 
@@ -129,19 +94,3 @@ def apply_z_threshold(z_df: pd.DataFrame,
     return z_df.assign(**{"Def epitope": def_is.astype("int8"), 
                         "Uncertain": uncertain.astype("int8"), 
                         "Not epitope": def_not.astype("int8")})
-
-if __name__ == "__main__":
-    # testing each function
-    pd.set_option("display.max_rows", None)
-    pd.set_option("display.max_columns", None)
-    pd.set_option("display.max_colwidth", None)
-
-    fasta_test = read_fasta(Path("../data/fulldesign_2019-02-27_wGBKsw.fasta"), full_name=True)
-    metadata_test = read_metadata(Path("../data/PV1_meta_2020-11-23.tsv"))
-    zscores_test = read_zscores(Path("../data/SHERC_combined_wSB_4-24-24_Z-HDI95_avg_round.tsv"))
-
-    merged1 = merge_fasta_metadata(fasta_test, metadata_test)
-    print(merged1.head())
-    z_df = apply_z_threshold(zscores_test)
-    merged2 = merge_zscores_metadata(z_df, merged1)
-    print(merged2.head())

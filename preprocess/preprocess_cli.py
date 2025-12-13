@@ -1,58 +1,12 @@
-import os
-import json
 import argparse
 from pathlib import Path
 import pandas as pd
 import logging
 import time
-from datetime import datetime
-from read import read_fasta, read_metadata, read_zscores
+from pipelineio.logger import setup_logger
+from pipelineio.read import read_fasta, read_metadata, read_zscores
 from process import merge_zscores_metadata, apply_z_threshold
 from typing import Optional, Tuple
-
-def setup_logger(log_level: str = "INFO", json_lines: bool = False) -> logging.Logger:
-    """
-    Creates and sets up a configured logger for this CLI.
-
-    Parameters
-    ----------
-        log_level : str
-            Minimum level for logs. Default is "INFO".
-        json_lines : bool
-            When True, formats logs as a JSON object. Default is False (`logging` library default format).
-
-    Returns
-    -------
-        logging.Logger
-            Logger named `preprocess_cli` with a stream handler attached.
-    """
-    class JSONFormatter(logging.Formatter):
-        def format(self, record):
-            payload = {"timestamp": datetime.now().isoformat(), 
-                       "level": record.levelname, 
-                       "message": record.getMessage(), 
-                       "logger": record.name, 
-                       "where": f"{record.pathname}:{record.lineno}"}
-            
-            # add all detailed logs using "extra" kwargs
-            if hasattr(record, "extra") and isinstance(record.extra, dict):
-                payload.update(record.extra)
-            
-            return json.dumps(payload, ensure_ascii=False, separators=(",", ":"), indent=2)
-    
-    # create named logger and reset any inherited handlers to avoid duplication
-    logger = logging.getLogger("preprocess_cli")
-    logger.setLevel(getattr(logging, log_level.upper(), logging.INFO))
-    logger.handlers[:] = [] # avoid duplicate handlers
-
-    # choose formatter style
-    stream_formatter = JSONFormatter() if json_lines else logging.Formatter("%(levelname)s %(message)s")
-
-    stream_handler = logging.StreamHandler()
-    stream_handler.setFormatter(stream_formatter)
-    logger.addHandler(stream_handler)
-    
-    return logger
 
 def preprocess(meta_path: Path | str, 
                fasta_path: Path | str, 

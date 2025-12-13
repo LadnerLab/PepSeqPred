@@ -27,10 +27,8 @@ Usage
 """
 import os
 import re
-import json
 import logging
 import time
-from logging.handlers import RotatingFileHandler
 import argparse
 from pathlib import Path
 from datetime import datetime
@@ -39,61 +37,7 @@ import esm
 import torch
 import numpy as np
 import pandas as pd
-
-def setup_logger(log_dir: Path, log_level: str = "INFO", json_lines: bool = False) -> logging.Logger:
-    """
-    Creates and sets up a configured logger for this CLI.
-
-    Parameters
-    ----------
-        log_dir : Path
-            Directory where log files will be written.
-        log_level : str
-            Minimum level for logs. Default is "INFO".
-        json_lines : bool
-            When True, formats logs as a JSON object. Default is False (`logging` library default format).
-
-    Returns
-    -------
-        logging.Logger
-            Logger named `esm_cli` with a file handler and a stream handler attached.
-    """
-    log_dir.mkdir(parents=True, exist_ok=True)
-    log_path = log_dir / f"esm_cli_{datetime.now().strftime('%Y-%m-%d_T%H_%M_%S')}.log"
-
-    class JSONFormatter(logging.Formatter):
-        def format(self, record):
-            payload = {"timestamp": datetime.now().isoformat(), 
-                       "level": record.levelname, 
-                       "message": record.getMessage(), 
-                       "logger": record.name, 
-                       "where": f"{record.pathname}:{record.lineno}"}
-            
-            # add all detailed logs using "extra" kwargs
-            if hasattr(record, "extra") and isinstance(record.extra, dict):
-                payload.update(record.extra)
-            
-            return json.dumps(payload, ensure_ascii=False, separators=(",", ":"), indent=2)
-    
-    # create named logger and reset any inherited handlers to avoid duplication
-    logger = logging.getLogger("esm_cli")
-    logger.setLevel(getattr(logging, log_level.upper(), logging.INFO))
-    logger.handlers[:] = [] # avoid duplicate handlers
-
-    # choose formatter style
-    formatter = JSONFormatter() if json_lines else logging.Formatter("[%(asctime)s] %(levelname)s %(message)s")
-    stream_formatter = JSONFormatter() if json_lines else logging.Formatter("%(levelname)s %(message)s")
-
-    # add rotating file handlers, ~10 MB of storage
-    file_handler = RotatingFileHandler(log_path, maxBytes=10_000_000, backupCount=3)
-    file_handler.setFormatter(formatter)
-    logger.addHandler(file_handler)
-
-    stream_handler = logging.StreamHandler()
-    stream_handler.setFormatter(stream_formatter)
-    logger.addHandler(stream_handler)
-    
-    return logger
+from pipelineio.logger import setup_logger
 
 def read_fasta(fasta_path: str | Path) -> pd.DataFrame:
     """
@@ -654,9 +598,12 @@ def main() -> None:
     
     args = parser.parse_args()
     out_dir = args.out_dir
+    json_indent = 2 if args.json_lines else None
     logger = setup_logger(out_dir / args.log_dir, 
                           log_level=args.log_level, 
-                          json_lines=args.log_json)
+                          json_lines=args.log_json, 
+                          json_indent=json_indent, 
+                          name="esm_cli")
     
     # initial log
     logger.info("cuda_status", 

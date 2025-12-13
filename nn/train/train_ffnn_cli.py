@@ -5,7 +5,7 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, random_split
 from pipelineio.logger import setup_logger
-from linker.dataset import PeptideDataset
+from pipelineio.peptidedataset import PeptideDataset
 from nn.models.ffnn import PepSeqFFNN
 from nn.train.trainer import Trainer, TrainerConfig
 

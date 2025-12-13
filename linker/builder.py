@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Dict, List
 import pandas as pd
 import torch
-from dataset import PeptideDataset
+from pipelineio.peptidedataset import PeptideDataset
 
 def parse_id_from_fullname(fullname: str) -> str:
     fullname_pattern = re.compile(r"^ID=([^\s]+)\s+AC=([^\s]+)\s+OXX=([^\s]+)\s*$")

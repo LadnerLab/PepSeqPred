@@ -159,16 +159,3 @@ def read_zscores(z_path: Path | str,
     z_df.rename(columns={z_id_col: meta_id_col}, inplace=True)
 
     return z_df
-
-if __name__ == "__main__":
-    # testing each function
-    pd.set_option("display.max_rows", None)
-    pd.set_option("display.max_columns", None)
-    pd.set_option("display.max_colwidth", None)
-
-    fasta_test = read_fasta(Path("../data/fulldesign_2019-02-27_wGBKsw.fasta"), full_name=True)
-    print(fasta_test.head())
-    metadata_test = read_metadata(Path("../data/PV1_meta_2020-11-23.tsv"), drop_cols=["Category", "SpeciesID", "Protein", "Encoding"])
-    print(metadata_test.head())
-    zscores_test = read_zscores(Path("../data/SHERC_combined_wSB_4-24-24_Z-HDI95_avg_round.tsv"))
-    print(zscores_test.head())

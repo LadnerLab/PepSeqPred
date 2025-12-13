@@ -4,12 +4,11 @@ import pandas as pd
 import logging
 import time
 from pipelineio.logger import setup_logger
-from pipelineio.read import read_fasta, read_metadata, read_zscores
-from process import merge_zscores_metadata, apply_z_threshold
+from pipelineio.read import read_metadata, read_zscores
+from preprocess.process import merge_zscores_metadata, apply_z_threshold
 from typing import Optional, Tuple
 
 def preprocess(meta_path: Path | str, 
-               fasta_path: Path | str, 
                z_path: Path | str, 
                fname_col: str = "FullName", 
                code_col: str = "CodeName", 
@@ -28,8 +27,6 @@ def preprocess(meta_path: Path | str,
     ----------
         meta_path: Path or str
             Path to metadata file.
-        fasta_path : str or Path
-            Path to the FASTA file.
         z_path: Path or str
             Path to metadata file.
         fname_col : str
@@ -60,18 +57,13 @@ def preprocess(meta_path: Path | str,
             Fully populated PV1 metadata style DataFrame for use in ESM-2 embedding generation and machine learning
             epitope location training/predictions. Optionally, saves DataFrame to a TSV file if `save_path` argument
             is passed to function.
-        fasta_df : pd.DataFrame
-            The fasta file read into a DataFrame for use in ESM-2 embedding generation and machine learning epitope 
-            location training/predictions.
     """
     t0 = time.perf_counter()
     meta_df = read_metadata(meta_path, id_col=fname_col, drop_cols=["Category", "SpeciesID", "Protein", "Encoding"])
-    fasta_df = read_fasta(fasta_path, full_name=True)
     z_df = read_zscores(z_path, meta_id_col=code_col)
     logger.info("read_files", 
                 extra={"extra": {
                     "meta_size": len(meta_df), 
-                    "fasta_size": len(fasta_df), 
                     "z_size": len(z_df), 
                     "read_duration_s": round(time.perf_counter() - t0, 3)
                 }})
@@ -97,20 +89,17 @@ def preprocess(meta_path: Path | str,
                     "merge_duration_s": round(time.perf_counter() - t2, 3)
                 }})
 
-    return fully_pop_meta_df, fasta_df
+    return fully_pop_meta_df
 
 def main() -> None:
     """
     Parse CLI arguments, set up logging, run data preprocessing script, and save results.
     """
     t0 = time.perf_counter()
-    parser = argparse.ArgumentParser(description="Preprocess and label model input data from PV1 metadata, targets fasta file, and z-score reactivity datasets.")
+    parser = argparse.ArgumentParser(description="Preprocess and label model input data from PV1 metadata and z-score reactivity datasets.")
     parser.add_argument("meta_file", 
                         type=Path, 
                         help="Path to metadata file.")
-    parser.add_argument("fasta_file", 
-                        type=Path, 
-                        help="Path to targets fasta file.")
     parser.add_argument("z_file", 
                         type=Path, 
                         help="Path to z-score reactivity file.")
@@ -187,8 +176,7 @@ def main() -> None:
                     "save_path": str(save_path)
                 }})
 
-    meta_df, fasta_df = preprocess(args.meta_file, 
-                         args.fasta_file, 
+    meta_df = preprocess(args.meta_file, 
                          args.z_file, 
                          fname_col=args.fname_col, 
                          code_col=args.code_col,  
@@ -203,7 +191,6 @@ def main() -> None:
     logger.info("preprocessing_done", 
                 extra={"extra": {
                     "meta_size": len(meta_df), 
-                    "fasta_size": len(fasta_df), 
                     "output_file_path": str(save_path), 
                     "total_duration_s": round(time.perf_counter() - t0, 3)
                 }})

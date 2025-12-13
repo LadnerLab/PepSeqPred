@@ -2,7 +2,7 @@ import time
 import argparse
 from pathlib import Path
 from pipelineio.logger import setup_logger
-from builder import PeptideDatasetBuilder
+from linker.builder import PeptideDatasetBuilder
 
 def main() -> None:
     t0 = time.perf_counter()

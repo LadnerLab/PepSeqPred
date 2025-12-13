@@ -43,4 +43,4 @@ python3 -m preprocess.preprocess_cli \
     --subject-prefix "$PREFIX" \
     --save-path
 
-# COMMAND: ./preprocessdata.sh ../../data/PV1_meta_2020-11-23.tsv ../../data/SHERC_combined_wSB_4-24-24_Z-HDI95_avg_round.tsv
+# COMMAND: ./preprocessdata.sh ./data/PV1_meta_2020-11-23.tsv ./data/SHERC_combined_wSB_4-24-24_Z-HDI95_avg_round.tsv

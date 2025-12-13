@@ -4,12 +4,13 @@ set -euo pipefail
 echo "Starting smoke test ============================================================"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+ROOT_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
-META_DIR="${ROOT_DIR}/data"
+META_DIR="${ROOT_DIR}/linker/tests/data"
 META_PATH="${META_DIR}/test_meta.tsv"
 EMB_DIR="${META_DIR}/embeddings"
 OUT_PATH="${META_DIR}/test_dataset.pt"
+ENV_DIR="../../venv"
 
 mkdir -p "${EMB_DIR}"
 
@@ -17,10 +18,14 @@ echo "Creating test metadata at ${META_PATH}..."
 
 cat > "${META_PATH}" << 'EOF'
 CodeName	AlignStart	AlignStop	FullName	Peptide	Def epitope	Uncertain	Not epitope
-TEST_0001	0	30	">ID=PROT1 AC=P00001 OXX=11111"	AAAAAAAAAAAAAAAAAAAAAAAAAAAAAA	1	0	0
-TEST_0002	10	40	">ID=PROT2 AC=P00002 OXX=22222"	BBBBBBBBBBBBBBBBBBBBBBBBBBBBBB	0	1	0
-TEST_0003	50	80	">ID=PROT3 AC=P00003 OXX=33333"	CCCCCCCCCCCCCCCCCCCCCCCCCCCCCC	0	0	1
+TEST_0001	0	30	"ID=PROT1 AC=P00001 OXX=11111"	AAAAAAAAAAAAAAAAAAAAAAAAAAAAAA	1	0	0
+TEST_0002	10	40	"ID=PROT2 AC=P00002 OXX=22222"	BBBBBBBBBBBBBBBBBBBBBBBBBBBBBB	0	1	0
+TEST_0003	50	80	"ID=PROT3 AC=P00003 OXX=33333"	CCCCCCCCCCCCCCCCCCCCCCCCCCCCCC	0	0	1
 EOF
+
+# environment config
+echo "Activating virtual environment..."
+source "$ENV_DIR/Scripts/activate"
 
 echo "Creating dummy .pt embeddings at ${EMB_DIR}..."
 
@@ -42,7 +47,9 @@ PY
 
 echo "Running linker_cli.py..."
 
-python3 "../linker_cli.py" \
+cd "${ROOT_DIR}"
+
+python3 -m linker.linker_cli \
     "${META_PATH}" \
     "${EMB_DIR}" \
     "${OUT_PATH}"
@@ -55,7 +62,7 @@ sys.path.insert(0, "${ROOT_DIR}")
 
 import torch
 from pathlib import Path
-from dataset import PeptideDataset
+from pipelineio.peptidedataset import PeptideDataset
 
 path = Path("${OUT_PATH}")
 data = PeptideDataset.load(path)

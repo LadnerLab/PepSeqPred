@@ -128,7 +128,7 @@ def main() -> None:
     args = parser.parse_args()
     out_dir = args.out_dir
     json_indent = 2 if args.log_json else None
-    logger = setup_logger(out_dir / args.log_dir, 
+    logger = setup_logger(log_dir=(out_dir / args.log_dir), 
                           log_level=args.log_level, 
                           json_lines=args.log_json, 
                           json_indent=json_indent, 

@@ -6,7 +6,7 @@ echo "Starting smoke test ======================================================
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
-TEST_DIR="${ROOT_DIR}/esm/tests/smoketest"
+TEST_DIR="${ROOT_DIR}/esm2/tests/smoketest"
 FASTA="${TEST_DIR}/data/smokesample.fasta"
 ENV_DIR="../../venv"
 

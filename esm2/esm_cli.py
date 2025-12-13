@@ -33,7 +33,7 @@ import esm
 import torch
 from pipelineio.logger import setup_logger
 from pipelineio.read import read_fasta
-from embeddings import esm_embeddings_from_fasta
+from esm2.embeddings import esm_embeddings_from_fasta
 
 def main() -> None:
     """
@@ -127,7 +127,7 @@ def main() -> None:
     
     args = parser.parse_args()
     out_dir = args.out_dir
-    json_indent = 2 if args.json_lines else None
+    json_indent = 2 if args.log_json else None
     logger = setup_logger(out_dir / args.log_dir, 
                           log_level=args.log_level, 
                           json_lines=args.log_json, 

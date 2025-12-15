@@ -6,13 +6,13 @@ echo "Starting smoke test ======================================================
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 
-INPUT_DATA="${ROOT_DIR}/nn/train/tests/data.pt"
-SAVE_PATH="${ROOT_DIR}/nn/train/tests/results"
+INPUT_DATA="${ROOT_DIR}/data/localsample/sample_data.pt"
+SAVE_PATH="${ROOT_DIR}/nn/models/samples"
 mkdir -p "${SAVE_PATH}"
 
 EPOCHS="${EPOCHS:-5}"
 SEED="${SEED:-42}"
-BATCH_SIZE="${BATCH_SIZE:-32}"
+BATCH_SIZE="${BATCH_SIZE:-8}"
 LEARNING_RATE="${LEARNING_RATE:-0.001}"
 WEIGHT_DECAY="${WEIGHT_DECAY:-0.0}"
 VALIDATION_FRACTION="${VALIDATION_FRACTION:-0.2}"

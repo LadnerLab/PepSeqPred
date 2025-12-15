@@ -1,3 +1,14 @@
+"""preprocess_cli.py
+
+This module is designed to preprocess the metadata and z-score datasets for 
+downstream model training by cleaning up the metadata file and appending 
+one-hot encoded targets generated from the z-score dataset.
+
+Usage
+-----
+>>> # from scripts/preprocessdata.sh
+>>> ./preprocessdata.sh <metadata_tsv> <zscore_tsv>
+"""
 import argparse
 from pathlib import Path
 import pandas as pd

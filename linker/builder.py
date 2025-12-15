@@ -9,6 +9,21 @@ import torch
 from pipelineio.peptidedataset import PeptideDataset
 
 def parse_id_from_fullname(fullname: str) -> str:
+    """
+    Parses ID part from fullname string. Example:
+    ID=Q9DJD5_9PICO AC=Q9DJD5 OXX=12118,12110,12109,12058. ID would be:
+    Q9DJD5_9PICO
+    
+    Parameters
+    ----------
+        fullname : str
+            The fullname string from the column "FullName" in metadata file.
+
+    Returns
+    -------
+        str
+            The ID parsed from fullname string.
+    """
     fullname_pattern = re.compile(r"^ID=([^\s]+)\s+AC=([^\s]+)\s+OXX=([^\s]+)\s*$")
     match_ = fullname_pattern.match(fullname)
     if not match_:
@@ -16,6 +31,24 @@ def parse_id_from_fullname(fullname: str) -> str:
     return match_.group(1)
 
 def load_protein_embedding(pt_path: Path | str) -> torch.Tensor:
+    """
+    Loads the entire protein embedding (L, D + 1) from a .pt file. 
+    
+    Parameters
+    ----------
+        pt_path : Path or str
+            Path to the .pt file containing entire protein embedding.
+
+    Returns
+    -------
+        Tensor
+            The contiguous embedding as a loaded tensor.
+
+    Raises
+    ------
+        ValueError
+            If embedding is not stored as a tensor, error is raised as unsupported .pt format.
+    """
     embedding = torch.load(pt_path, map_location="cpu")
     if isinstance(embedding, torch.Tensor):
         return embedding.contiguous()
@@ -23,6 +56,24 @@ def load_protein_embedding(pt_path: Path | str) -> torch.Tensor:
         raise ValueError(f"Unsupported .pt format in '{pt_path}'")
     
 def load_one_hot_target(row: pd.Series) -> torch.Tensor:
+    """
+    Loads the one-hot encoded model targets from a DataFrame row.
+
+    Parameters
+    ----------
+        row : Series
+            A row from a Pandas DataFrame as type series.
+
+    Returns
+    -------
+        Tensor
+            A vector containing the one-hot encoded model targets.
+
+    Raises
+    ------
+        ValueError
+            If the vector values do not sum to 1.
+    """
     y_def = int(row["Def epitope"])
     y_unc = int(row["Uncertain"])
     y_not = int(row["Not epitope"])
@@ -36,6 +87,18 @@ def load_one_hot_target(row: pd.Series) -> torch.Tensor:
     return vec
 
 class PeptideDatasetBuilder:
+    """
+    Builds out the PeptideDataset dataclass for use in downstream model training.
+
+    Parameters
+    ----------
+        meta_path : Path or str
+            Path to the metadata TSV file.
+        emb_dir : Path or str
+            Path to the directory storing embeddings.
+        logger : Logger
+            Logger to keep track of progress and write errors.
+    """
     def __init__(self, meta_path: Path | str, 
                  emb_dir: Path | str, 
                  logger: logging.Logger):
@@ -48,6 +111,9 @@ class PeptideDatasetBuilder:
         self.logger = logger
 
     def _get_full_embedding(self, protein_id: str) -> torch.Tensor:
+        """
+        Adds protein embedding to cache if found, otherwise throws FileNotFoundError.
+        """
         if protein_id not in self._full_emb_cache:
             pt_path = self.emb_dir / f"{protein_id}.pt"
             if not os.path.exists(pt_path):
@@ -57,6 +123,24 @@ class PeptideDatasetBuilder:
         return self._full_emb_cache[protein_id]
     
     def build(self, peptide_len: int = 30) -> PeptideDataset:
+        """
+        Builds the PeptideDataset dataclass for downstream model training.
+
+        Parameters
+        ----------
+            peptide_len : int
+                The expected length of a peptide for this dataset. We are expecting 30mers by default.
+
+        Returns
+        -------
+            PeptideDataset
+                A fully populated PeptideDataset object.
+
+        Raises
+        ------
+            IndexError
+                If parsed align_start and align_stop values are out of embedding bounds.
+        """
         embeddings: List[torch.Tensor] = []
         targets: List[torch.Tensor] = []
         code_names: List[str] = []

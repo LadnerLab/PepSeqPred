@@ -1,3 +1,9 @@
+"""train_ffnn_cli.py
+
+This module is designed to train a FFNN to predict if a peptide is likely to contain, not contain, or is uncertain about containing epitopes.
+
+***Usage TBD
+"""
 import argparse
 from pathlib import Path
 import random
@@ -10,6 +16,21 @@ from nn.models.ffnn import PepSeqFFNN
 from nn.train.trainer import Trainer, TrainerConfig
 
 def compute_class_weights(data: DataLoader, num_classes: int = 3) -> torch.Tensor:
+    """
+    Calculates the weight of each class.
+
+    Parameters
+    ----------
+        data : DataLoader
+            Model training data with likely imbalanced classes.
+        num_classes : int
+            The number of classes in the data.
+
+    Returns
+    -------
+        Tensor
+            The class weights as a tensor.
+    """
     counts = torch.zeros(num_classes, dtype=torch.long)
     for _, y_onehot in data:
         y = y_onehot.argmax(dim=-1)
@@ -22,6 +43,7 @@ def compute_class_weights(data: DataLoader, num_classes: int = 3) -> torch.Tenso
     return weights
 
 def main() -> None:
+    """Handles command-line argument parsing and high-level execution of the Train FFNN program."""
     parser = argparse.ArgumentParser(description="Train PepSeqPred FFNN on peptide-level ESM-2 embeddings to predict likelihood of peptide containing vs not containing vs uncertain about containing epitopes across the infectome.")
     parser.add_argument("input_data", 
                         type=Path, 

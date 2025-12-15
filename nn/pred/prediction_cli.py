@@ -1,16 +1,44 @@
+"""prediction_cli.py
+
+This module is designed to predict the probability of a peptide belonging to three different classes: definitely epitope, uncertain, and not epitope by using a PepSeqFFNN.
+
+***Usage TBD
+"""
 import argparse
 from pathlib import Path
 import torch
 import esm
 import numpy as np
-from typing import Dict, Any
+from typing import Dict, Any, Tuple
 from pipelineio.logger import setup_logger
 from esm2.embeddings import clean_seq, compute_window_embedding, append_seq_len
 from nn.models.ffnn import PepSeqFFNN
 
 CLASS_NAMES = ["Def epitope", "Uncertain", "Not eptiope"]
 
-def find_peptide_start_stop(protein_seq: str, peptide: str) -> int:
+def find_peptide_start_stop(protein_seq: str, peptide: str) -> Tuple[int, int]:
+    """
+    Find the peptide start and stop indices within an overall protein sequence if they were not provided.
+
+    Parameters
+    ----------
+        protein_seq : str
+            The entire protein sequence used to generate the peptide.
+        peptide : str
+            The peptide as a string which should be a subset of the overall protein sequence.
+
+    Returns
+    -------
+        start : int
+            Start index of the peptide.
+        stop : int
+            Stop index of the peptide.
+
+    Raises
+    ------
+        ValueError
+            If peptide is not found in the protein sequence.
+    """
     start = protein_seq.find(peptide)
     stop = len(peptide) + start
     if start < 0 or stop > len(protein_seq):
@@ -18,6 +46,24 @@ def find_peptide_start_stop(protein_seq: str, peptide: str) -> int:
     return start, stop
 
 def infer_emb_dim(state: Dict[str, Any]) -> int:
+    """
+    Infers the embedding dimension from the model state.
+
+    Parameters
+    ----------
+        state : Dict[str, Any]
+            The current model state as a dict.
+
+    Returns
+    -------
+        int
+            The embedding dimension (usually 1281).
+
+    Raises
+    ------
+        ValueError
+            If no 2D weight tensors were found to infer embedding dimension.
+    """
     for _, v in state.items():
         if torch.is_tensor(v) and v.dim() == 2:
             return int(v.shape[1])
@@ -26,6 +72,24 @@ def infer_emb_dim(state: Dict[str, Any]) -> int:
 def embed_protein_seq(protein_seq: str, 
                       model_name: str = "esm2_t33_650M_UR50D", 
                       max_tokens: int = 1022) -> torch.Tensor:
+    """
+    Generates the embedding for an entire protein sequence.
+
+    Parameters
+    ----------
+        protein_seq : str
+            The overall protein sequence the peptide was generated from.
+        model_name : str
+            The model used to generate ESM-2 training embeddings from. This 
+            model must match the training model. Default is esm2_t33_650M_UR50D.
+        max_tokens : int
+            Maximum number of tokens the ESM model can fit in its context window. Default is 1022.
+
+    Returns
+    -------
+        Tensor
+            The entire protein sequence's embeddings.
+    """
     # load ESM embedding model
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model, alphabet = getattr(esm.pretrained, model_name)()
@@ -58,6 +122,7 @@ def embed_protein_seq(protein_seq: str,
     return torch.from_numpy(rep_np)
 
 def main() -> None:
+    """Handles command-line argument parsing and high-level execution of the Prediction program."""
     parser = argparse.ArgumentParser(description="Predict epitope class for a peptide using a trained PepSeqPred model.")
     parser.add_argument("checkpoint", 
                         type=Path, 

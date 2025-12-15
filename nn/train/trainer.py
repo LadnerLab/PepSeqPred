@@ -7,6 +7,21 @@ from dataclasses import dataclass
 from typing import Optional, List, Dict, Any
 
 def count_classes(loader: DataLoader, num_classes: int = 3) -> List[int]:
+    """
+    Counts total number of peptides per class.
+
+    Parameters
+    ----------
+        loader : DataLoader
+            The DataLoader containing one-hot encoded targets to sum.
+        num_classes : int
+            Number of classes to sum. Default is 3.
+
+    Returns
+    -------
+        counts : List[int]
+            List containing the sum of each class.
+    """
     counts = [0] * num_classes
     for _, y_onehot in loader:
         y = y_onehot.argmax(dim=-1)
@@ -16,6 +31,7 @@ def count_classes(loader: DataLoader, num_classes: int = 3) -> List[int]:
 
 @dataclass
 class TrainerConfig:
+    """Configuration dataclass used to configure the model training."""
     epochs: int = 10
     batch_size: int = 64
     learning_rate: float = 1e-3
@@ -24,6 +40,24 @@ class TrainerConfig:
     device: str = "cuda" # should only train using GPUs (but can be changed to "cpu")
 
 class Trainer:
+    """
+    Trainer class used to facilitate model training. Can take in most types of neural networks as input for training.
+
+    Parameters
+    ----------
+        model : Module
+            A PyTorch Module class which is the neural network to be trained.
+        train_loader : DataLoader
+            The model training data.
+        logger : Logger
+            Logger used to log progress and errors.
+        val_loader : DataLoader or None
+            Optional model evaluation data.
+        config : TrainerConfig
+            Neural network specific parameters to tweak.
+        class_weights : Tensor or None
+            Optional weights per class in the case of class imbalance.
+    """
     def __init__(self, model: nn.Module, 
                  train_loader: DataLoader, 
                  logger: logging.Logger, 
@@ -72,6 +106,7 @@ class Trainer:
                          }})
 
     def _batch_step(self, batch: torch.Tensor, train: bool = True) -> Dict[str, Any]:
+        """Steps through a batch to train and optimize the model."""
         X, y_onehot = batch # (B, L, E), (B, 3)
         X = X.to(self.device)
         y_onehot = y_onehot.to(self.device)
@@ -121,6 +156,7 @@ class Trainer:
                 "preds": preds.detach().cpu()} # (B,)
 
     def _run_epoch(self, epoch: int, train: bool = True) -> Dict[str, float]:
+        """Runs one complete epoch (training step) from start to finish."""
         loader = self.train_loader if train else self.val_loader
         if loader is None:
             return {"loss": float("nan"), "acc": float("nan")}
@@ -190,6 +226,14 @@ class Trainer:
         return {"loss": avg_loss, "acc": avg_acc}
 
     def fit(self, save_dir: Optional[Path | str] = None) -> None:
+        """
+        Fits a neural network model to the data provided.
+
+        Parameters
+        ----------
+            save_dir : Path or str or None
+                An optional path to a directory to save the best performing model to.
+        """
         best_val_loss = float("inf")
         if save_dir is not None:
             save_dir.mkdir(parents=True, exist_ok=True)
@@ -219,6 +263,7 @@ class Trainer:
                          }})
 
     def _save_checkpoint(self, path: Path | str, epoch: int, loss: float) -> None:
+        """Saves model checkpoint to path."""
         path.parent.mkdir(parents=True, exist_ok=True)
         state = {"model_state_dict": self.model.state_dict(), 
                  "optim_state_dict": self.optimizer.state_dict(), 

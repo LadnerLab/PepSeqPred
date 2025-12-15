@@ -60,18 +60,12 @@ def embed_protein_seq(protein_seq: str,
 def main() -> None:
     parser = argparse.ArgumentParser(description="Predict epitope class for a peptide using a trained PepSeqPred model.")
     parser.add_argument("checkpoint", 
-                        action="store", 
-                        dest="checkpoint", 
                         type=Path, 
                         help="Path to the trained model checkpoint (.pt).")
-    parser.add_argument("protein-seq", 
-                        action="store", 
-                        dest="protein_seq", 
+    parser.add_argument("protein_seq",  
                         type=str, 
                         help="Full protein sequence the peptide came from.")
     parser.add_argument("peptide", 
-                        action="store", 
-                        dest="peptide", 
                         type=str, 
                         help="Peptide sequence to score.")
     parser.add_argument("--align-start", 

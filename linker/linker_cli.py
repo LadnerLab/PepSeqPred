@@ -1,56 +1,39 @@
+"""linker_cli.py
+
+This module is designed to link the model training data and targets together for downstream neural network training and evaluation. For example:
+
+Sample metadata TSV file
+------------------------
+CodeName	AlignStart	AlignStop	FullName	Peptide	Def epitope	Uncertain	Not epitope \n
+TEST_0001	0	30	"ID=PROT1 AC=P00001 OXX=11111"	AAAAAAAAAAAAAAAAAAAAAAAAAAAAAA	1	0	0 \n
+TEST_0002	10	40	"ID=PROT2 AC=P00002 OXX=22222"	BBBBBBBBBBBBBBBBBBBBBBBBBBBBBB	0	1	0 \n
+TEST_0003	50	80	"ID=PROT3 AC=P00003 OXX=33333"	CCCCCCCCCCCCCCCCCCCCCCCCCCCCCC	0	0	1 \n
+
+Sample embeddings generated (L, D + 1)
+--------------------------------------
+EMB_1: [[0.123, 1.532, -0.035, ..., 2.445], ..., 519] \n
+EMB_2: [[1.623, -0.022, -0.999, ..., 6.013], ..., 36] \n
+EMB_3: [[0.321, -6.59, 0.635, ..., -0.001], ..., 1108] \n
+
+This data is combined such that each peptide from the metadata is used to parse out the peptide-level embeddings from the overall protein
+sequence's embeddings, then mapped to their targets (labels), along with other information used to make model training as simple as possible.
+
+Usage
+-----
+>>> # can be done locally, or on HPC
+>>> python linker_cli.py \ 
+    <meta_path> \ 
+    <emb_dir> \ 
+    <out_path>
+"""
 import time
-import json
 import argparse
-import logging
 from pathlib import Path
-from datetime import datetime
-from builder import PeptideDatasetBuilder
-
-def setup_logger(log_level: str = "INFO", json_lines: bool = False) -> logging.Logger:
-    """
-    Creates and sets up a configured logger for this CLI.
-
-    Parameters
-    ----------
-        log_level : str
-            Minimum level for logs. Default is "INFO".
-        json_lines : bool
-            When True, formats logs as a JSON object. Default is False (`logging` library default format).
-
-    Returns
-    -------
-        logging.Logger
-            Logger named `linker_cli` with a stream handler attached.
-    """
-    class JSONFormatter(logging.Formatter):
-        def format(self, record):
-            payload = {"timestamp": datetime.now().isoformat(), 
-                       "level": record.levelname, 
-                       "message": record.getMessage(), 
-                       "logger": record.name, 
-                       "where": f"{record.pathname}:{record.lineno}"}
-            
-            # add all detailed logs using "extra" kwargs
-            if hasattr(record, "extra") and isinstance(record.extra, dict):
-                payload.update(record.extra)
-            
-            return json.dumps(payload, ensure_ascii=False, separators=(",", ":"), indent=2)
-    
-    # create named logger and reset any inherited handlers to avoid duplication
-    logger = logging.getLogger("linker_cli")
-    logger.setLevel(getattr(logging, log_level.upper(), logging.INFO))
-    logger.handlers[:] = [] # avoid duplicate handlers
-
-    # choose formatter style
-    stream_formatter = JSONFormatter() if json_lines else logging.Formatter("%(levelname)s %(message)s")
-
-    stream_handler = logging.StreamHandler()
-    stream_handler.setFormatter(stream_formatter)
-    logger.addHandler(stream_handler)
-    
-    return logger
+from pipelineio.logger import setup_logger
+from linker.builder import PeptideDatasetBuilder
 
 def main() -> None:
+    """Handles command-line argument parsing and high-level execution of the Linker program."""
     t0 = time.perf_counter()
     parser = argparse.ArgumentParser(description="Link generated ESM-2 embeddings with metadata to create model training data.")
     parser.add_argument("meta_path", 
@@ -60,11 +43,13 @@ def main() -> None:
                         type=Path, 
                         help="Path to the directory storing .pt embedding files.")
     parser.add_argument("save_path", 
-                        type=str, 
+                        type=Path, 
                         help="Name of output file to save training data to.")
     
     args = parser.parse_args()
-    logger = setup_logger(json_lines=True)
+    logger = setup_logger(json_lines=True, 
+                          json_indent=2, 
+                          name="linker_cli")
 
     logger.info("run_start", 
                 extra={"extra": {
@@ -74,6 +59,7 @@ def main() -> None:
                                     emb_dir=args.emb_dir, 
                                     logger=logger)
     data = builder.build()
+    args.save_path.parent.mkdir(parents=True, exist_ok=True)
     data.save(args.save_path)
 
     logger.info("linking_done", 

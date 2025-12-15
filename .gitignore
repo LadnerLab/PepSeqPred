@@ -13,3 +13,4 @@ data/
 *.csv
 *.tsv
 *.pt
+*.log

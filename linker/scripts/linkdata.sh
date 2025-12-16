@@ -1,18 +1,40 @@
-#!/usr/bin/env bash
+#!/bin/bash
+#SBATCH --job-name=link_data
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --mem=16G
+#SBATCH --time=00:30:00
+#SBATCH --output=/scratch/%u/linker_slurm/%x_%j.out
+#SBATCH --error=/scratch/%u/linker_slurm/%x_%j.err
+
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ROOT_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+# handle incorrect usage
+usage() {
+    echo "Usage $0 <meta_path> <emb_dir> <out_path>"
+    echo "    meta_path: Path to preprocessed metadata."
+    echo "    emb_dir: Path to directory containing ESM-2 embeddings."
+    echo "    out_path: Desired output directory."
+}
 
-META_PATH="${ROOT_DIR}/data/localsample/meta_500_20_4_10_all.tsv"
-EMB_DIR="${ROOT_DIR}/esm2/tests/sample/artifacts/pts"
-OUT_PATH="${ROOT_DIR}/data/localsample/sample_data.pt"
-ENV_DIR="${ROOT_DIR}/venv"
+if [ "$#" -ne 3 ]; then
+    usage
+fi
 
-source "$ENV_DIR/Scripts/activate"
-cd "${ROOT_DIR}"
+# set script variables
+META_PATH="$1"
+EMB_DIR="$2"
+OUT_PATH="$3"
 
-python3 -m linker.linker_cli \
+# load Python Conda virtual environment (ensure env installed on HPC)
+# module purge
+# module load anaconda3
+# module load cuda
+# source $CONDA_PREFIX/etc/profile.d/conda.sh
+# conda activate pepseqpred
+source "../../venv/Scripts/activate"
+
+python3 -u linker_cli.pyz \
     "${META_PATH}" \
     "${EMB_DIR}" \
     "${OUT_PATH}"

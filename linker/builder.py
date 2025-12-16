@@ -3,7 +3,7 @@ import re
 import time
 import logging
 from pathlib import Path
-from typing import Dict, List
+from typing import List
 import pandas as pd
 import torch
 from pipelineio.peptidedataset import PeptideDataset
@@ -104,23 +104,20 @@ class PeptideDatasetBuilder:
                  logger: logging.Logger):
         self.meta_path = Path(meta_path)
         self.emb_dir = Path(emb_dir)
-        self.df = pd.read_csv(meta_path, sep="\t")
 
-        self._full_emb_cache: Dict[str, torch.Tensor] = {}
+        self.df = pd.read_csv(meta_path, sep="\t")
+        self.df["protein_id"] = self.df["FullName"].astype(str).map(parse_id_from_fullname)
 
         self.logger = logger
 
     def _get_full_embedding(self, protein_id: str) -> torch.Tensor:
         """
-        Adds protein embedding to cache if found, otherwise throws FileNotFoundError.
+        Gets protein embedding from disk, otherwise throws FileNotFoundError.
         """
-        if protein_id not in self._full_emb_cache:
-            pt_path = self.emb_dir / f"{protein_id}.pt"
-            if not os.path.exists(pt_path):
-                raise FileNotFoundError(f"Missing embedding file: '{pt_path}'")
-            self._full_emb_cache[protein_id] = load_protein_embedding(pt_path)
-
-        return self._full_emb_cache[protein_id]
+        pt_path = self.emb_dir / f"{protein_id}.pt"
+        if not os.path.exists(pt_path):
+            raise FileNotFoundError(f"Missing embedding file: '{pt_path}'")
+        return load_protein_embedding(pt_path)
     
     def build(self, peptide_len: int = 30) -> PeptideDataset:
         """
@@ -154,58 +151,60 @@ class PeptideDatasetBuilder:
                          extra={"extra": {
                              "expected_peptide_len": peptide_len
                          }})
-
-        for index, row in self.df.iterrows():
-            code_name = str(row["CodeName"])
-            align_start = int(row["AlignStart"])
-            align_stop = int(row["AlignStop"])
-            peptide_seq = str(row["Peptide"])
-
-            fullname = str(row["FullName"])
-            protein_id = parse_id_from_fullname(fullname)
-
+        
+        # iterate over same proteins only once
+        grouped_proteins = self.df.groupby("protein_id", sort=False)
+        for protein_id, group in grouped_proteins:
             # skip missing embedding files
             try:
                 full_emb = self._get_full_embedding(protein_id) # (L_full, D)
             except FileNotFoundError:
                 continue
- 
-            L_full = full_emb.size(0)
+            except Exception as e:
+                self.logger.error(f"{e}: {protein_id}")
 
-            if align_start < 0 or align_stop > L_full:
-                raise IndexError(f"Row {index} asks for slice [{align_start}:{align_stop}] "
-                                 f"but full embedding length is {L_full} for protein '{protein_id}'")
-            
-            pep_emb = full_emb[align_start:align_stop] # (L_pep, D), usually (30, 1281)
-            L_pep = pep_emb.size(0)
-            parsed_pep_seq_len = len(peptide_seq)
+            for index, row in group.iterrows():
+                code_name = str(row["CodeName"])
+                align_start = int(row["AlignStart"])
+                align_stop = int(row["AlignStop"])
+                peptide_seq = str(row["Peptide"])
+    
+                L_full = full_emb.size(0)
 
-            if L_pep != peptide_len or L_pep != parsed_pep_seq_len:
-                # log warning then skip peptide
-                self.logger.warning("length_mismatch", 
-                                    extra={"extra": {
-                                        "row_index": index,
-                                        "protein_id": protein_id,
-                                        "code_name": code_name,
-                                        "align_start": align_start,
-                                        "align_stop": align_stop,
-                                        "peptide_len_from_param": peptide_len,
-                                        "embedding_len": L_pep,
-                                        "peptide_seq_len": parsed_pep_seq_len,
-                                        "peptide_seq": peptide_seq,
-                                    }})
-                continue
+                if align_start < 0 or align_stop > L_full:
+                    raise IndexError(f"Row {index} asks for slice [{align_start}:{align_stop}] "
+                                    f"but full embedding length is {L_full} for protein '{protein_id}'")
+                
+                pep_emb = full_emb[align_start:align_stop] # (L_pep, D), usually (30, 1281)
+                L_pep = pep_emb.size(0)
+                parsed_pep_seq_len = len(peptide_seq)
 
-            target_vec = load_one_hot_target(row)
+                if L_pep != peptide_len or L_pep != parsed_pep_seq_len:
+                    # log warning then skip peptide
+                    self.logger.warning("length_mismatch", 
+                                        extra={"extra": {
+                                            "row_index": index,
+                                            "protein_id": protein_id,
+                                            "code_name": code_name,
+                                            "align_start": align_start,
+                                            "align_stop": align_stop,
+                                            "peptide_len_from_param": peptide_len,
+                                            "embedding_len": L_pep,
+                                            "peptide_seq_len": parsed_pep_seq_len,
+                                            "peptide_seq": peptide_seq,
+                                        }})
+                    continue
 
-            # build lists
-            embeddings.append(pep_emb)
-            targets.append(target_vec)
-            code_names.append(code_name)
-            protein_ids.append(protein_id)
-            peptides.append(peptide_seq)
-            align_starts.append(align_start)
-            align_stops.append(align_stop)
+                target_vec = load_one_hot_target(row)
+
+                # build lists
+                embeddings.append(pep_emb)
+                targets.append(target_vec)
+                code_names.append(code_name)
+                protein_ids.append(protein_id)
+                peptides.append(peptide_seq)
+                align_starts.append(align_start)
+                align_stops.append(align_stop)
 
         self.logger.info("build_loop_finished", 
                          extra={"extra": {

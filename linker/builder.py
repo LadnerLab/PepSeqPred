@@ -8,7 +8,7 @@ from typing import List, Optional
 import pandas as pd
 import numpy as np
 import torch
-from peptidedataset import PeptideDataset
+from pipelineio.peptidedataset import PeptideDataset
 
 def parse_id_from_fullname(fullname: str) -> str:
     """

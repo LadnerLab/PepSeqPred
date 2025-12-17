@@ -29,8 +29,8 @@ Usage
 import time
 import argparse
 from pathlib import Path
-from logger import setup_logger
-from builder import PeptideDatasetBuilder
+from pipelineio.logger import setup_logger
+from linker.builder import PeptideDatasetBuilder
 
 def main() -> None:
     """Handles command-line argument parsing and high-level execution of the Linker program."""

@@ -8,8 +8,6 @@
 #SBATCH --output=/scratch/%u/linker_slurm/%x_%j.out
 #SBATCH --error=/scratch/%u/linker_slurm/%x_%j.err
 
-set -euo pipefail
-
 # handle incorrect usage
 usage() {
     echo "Usage $0 <meta_path> <out_path> <emb_dir_1> [emb_dir2, ..., emb_dir_n]"

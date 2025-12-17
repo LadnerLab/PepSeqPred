@@ -21,16 +21,16 @@ sequence's embeddings, then mapped to their targets (labels), along with other i
 Usage
 -----
 >>> # can be done locally, or on HPC
->>> python linker_cli.py \ 
-    <meta_path> \ 
-    <emb_dir> \ 
+>>> python linker_cli.py \
+    <meta_path> \
+    <emb_dir> \
     <out_path>
 """
 import time
 import argparse
 from pathlib import Path
-from pipelineio.logger import setup_logger
-from linker.builder import PeptideDatasetBuilder
+from logger import setup_logger
+from builder import PeptideDatasetBuilder
 
 def main() -> None:
     """Handles command-line argument parsing and high-level execution of the Linker program."""
@@ -39,12 +39,15 @@ def main() -> None:
     parser.add_argument("meta_path", 
                         type=Path, 
                         help="Path to metadata file.")
-    parser.add_argument("emb_dir", 
-                        type=Path, 
-                        help="Path to the directory storing .pt embedding files.")
     parser.add_argument("save_path", 
                         type=Path, 
                         help="Name of output file to save training data to.")
+    parser.add_argument("--emb-dir", 
+                        action="append", 
+                        dest="emb_dirs", 
+                        type=Path, 
+                        required=True, 
+                        help="Embedding directory. Repeat this flag to add multiple shard roots.")
     
     args = parser.parse_args()
     logger = setup_logger(json_lines=True, 
@@ -56,9 +59,9 @@ def main() -> None:
                     "saving_to": str(args.save_path)
                 }})
     builder = PeptideDatasetBuilder(meta_path=args.meta_path, 
-                                    emb_dir=args.emb_dir, 
+                                    emb_dirs=args.emb_dirs, 
                                     logger=logger)
-    data = builder.build()
+    data = builder.build(memmap_dtype="float32")
     args.save_path.parent.mkdir(parents=True, exist_ok=True)
     data.save(args.save_path)
 

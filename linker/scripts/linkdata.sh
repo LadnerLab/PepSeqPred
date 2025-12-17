@@ -2,8 +2,9 @@
 #SBATCH --job-name=link_data
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --mem=16G
-#SBATCH --time=00:30:00
+#SBATCH --cpus-per-task=4
+#SBATCH --mem=128G
+#SBATCH --time=12:00:00
 #SBATCH --output=/scratch/%u/linker_slurm/%x_%j.out
 #SBATCH --error=/scratch/%u/linker_slurm/%x_%j.err
 
@@ -11,30 +12,37 @@ set -euo pipefail
 
 # handle incorrect usage
 usage() {
-    echo "Usage $0 <meta_path> <emb_dir> <out_path>"
+    echo "Usage $0 <meta_path> <out_path> <emb_dir_1> [emb_dir2, ..., emb_dir_n]"
     echo "    meta_path: Path to preprocessed metadata."
-    echo "    emb_dir: Path to directory containing ESM-2 embeddings."
-    echo "    out_path: Desired output directory."
+    echo "    out_path: Desired output .pt file path."
+    echo "    emb_dir_*: One or more directories containing .pt embeddings."
 }
 
-if [ "$#" -ne 3 ]; then
+# need at least metadata, output directory, and one embedding directory
+if [ "$#" -lt 3 ]; then
     usage
+    exit 1
 fi
 
-# set script variables
 META_PATH="$1"
-EMB_DIR="$2"
-OUT_PATH="$3"
+OUT_PATH="$2"
+shift 2
+EMB_DIRS=("$@")
 
 # load Python Conda virtual environment (ensure env installed on HPC)
-# module purge
-# module load anaconda3
-# module load cuda
-# source $CONDA_PREFIX/etc/profile.d/conda.sh
-# conda activate pepseqpred
-source "../../venv/Scripts/activate"
+module purge
+module load anaconda3
+module load cuda
+source $CONDA_PREFIX/etc/profile.d/conda.sh
+conda activate pepseqpred
 
-python3 -u linker_cli.pyz \
-    "${META_PATH}" \
-    "${EMB_DIR}" \
-    "${OUT_PATH}"
+# build script arguments list for linker
+PY_ARGS=(
+    "$META_PATH"
+    "$OUT_PATH"
+)
+for d in "${EMB_DIRS[@]}"; do
+    PY_ARGS+=("--emb-dir" "$d")
+done
+
+srun python -u linker_cli.pyz "${PY_ARGS[@]}"

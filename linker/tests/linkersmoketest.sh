@@ -51,8 +51,8 @@ cd "${ROOT_DIR}"
 
 python3 -m linker.linker_cli \
     "${META_PATH}" \
-    "${EMB_DIR}" \
-    "${OUT_PATH}"
+    "${OUT_PATH}" \
+    --emb-dir "${EMB_DIR}"
 
 echo "Inspecting saved dataset at ${OUT_PATH}..."
 

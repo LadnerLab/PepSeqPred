@@ -2,9 +2,9 @@
 #SBATCH --job-name=link_data
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=4
-#SBATCH --mem=128G
-#SBATCH --time=12:00:00
+#SBATCH --cpus-per-task=1
+#SBATCH --mem=64G
+#SBATCH --time=1:30:00
 #SBATCH --output=/scratch/%u/linker_slurm/%x_%j.out
 #SBATCH --error=/scratch/%u/linker_slurm/%x_%j.err
 

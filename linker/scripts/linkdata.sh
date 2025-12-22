@@ -3,10 +3,10 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=1
-#SBATCH --mem=64G
+#SBATCH --mem=16G
 #SBATCH --time=1:30:00
-#SBATCH --output=/scratch/%u/linker_slurm/%x_%j.out
-#SBATCH --error=/scratch/%u/linker_slurm/%x_%j.err
+#SBATCH --output=/scratch/%u/linker_slurm/%j/%x.out
+#SBATCH --error=/scratch/%u/linker_slurm/%j/%x.err
 
 # handle incorrect usage
 usage() {

@@ -96,6 +96,12 @@ def main() -> None:
                         type=int, 
                         default=0, 
                         help="If > 0, use only first N samples from dataset")
+    parser.add_argument("--num-workers", 
+                        action="store", 
+                        dest="num_workers", 
+                        type=int, 
+                        default=0, 
+                        help="Number of worker threads for data loading")
 
     args = parser.parse_args()
     logger = setup_logger(json_lines=True, 
@@ -134,12 +140,12 @@ def main() -> None:
     train_loader = DataLoader(train_data, 
                               batch_size=args.batch_size, 
                               shuffle=True, 
-                              num_workers=0, 
+                              num_workers=args.num_workers, 
                               pin_memory=pin)
     val_loader = DataLoader(val_data, 
                             batch_size=args.batch_size, 
                             shuffle=False, 
-                            num_workers=0, 
+                            num_workers=args.num_workers, 
                             pin_memory=pin)
     
     # build our FFNN model

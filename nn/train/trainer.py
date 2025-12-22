@@ -108,8 +108,9 @@ class Trainer:
     def _batch_step(self, batch: torch.Tensor, train: bool = True) -> Dict[str, Any]:
         """Steps through a batch to train and optimize the model."""
         X, y_onehot = batch # (B, L, E), (B, 3)
-        X = X.to(self.device)
-        y_onehot = y_onehot.to(self.device)
+        non_blocking = (self.device.type == "cuda")
+        X = X.to(self.device, non_blocking=non_blocking)
+        y_onehot = y_onehot.to(self.device, non_blocking=non_blocking)
 
         # validate targets
         if y_onehot.dim() != 2 or y_onehot.size(-1) != 3:
@@ -137,7 +138,7 @@ class Trainer:
         acc = correct / total
 
         if train:
-            self.optimizer.zero_grad()
+            self.optimizer.zero_grad(set_to_none=True)
             loss.backward()
             self.optimizer.step()
 

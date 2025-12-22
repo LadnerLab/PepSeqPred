@@ -6,7 +6,7 @@ echo "Starting smoke test ======================================================
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 
-INPUT_DATA="${ROOT_DIR}/data/localsample/sample_data.pt"
+INPUT_DATA="${ROOT_DIR}/data/localsample/500_sample.pt"
 SAVE_PATH="${ROOT_DIR}/nn/models/samples"
 mkdir -p "${SAVE_PATH}"
 
@@ -22,7 +22,7 @@ echo "Running train_ffnn_cli.py..."
 
 cd "${ROOT_DIR}"
 
-python3 -m nn.train.train_ffnn_cli \
+python3 nn/train/train_ffnn.pyz \
     "${INPUT_DATA}" \
     --epochs "${EPOCHS}" \
     --seed "${SEED}" \

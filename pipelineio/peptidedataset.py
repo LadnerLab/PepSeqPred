@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 from pathlib import Path
+import contextlib
 from typing import List, Dict, Any, Tuple
 import torch
 import torch.serialization as ts
@@ -97,7 +98,14 @@ class PeptideDataset(Dataset):
     @classmethod
     def load(cls, path: Path | str) -> "PeptideDataset":
         """Load a PeptideDataset from disk."""
-        with ts.safe_globals([cls]):
+        if hasattr(ts, "safe_globals"):
+            ctx = ts.safe_globals([cls])
+        else:
+            if hasattr(ts, "add_safe_globals"):
+                ts.add_safe_globals([cls])
+            ctx = contextlib.nullcontext()
+
+        with ctx:
             obj = torch.load(path, map_location="cpu")
 
         if isinstance(obj, dict):

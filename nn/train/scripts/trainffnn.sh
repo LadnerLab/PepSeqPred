@@ -46,7 +46,7 @@ source $CONDA_PREFIX/etc/profile.d/conda.sh
 conda activate pepseqpred
 
 # turn off srun for testing
-if [ "${USE_SRUN}" --eq 1 ]; then
+if [ "${USE_SRUN}" -eq 1 ]; then
     LAUNCHER="srun"
 else
     LAUNCHER=""

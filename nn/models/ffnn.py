@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from .base import PepSeqClassifierBase
+from base import PepSeqClassifierBase
 from typing import Iterable, Sequence
 
 class PepSeqFFNN(PepSeqClassifierBase):

@@ -7,14 +7,14 @@
 #SBATCH --cpus-per-task=1
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --mem=32G
-#SBATCH --time=00:15:00
+#SBATCH --mem=16G
+#SBATCH --time=00:01:00
 
 usage() {
     echo "Usage $0 <checkpoint> <protein_seq> <peptide>"
     echo "    checkpoint: Path to the best model checkpoint .pt file."
-    echo "    protein_seq: The entire protein sequence the peptide is derived from as a continuous string."
-    echo "    peptide: The peptide sequence as a continuous string."
+    echo "    fasta_input: Path to a FASTA file containing protein sequence(s) and peptides."
+    echo "    output_csv: Path to output CSV file to write predictions to."
 }
 
 if [ "$#" -lt 3 ]; then
@@ -23,8 +23,8 @@ if [ "$#" -lt 3 ]; then
 fi
 
 CHECKPOINT=$1
-PROTEIN_SEQ=$2
-PEPTIDE=$3
+FASTA_INPUT=$2
+OUTPUT_CSV=$3
 
 module purge
 module load anaconda3
@@ -34,6 +34,6 @@ conda activate pepseqpred
 
 srun python -u make_prediction.pyz \
     "${CHECKPOINT}" \
-    "${PROTEIN_SEQ}" \
-    "${PEPTIDE}" \
+    "${FASTA_INPUT}" \
+    --output-csv "${OUTPUT_CSV}" \
     --log-json

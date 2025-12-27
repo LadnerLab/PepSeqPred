@@ -148,6 +148,7 @@ class Trainer:
         self.logger.info("trainer_init", 
                          extra={"extra": {
                              "device": str(self.device), 
+                             "seed": torch.initial_seed(), 
                              "epochs": self.config.epochs, 
                              "batch_size": self.config.batch_size, 
                              "learning_rate": self.config.learning_rate, 

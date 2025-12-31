@@ -316,7 +316,7 @@ def main() -> None:
 
     # build model loaded from disk
     emb_dim = infer_emb_dim(state)
-    psp_model = PepSeqFFNN(emb_dim=emb_dim, num_classes=len(CLASS_NAMES))
+    psp_model = PepSeqFFNN(emb_dim=emb_dim, hidden_sizes=(512, 256, 128), num_classes=len(CLASS_NAMES))
     psp_model.load_state_dict(state)
     psp_model.eval().to(device)
 

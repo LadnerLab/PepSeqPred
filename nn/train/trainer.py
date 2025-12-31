@@ -74,7 +74,7 @@ def compute_eval_metrics(y_true: torch.Tensor, y_pred: torch.Tensor, y_prob: tor
 
     # AUC10 calculation
     def auc10_binary(y_true_bin, y_score) -> float:
-        fpr, tpr = roc_curve(y_true_bin, y_score)
+        fpr, tpr, _ = roc_curve(y_true_bin, y_score)
         mask = fpr <= 0.10
         if mask.sum() < 2:
             return float("nan")
@@ -220,7 +220,7 @@ class Trainer:
                 "preds": preds.detach().cpu(), # (B,)
                 "probs": probs.detach().cpu()} # (B, 3)
 
-    def _run_epoch(self, epoch: int, train: bool = True) -> Dict[str, float]:
+    def _run_epoch(self, epoch: int, train: bool = True) -> Dict[str, Any]:
         """Runs one complete epoch (training step) from start to finish."""
         loader = self.train_loader if train else self.val_loader
         if loader is None:
@@ -324,6 +324,7 @@ class Trainer:
                 An optional path to a directory to save the best performing model to.
         """
         best_val_loss = float("inf")
+        best_metrics: Dict[str, Any] = {}
         if save_dir is not None:
             save_dir.mkdir(parents=True, exist_ok=True)
 
@@ -344,11 +345,13 @@ class Trainer:
                 metric_loss = val_metrics["loss"] if val_metrics is not None else train_metrics["loss"]
                 if metric_loss < best_val_loss:
                     best_val_loss = metric_loss
-                    self._save_checkpoint(save_dir / "best_model.pt", epoch, best_val_loss, val_metrics["eval_metrics"])
+                    best_metrics = val_metrics["eval_metrics"] if val_metrics is not None else {}
+                    self._save_checkpoint(save_dir / "best_model.pt", epoch, best_val_loss, best_metrics)
 
         self.logger.info("training_done", 
                          extra={"extra": {
-                             "best_val_loss": best_val_loss
+                             "best_val_loss": best_val_loss, 
+                             "best_metrics": best_metrics
                          }})
 
     def _save_checkpoint(self, path: Path | str, epoch: int, loss: float, metrics: Dict[str, Any]) -> None:

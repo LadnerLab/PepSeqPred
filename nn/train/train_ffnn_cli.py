@@ -151,7 +151,12 @@ def main() -> None:
     
     # build our FFNN model
     emb_dim = data.embeddings.size(-1)
-    model = PepSeqFFNN(emb_dim=emb_dim, num_classes=3)
+    model = PepSeqFFNN(emb_dim=emb_dim, 
+                       hidden_sizes=(128, 128, 128, 128), 
+                       dropouts=(0.1, 0.1, 0.1, 0.1), 
+                       use_layer_norm=True, 
+                       use_residual=True, 
+                       num_classes=3)
 
     # setup config and train
     config = TrainerConfig(epochs=args.epochs, 

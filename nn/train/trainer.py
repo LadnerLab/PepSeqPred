@@ -4,13 +4,14 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 import numpy as np
+import optuna
 from sklearn.metrics import (precision_recall_fscore_support, 
                              matthews_corrcoef, 
                              roc_auc_score, 
                              roc_curve, 
                              auc)
 from dataclasses import dataclass
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Tuple
 
 def count_classes(loader: DataLoader, num_classes: int = 3) -> List[int]:
     """
@@ -296,6 +297,8 @@ class Trainer:
         if cm is not None:
             per_class_acc = cm.diag().float() / cm.sum(dim=1).clamp_min(1).float()
             balanced_acc = float(per_class_acc.mean().item())
+            eval_metrics["per_class_acc"] = [float(x) for x in per_class_acc.tolist()]
+            eval_metrics["balanced_acc"] = balanced_acc
             self.logger.info("val_confusion_matrix", 
                              extra={"extra": {
                                 "epoch": epoch,
@@ -371,3 +374,66 @@ class Trainer:
                              "epoch": epoch, 
                              "loss": loss
                          }})
+        
+    def fit_optuna(self, 
+                   save_dir: Optional[Path | str] = None, 
+                   trial: Optional[optuna.trial.Trial] = None, 
+                   score_key: str = "macro_f1") -> Tuple[float, int, float, Dict[str, Any]]:
+        """
+        Fits model using Optuna for hyperparameter optimization.
+        """
+        best_val_loss = float("inf")
+        best_score = float("-inf")
+        best_epoch = -1
+        best_metrics: Dict[str, Any] = {}
+
+        if save_dir is not None:
+            save_dir = Path(save_dir)
+            save_dir.mkdir(parents=True, exist_ok=True)
+
+        self.logger.info("training_started", 
+                         extra={"extra":{
+                             "epochs": self.config.epochs, 
+                             "save_dir": str(save_dir) if save_dir else None
+                         }})
+        
+        for epoch in range(self.config.epochs):
+            _ = self._run_epoch(epoch, train=True)
+
+            val_metrics = None
+            if self.val_loader is not None:
+                val_metrics = self._run_epoch(epoch, train=False)
+
+            if val_metrics is None:
+                continue
+
+            val_loss = float(val_metrics["loss"])
+            metrics = val_metrics.get("eval_metrics", {})
+            score = metrics.get(score_key, float("nan"))
+
+            # report intermediate score for pruning
+            if trial is not None:
+                if np.isfinite(score):
+                    trial.report(score, step=epoch)
+                    if trial.should_prune():
+                        raise optuna.TrialPruned()
+                    
+            # save loss
+            if save_dir is not None and val_loss < best_val_loss:
+                best_val_loss = val_loss
+                self._save_checkpoint(save_dir / "best_model.pt", epoch, best_val_loss, metrics)
+
+            # track best score for Optuna
+            if np.isfinite(score) and score > best_score:
+                best_score = score
+                best_epoch = epoch
+                best_metrics = metrics
+
+        self.logger.info("training_done", 
+                         extra={"extra": {
+                             "best_val_loss": best_val_loss, 
+                             f"best_{score_key}_score": best_score, 
+                             "best_epoch": best_epoch
+                         }})
+        
+        return float(best_score), int(best_epoch), float(best_val_loss), best_metrics

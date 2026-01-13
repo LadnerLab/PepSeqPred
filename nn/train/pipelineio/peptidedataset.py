@@ -37,7 +37,7 @@ class PeptideDataset(Dataset):
             Stop indices of each peptide within the parent protein sequence.
     """
     embeddings: torch.Tensor | List[torch.Tensor]
-    targets: torch.Tensor | List[torch.Tensor]
+    targets: torch.Tensor | List[torch.Tensor] # peptide level targets
     code_names: List[str]
     protein_ids: List[str]
     peptides: List[str]
@@ -62,8 +62,9 @@ class PeptideDataset(Dataset):
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
         """Retrieve a single embeddings sample and its target label."""
         X = self.embeddings[idx] # (L, D)
-        y = self.targets[idx] # (3,)
-        return X, y
+        y_pep = self.targets[idx] # (3,)
+        y_res = y_pep.unsqueeze(1).repeat(X.size(0), 1) # (L, 3)
+        return X, y_res
     
     # ----- Convenient props -----
     @property
@@ -75,7 +76,7 @@ class PeptideDataset(Dataset):
     def peptide_len(self) -> int:
         """Length of each peptide sequence."""
         if self.embeddings:
-            return self.embeddings[0].size(1)
+            return self.embeddings.size(1)
         return 0
     
     def to_dict(self) -> Dict[str, Any]:

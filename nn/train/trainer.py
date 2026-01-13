@@ -183,22 +183,24 @@ class Trainer:
             raise ValueError("Targets must be one-hot encoded per sample")
 
         # convert one-hot to class indices {0, 1, 2} for loss calculation
-        y = y_onehot.argmax(dim=-1)
+        y = y_onehot.argmax(dim=-1) # (B, L)
 
         # get logits to calculate loss and validate shape
         logits = self.model(X)
         if logits.dim() != 2 or logits.size(-1) != 3:
             raise ValueError(f"Expected logits shape (B, 3), got {tuple(logits.shape)}")
+        logits = logits.view(-1, logits.size(-1)) # (B * L, 3)
+        y = y.view(-1) # (B * L,)
         # calculate loss and validate for NaNs
         loss = self.criterion(logits, y)
         if not torch.isfinite(loss):
             raise FloatingPointError(f"Non-finite loss caught: {loss.item()}")
 
         # simple accuracy
-        preds = logits.argmax(dim=-1)
+        preds = logits.argmax(dim=1)
         probs = torch.softmax(logits, dim=-1)
         correct = (preds == y).sum().item()
-        total = y.size(0)
+        total = y.numel()
         acc = correct / total
 
         if train:
@@ -272,7 +274,7 @@ class Trainer:
             if cm is not None:
                 yt = out["y"]
                 yp = out["preds"]
-                for t, p in zip(yt.tolist(), yp.tolist()):
+                for t, p in zip(yt.cpu().numpy(), yp.cpu().numpy()):
                     cm[t, p] += 1
 
                 # compute eval metrics
@@ -298,8 +300,8 @@ class Trainer:
             per_class_acc = cm.diag().float() / cm.sum(dim=1).clamp_min(1).float()
             balanced_acc = float(per_class_acc.mean().item())
             eval_metrics["per_class_acc"] = [float(x) for x in per_class_acc.tolist()]
-            eval_metrics["balanced_acc"] = balanced_acc
-            self.logger.info("val_confusion_matrix", 
+            eval_metrics["res_balanced_acc"] = balanced_acc
+            self.logger.info("res_confusion_matrix", 
                              extra={"extra": {
                                 "epoch": epoch,
                                 "confusion_matrix": cm.tolist(),

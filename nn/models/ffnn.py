@@ -145,7 +145,9 @@ class PepSeqFFNN(PepSeqClassifierBase):
         if X.size(-1) != self.emb_dim:
             raise ValueError(f"Expected emb_dim {self.emb_dim}, got {X.size(-1)}")
         
-        # predicting peptide contains epitope, not if each residue is an epitope
-        pooled = X.mean(dim=1) # mean pool: (B, L, E) --> (B, E)
-        logits = self.ff_model(pooled)
+        # predict at residue level
+        B, L, D = X.shape
+        X = X.view(B * L, D) # flatten residues
+        logits = self.ff_model(X) # (B * L, 3)
+        logits = logits.view(B, L, -1)
         return logits

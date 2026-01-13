@@ -3,8 +3,15 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
+import numpy as np
+import optuna
+from sklearn.metrics import (precision_recall_fscore_support, 
+                             matthews_corrcoef, 
+                             roc_auc_score, 
+                             roc_curve, 
+                             auc)
 from dataclasses import dataclass
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Tuple
 
 def count_classes(loader: DataLoader, num_classes: int = 3) -> List[int]:
     """
@@ -28,6 +35,61 @@ def count_classes(loader: DataLoader, num_classes: int = 3) -> List[int]:
         for c in range(num_classes):
             counts[c] += int((y == c).sum().item())
     return counts
+
+def compute_eval_metrics(y_true: torch.Tensor, y_pred: torch.Tensor, y_prob: torch.Tensor) -> Dict[str, Any]:
+    """
+    Computes evaluation metrics given true lables, predicted labels, and predicted probabilities.
+
+    Parameters
+    ----------
+        y_true : Tensor
+            True class labels.
+        y_pred : Tensor
+            Predicted class labels.
+        y_prob : Tensor
+            Predicted class probabilities.
+
+    Returns
+    -------
+        metrics : Dict[str, Any]
+            Dictionary of evaluation metrics.
+    """
+    metrics: Dict[str, Any] = {}
+
+    precision, recall, f1, _ = precision_recall_fscore_support(y_true, y_pred, average="macro", zero_division=0)
+    metrics["macro_precision"] = float(precision)
+    metrics["macro_recall"] = float(recall)
+    metrics["macro_f1"] = float(f1)
+    metrics["mcc"] = matthews_corrcoef(y_true, y_pred)
+
+    # ROC AUC (one-vs-rest)
+    try:
+        auc_macro = roc_auc_score(y_true, y_prob, multi_class="ovr", average="macro")
+        auc_per_class = roc_auc_score(y_true, y_prob, multi_class="ovr", average=None)
+        metrics["auc_macro"] = auc_macro
+        metrics["auc_per_class"] = [float(x) for x in auc_per_class]
+
+    except Exception:
+        metrics["auc_macro"] = float("nan")
+        metrics["auc_per_class"] = [float("nan")] * 3
+
+    # AUC10 calculation
+    def auc10_binary(y_true_bin, y_score) -> float:
+        fpr, tpr, _ = roc_curve(y_true_bin, y_score)
+        mask = fpr <= 0.10
+        if mask.sum() < 2:
+            return float("nan")
+        return float(auc(fpr[mask], tpr[mask]) / 0.10)
+    
+    auc10s = []
+    for c in range(3):
+        y_bin = (y_true == c).astype(np.int32)
+        auc10s.append(auc10_binary(y_bin, y_prob[:, c]))
+
+    metrics["auc10_per_class"] = [float(x) for x in auc10s]
+    metrics["auc10_macro"] = float(np.nanmean(auc10s))
+
+    return metrics
 
 @dataclass
 class TrainerConfig:
@@ -87,6 +149,7 @@ class Trainer:
         self.logger.info("trainer_init", 
                          extra={"extra": {
                              "device": str(self.device), 
+                             "seed": torch.initial_seed(), 
                              "epochs": self.config.epochs, 
                              "batch_size": self.config.batch_size, 
                              "learning_rate": self.config.learning_rate, 
@@ -133,6 +196,7 @@ class Trainer:
 
         # simple accuracy
         preds = logits.argmax(dim=-1)
+        probs = torch.softmax(logits, dim=-1)
         correct = (preds == y).sum().item()
         total = y.size(0)
         acc = correct / total
@@ -153,10 +217,11 @@ class Trainer:
         return {"loss": float(loss.item()), 
                 "correct": int(correct), 
                 "n": int(total), 
-                "y": y.detach().cpu(), # (B,)
-                "preds": preds.detach().cpu()} # (B,)
+                "y": y.detach().cpu(),         # (B,)
+                "preds": preds.detach().cpu(), # (B,)
+                "probs": probs.detach().cpu()} # (B, 3)
 
-    def _run_epoch(self, epoch: int, train: bool = True) -> Dict[str, float]:
+    def _run_epoch(self, epoch: int, train: bool = True) -> Dict[str, Any]:
         """Runs one complete epoch (training step) from start to finish."""
         loader = self.train_loader if train else self.val_loader
         if loader is None:
@@ -183,11 +248,21 @@ class Trainer:
         if not train:
             cm = torch.zeros((3, 3), dtype=torch.int64) # rows true, cols pred
 
+        all_y: List[torch.Tensor] = []
+        all_preds: List[torch.Tensor] = []
+        all_probs: List[torch.Tensor] = []
+
         # use inference mode for eval
         ctx = torch.enable_grad() if train else torch.inference_mode()
         for batch in loader:
             with ctx:
                 out = self._batch_step(batch, train=train)
+
+            # collect data for metrics
+            if not train:
+                all_y.append(out["y"])
+                all_preds.append(out["preds"])
+                all_probs.append(out["probs"])
 
             total_loss += out["loss"] * out["n"]
             total_correct += out["correct"]
@@ -199,6 +274,12 @@ class Trainer:
                 yp = out["preds"]
                 for t, p in zip(yt.tolist(), yp.tolist()):
                     cm[t, p] += 1
+
+                # compute eval metrics
+                y_true = torch.cat(all_y, dim=0).numpy()
+                y_pred = torch.cat(all_preds, dim=0).numpy()
+                y_prob = torch.cat(all_probs, dim=0).numpy()
+                eval_metrics = compute_eval_metrics(y_true, y_pred, y_prob)
 
         avg_loss = total_loss / total_samples
         avg_acc = total_correct / total_samples
@@ -216,15 +297,25 @@ class Trainer:
         if cm is not None:
             per_class_acc = cm.diag().float() / cm.sum(dim=1).clamp_min(1).float()
             balanced_acc = float(per_class_acc.mean().item())
+            eval_metrics["per_class_acc"] = [float(x) for x in per_class_acc.tolist()]
+            eval_metrics["balanced_acc"] = balanced_acc
             self.logger.info("val_confusion_matrix", 
                              extra={"extra": {
-                                 "epoch": epoch,
-                                 "confusion_matrix": cm.tolist(),
-                                 "per_class_acc": per_class_acc.tolist(),
-                                 "balanced_acc": balanced_acc
+                                "epoch": epoch,
+                                "confusion_matrix": cm.tolist(),
+                                "per_class_acc": per_class_acc.tolist(),
+                                "balanced_acc": balanced_acc,
+                                "macro_precision": eval_metrics["macro_precision"],
+                                "macro_recall": eval_metrics["macro_recall"],
+                                "macro_f1": eval_metrics["macro_f1"],
+                                "mcc": eval_metrics["mcc"],
+                                "auc_macro": eval_metrics["auc_macro"],
+                                "auc_per_class": eval_metrics["auc_per_class"],
+                                "auc10_macro": eval_metrics["auc10_macro"],
+                                "auc10_per_class": eval_metrics["auc10_per_class"],
                              }})
 
-        return {"loss": avg_loss, "acc": avg_acc}
+        return {"loss": avg_loss, "acc": avg_acc, "eval_metrics": eval_metrics if not train else None}
 
     def fit(self, save_dir: Optional[Path | str] = None) -> None:
         """
@@ -236,6 +327,7 @@ class Trainer:
                 An optional path to a directory to save the best performing model to.
         """
         best_val_loss = float("inf")
+        best_metrics: Dict[str, Any] = {}
         if save_dir is not None:
             save_dir.mkdir(parents=True, exist_ok=True)
 
@@ -256,21 +348,24 @@ class Trainer:
                 metric_loss = val_metrics["loss"] if val_metrics is not None else train_metrics["loss"]
                 if metric_loss < best_val_loss:
                     best_val_loss = metric_loss
-                    self._save_checkpoint(save_dir / "best_model.pt", epoch, best_val_loss)
+                    best_metrics = val_metrics["eval_metrics"] if val_metrics is not None else {}
+                    self._save_checkpoint(save_dir / "best_model.pt", epoch, best_val_loss, best_metrics)
 
         self.logger.info("training_done", 
                          extra={"extra": {
-                             "best_val_loss": best_val_loss
+                             "best_val_loss": best_val_loss, 
+                             "best_metrics": best_metrics
                          }})
 
-    def _save_checkpoint(self, path: Path | str, epoch: int, loss: float) -> None:
+    def _save_checkpoint(self, path: Path | str, epoch: int, loss: float, metrics: Dict[str, Any]) -> None:
         """Saves model checkpoint to path."""
         path.parent.mkdir(parents=True, exist_ok=True)
         state = {"model_state_dict": self.model.state_dict(), 
                  "optim_state_dict": self.optimizer.state_dict(), 
                  "epoch": epoch, 
                  "config": self.config.__dict__, 
-                 "best_loss": loss}
+                 "best_loss": loss, 
+                 "metrics": metrics}
         torch.save(state, path)
 
         self.logger.info("checkpoint_saved", 
@@ -279,3 +374,66 @@ class Trainer:
                              "epoch": epoch, 
                              "loss": loss
                          }})
+        
+    def fit_optuna(self, 
+                   save_dir: Optional[Path | str] = None, 
+                   trial: Optional[optuna.trial.Trial] = None, 
+                   score_key: str = "macro_f1") -> Tuple[float, int, float, Dict[str, Any]]:
+        """
+        Fits model using Optuna for hyperparameter optimization.
+        """
+        best_val_loss = float("inf")
+        best_score = float("-inf")
+        best_epoch = -1
+        best_metrics: Dict[str, Any] = {}
+
+        if save_dir is not None:
+            save_dir = Path(save_dir)
+            save_dir.mkdir(parents=True, exist_ok=True)
+
+        self.logger.info("training_started", 
+                         extra={"extra":{
+                             "epochs": self.config.epochs, 
+                             "save_dir": str(save_dir) if save_dir else None
+                         }})
+        
+        for epoch in range(self.config.epochs):
+            _ = self._run_epoch(epoch, train=True)
+
+            val_metrics = None
+            if self.val_loader is not None:
+                val_metrics = self._run_epoch(epoch, train=False)
+
+            if val_metrics is None:
+                continue
+
+            val_loss = float(val_metrics["loss"])
+            metrics = val_metrics.get("eval_metrics", {})
+            score = metrics.get(score_key, float("nan"))
+
+            # report intermediate score for pruning
+            if trial is not None:
+                if np.isfinite(score):
+                    trial.report(score, step=epoch)
+                    if trial.should_prune():
+                        raise optuna.TrialPruned()
+                    
+            # save loss
+            if save_dir is not None and val_loss < best_val_loss:
+                best_val_loss = val_loss
+                self._save_checkpoint(save_dir / "best_model.pt", epoch, best_val_loss, metrics)
+
+            # track best score for Optuna
+            if np.isfinite(score) and score > best_score:
+                best_score = score
+                best_epoch = epoch
+                best_metrics = metrics
+
+        self.logger.info("training_done", 
+                         extra={"extra": {
+                             "best_val_loss": best_val_loss, 
+                             f"best_{score_key}_score": best_score, 
+                             "best_epoch": best_epoch
+                         }})
+        
+        return float(best_score), int(best_epoch), float(best_val_loss), best_metrics

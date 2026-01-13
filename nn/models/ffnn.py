@@ -3,6 +3,72 @@ import torch.nn as nn
 from base import PepSeqClassifierBase
 from typing import Iterable, Sequence
 
+class FFBlock(nn.Module):
+    """
+    Single feed-forward block with optional LayerNorm and optional residual connection.
+
+    Parameters
+    ----------
+        in_dim : int
+            Input dimension of the linear layer.
+        out_dim : int
+            Output dimension of the linear layer.
+        dropout_p : float
+            Dropout probability as a float.
+        use_layer_norm : bool
+            Whether to use LayerNorm after the linear layer.
+        use_residual : bool
+            Whether to use a residual connection.
+    """
+    def __init__(self, in_dim: int, out_dim: int, dropout_p: float, use_layer_norm: bool, use_residual: bool):
+        super().__init__()
+
+        self.linear = nn.Linear(in_dim, out_dim)
+
+        if use_layer_norm:
+            self.layer_norm = nn.LayerNorm(out_dim)
+
+        else:
+            self.layer_norm = nn.Identity()
+
+        self.activation = nn.ReLU()
+        self.dropout = nn.Dropout(dropout_p)
+        self.use_residual = use_residual
+
+        if use_residual:
+            if in_dim == out_dim:
+                self.skip = nn.Identity()
+
+            else:
+                self.skip = nn.Linear(in_dim, out_dim)
+        else:
+            self.skip = nn.Identity()
+
+    def forward(self, X: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass for the feed-forward block.
+
+        Parameters
+        ----------
+            X : Tensor
+                Input tensor of shape (B, E) where B is the batch size and E is the embedding dimension.
+
+        Returns
+        -------
+            Tensor
+                Output tensor of shape (B, out_dim).
+        """
+        y = self.linear(X)
+        y = self.layer_norm(y)
+        y = self.activation(y)
+        y = self.dropout(y)
+
+        if self.use_residual:
+            y = y + self.skip(X)
+
+        return y
+
+
 class PepSeqFFNN(PepSeqClassifierBase):
     """
     Implements PepSeqClassifierBase as a modular FFNN.
@@ -18,11 +84,17 @@ class PepSeqFFNN(PepSeqClassifierBase):
         num_classes : int
             The number of output classes. Default is `3` where each class represents the probability of a peptide
             containing an epitope, uncertain about containing an epitope, and not containing an epitope.
+        use_layer_norm : bool
+            Whether to use layer normalization after each hidden layer. Default is `False`.
+        use_residual : bool
+            Whether to use residual connections between hidden layers, Default is `False`.
     """
     def __init__(self, emb_dim: int = 1281, 
                  hidden_sizes: Sequence[int] = (150, 120, 45), 
                  dropouts: Sequence[float] = (0.2, 0.2, 0.2), 
-                 num_classes: int = 3):
+                 num_classes: int = 3, 
+                 use_layer_norm: bool = False, 
+                 use_residual: bool = False):
         super().__init__(emb_dim=emb_dim, num_classes=num_classes)
 
         if len(hidden_sizes) != len(dropouts):
@@ -33,15 +105,15 @@ class PepSeqFFNN(PepSeqClassifierBase):
 
         # arbitrary depth FFNN (default is 3 layers)
         for hidden_size, p in zip(hidden_sizes, dropouts):
-            layers += [
-                nn.Linear(in_features, hidden_size), 
-                nn.ReLU(), 
-                nn.Dropout(p)
-            ]
+            layers += [FFBlock(in_dim=in_features, 
+                               out_dim=hidden_size, 
+                               dropout_p=p, 
+                               use_layer_norm=use_layer_norm, 
+                               use_residual=use_residual)]
+
             in_features = hidden_size
 
         layers.append(nn.Linear(in_features, num_classes))
-
         self.ff_model = nn.Sequential(*layers)
 
     def forward(self, X: torch.Tensor) -> torch.Tensor:

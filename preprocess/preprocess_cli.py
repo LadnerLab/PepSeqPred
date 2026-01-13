@@ -17,8 +17,9 @@ import time
 from pipelineio.logger import setup_logger
 from pipelineio.read import read_metadata, read_zscores
 from preprocess.process import merge_zscores_metadata, apply_z_threshold
-from typing import Optional, Tuple
+from typing import Optional
 
+# TODO: log/flag all peptides < 30 amino acids in length
 def preprocess(meta_path: Path | str, 
                z_path: Path | str, 
                fname_col: str = "FullName", 
@@ -29,7 +30,7 @@ def preprocess(meta_path: Path | str,
                not_epitope_max_subjects: Optional[int] = None, 
                prefix: str = "VW_", 
                save_path: Optional[str | Path] = None, 
-               logger: Optional[logging.Logger] = None) -> Tuple[pd.DataFrame, pd.DataFrame]:
+               logger: Optional[logging.Logger] = None) -> pd.DataFrame:
     """
     Runs the entire data preprocessing step for ESM-2 embedding generation and machine learning epitope 
     predictions.

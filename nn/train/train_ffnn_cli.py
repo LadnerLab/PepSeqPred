@@ -33,8 +33,7 @@ def compute_class_weights(data: DataLoader, num_classes: int = 3) -> torch.Tenso
     """
     counts = torch.zeros(num_classes, dtype=torch.long)
     for _, y_onehot in data:
-        y = y_onehot.argmax(dim=-1)
-        y = torch.atleast_1d(y).to(torch.long)
+        y = y_onehot.argmax(dim=-1).view(-1) # flatten residues
         counts += torch.bincount(y.cpu(), minlength=num_classes)
     
     # inverse frequency so mean weight = 1

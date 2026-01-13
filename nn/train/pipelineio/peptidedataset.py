@@ -63,7 +63,7 @@ class PeptideDataset(Dataset):
         """Retrieve a single embeddings sample and its target label."""
         X = self.embeddings[idx] # (L, D)
         y_pep = self.targets[idx] # (3,)
-        y_res = y_pep.unsqueeze(1).repeat(X.size(0), 1) # (L, 3)
+        y_res = y_pep.unsqueeze(0).repeat(X.size(0), 1) # (L, 3)
         return X, y_res
     
     # ----- Convenient props -----

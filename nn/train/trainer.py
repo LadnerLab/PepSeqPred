@@ -29,12 +29,11 @@ def count_classes(loader: DataLoader, num_classes: int = 3) -> List[int]:
         counts : List[int]
             List containing the sum of each class.
     """
-    counts = [0] * num_classes
+    counts = torch.zeros(num_classes, dtype=torch.long)
     for _, y_onehot in loader:
-        y = y_onehot.argmax(dim=-1)
-        for c in range(num_classes):
-            counts[c] += int((y == c).sum().item())
-    return counts
+        y = y_onehot.argmax(dim=-1).view(-1).to(torch.long) # flatten residues
+        counts += torch.bincount(y.cpu(), minlength=num_classes)
+    return counts.tolist()
 
 def compute_eval_metrics(y_true: torch.Tensor, y_pred: torch.Tensor, y_prob: torch.Tensor) -> Dict[str, Any]:
     """
@@ -176,10 +175,10 @@ class Trainer:
         y_onehot = y_onehot.to(self.device, non_blocking=non_blocking)
 
         # validate targets
-        if y_onehot.dim() != 2 or y_onehot.size(-1) != 3:
+        if y_onehot.dim() != 3 or y_onehot.size(-1) != 3:
             raise ValueError(f"Expected y_onehot shape (B, 3), got {tuple(y_onehot.shape)}")
         row_sums = y_onehot.sum(dim=-1)
-        if not torch.all((row_sums == 1) | (row_sums == 1.0)):
+        if not torch.all((row_sums == 1)):
             raise ValueError("Targets must be one-hot encoded per sample")
 
         # convert one-hot to class indices {0, 1, 2} for loss calculation
@@ -187,8 +186,8 @@ class Trainer:
 
         # get logits to calculate loss and validate shape
         logits = self.model(X)
-        if logits.dim() != 2 or logits.size(-1) != 3:
-            raise ValueError(f"Expected logits shape (B, 3), got {tuple(logits.shape)}")
+        if logits.dim() != 3 or logits.size(-1) != 3:
+            raise ValueError(f"Expected logits shape (B, L, 3), got {tuple(logits.shape)}")
         logits = logits.view(-1, logits.size(-1)) # (B * L, 3)
         y = y.view(-1) # (B * L,)
         # calculate loss and validate for NaNs
@@ -277,11 +276,19 @@ class Trainer:
                 for t, p in zip(yt.cpu().numpy(), yp.cpu().numpy()):
                     cm[t, p] += 1
 
-                # compute eval metrics
-                y_true = torch.cat(all_y, dim=0).numpy()
-                y_pred = torch.cat(all_preds, dim=0).numpy()
-                y_prob = torch.cat(all_probs, dim=0).numpy()
-                eval_metrics = compute_eval_metrics(y_true, y_pred, y_prob)
+                # # compute eval metrics
+                # y_true = torch.cat(all_y, dim=0).numpy()
+                # y_pred = torch.cat(all_preds, dim=0).numpy()
+                # y_prob = torch.cat(all_probs, dim=0).numpy()
+                # eval_metrics = compute_eval_metrics(y_true, y_pred, y_prob)
+
+        # compute eval metrics
+        if not train:
+            y_true = torch.cat(all_y, dim=0).numpy()
+            y_pred = torch.cat(all_preds, dim=0).numpy()
+            y_prob = torch.cat(all_probs, dim=0).numpy()
+
+            eval_metrics = compute_eval_metrics(y_true, y_pred, y_prob)
 
         avg_loss = total_loss / total_samples
         avg_acc = total_correct / total_samples

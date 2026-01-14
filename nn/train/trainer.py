@@ -55,10 +55,20 @@ def compute_eval_metrics(y_true: torch.Tensor, y_pred: torch.Tensor, y_prob: tor
     """
     metrics: Dict[str, Any] = {}
 
+    # calculate macro precesion, recall, and f1
     precision, recall, f1, _ = precision_recall_fscore_support(y_true, y_pred, average="macro", zero_division=0)
     metrics["macro_precision"] = float(precision)
     metrics["macro_recall"] = float(recall)
     metrics["macro_f1"] = float(f1)
+
+    # calculate precision, recall, and f1 per class
+    precision_per_class, recall_per_class, f1_per_class, _ = precision_recall_fscore_support(
+        y_true, y_pred, average=None, labels=[0, 1, 2], zero_division=0
+    )
+    metrics["precision_per_class"] = [float(prec) for prec in precision_per_class]
+    metrics["recall_per_class"] = [float(rec) for rec in recall_per_class]
+    metrics["f1_per_class"] = [float(f1c) for f1c in f1_per_class]
+
     metrics["mcc"] = matthews_corrcoef(y_true, y_pred)
 
     # ROC AUC (one-vs-rest)
@@ -312,11 +322,14 @@ class Trainer:
                              extra={"extra": {
                                 "epoch": epoch,
                                 "confusion_matrix": cm.tolist(),
-                                "per_class_acc": per_class_acc.tolist(),
                                 "balanced_acc": balanced_acc,
+                                "per_class_acc": per_class_acc.tolist(),
                                 "macro_precision": eval_metrics["macro_precision"],
+                                "per_class_precision": eval_metrics["precision_per_class"],
                                 "macro_recall": eval_metrics["macro_recall"],
+                                "per_class_recall": eval_metrics["recall_per_class"],
                                 "macro_f1": eval_metrics["macro_f1"],
+                                "per_class_f1": eval_metrics["f1_per_class"],
                                 "mcc": eval_metrics["mcc"],
                                 "auc_macro": eval_metrics["auc_macro"],
                                 "auc_per_class": eval_metrics["auc_per_class"],

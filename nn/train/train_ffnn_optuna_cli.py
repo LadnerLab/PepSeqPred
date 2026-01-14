@@ -32,8 +32,7 @@ def compute_class_weights(data: DataLoader, num_classes: int = 3) -> torch.Tenso
     """
     counts = torch.zeros(num_classes, dtype=torch.long)
     for _, y_onehot in data:
-        y = y_onehot.argmax(dim=-1)
-        y = torch.atleast_1d(y).to(torch.long)
+        y = y_onehot.argmax(dim=-1).view(-1).to(torch.long)
         counts += torch.bincount(y.cpu(), minlength=num_classes)
     
     # inverse frequency so mean weight = 1
@@ -188,7 +187,7 @@ def main() -> None:
                         help="Max hidden width")
     parser.add_argument("--batch-sizes", 
                         type=str, 
-                        default="64,128,256", 
+                        default="32,64,128", 
                         help="Comma separated batch sizes")
     parser.add_argument("--lr-min", 
                         type=float, 
@@ -355,10 +354,19 @@ def main() -> None:
             "BestValLoss": float(best_val_loss),
             "BestEpoch": int(best_epoch),
             "MacroPrecision": float(best_metrics.get("macro_precision", float("nan"))),
+            "PrecClass0": float(best_metrics.get("precision_per_class", [float("nan")] * 3)[0]),
+            "PrecClass1": float(best_metrics.get("precision_per_class", [float("nan")] * 3)[1]),
+            "PrecClass2": float(best_metrics.get("precision_per_class", [float("nan")] * 3)[2]),
             "MacroRecall": float(best_metrics.get("macro_recall", float("nan"))),
+            "RecallClass0": float(best_metrics.get("recall_per_class", [float("nan")] * 3)[0]),
+            "RecallClass1": float(best_metrics.get("recall_per_class", [float("nan")] * 3)[1]),
+            "RecallClass2": float(best_metrics.get("recall_per_class", [float("nan")] * 3)[2]),
             "MacroF1": float(best_metrics.get("macro_f1", float("nan"))),
+            "F1Class0": float(best_metrics.get("f1_per_class", [float("nan")] * 3)[0]),
+            "F1Class1": float(best_metrics.get("f1_per_class", [float("nan")] * 3)[1]),
+            "F1Class2": float(best_metrics.get("f1_per_class", [float("nan")] * 3)[2]),
             "MCC": float(best_metrics.get("mcc", float("nan"))),
-            "BalancedAcc": float(best_metrics.get("balanced_acc", float("nan"))),
+            "BalancedAcc": float(best_metrics.get("res_balanced_acc", float("nan"))),
             "AccClass0": float(best_metrics.get("per_class_acc", [float("nan")] * 3)[0]),
             "AccClass1": float(best_metrics.get("per_class_acc", [float("nan")] * 3)[1]),
             "AccClass2": float(best_metrics.get("per_class_acc", [float("nan")] * 3)[2]),

@@ -100,6 +100,21 @@ def compute_eval_metrics(y_true: torch.Tensor, y_pred: torch.Tensor, y_prob: tor
 
     return metrics
 
+def build_default_cost_matrix() -> torch.Tensor:
+    return torch.Tensor([
+        [0.0, 1.0, 4.0], 
+        [1.0, 0.0, 1.0], 
+        [4.0, 1.0, 0.0]
+    ])
+
+def validate_cost_matrix(cost_matrix: torch.Tensor, num_classes: int = 3) -> None:
+    if cost_matrix.shape != (num_classes, num_classes):
+        raise ValueError(f"cost_matrix must be shape {(num_classes, num_classes)}")
+    if not torch.all(cost_matrix.diag() == 0):
+        raise ValueError("cost_matrix diagonal must be all zeros")
+    if torch.any(cost_matrix < 0):
+        raise ValueError("cost_matrix must be non-negative")
+
 @dataclass
 class TrainerConfig:
     """Configuration dataclass used to configure the model training."""
@@ -109,6 +124,11 @@ class TrainerConfig:
     weight_decay: float = 0.0
     num_workers: int = 0
     device: str = "cuda" # should only train using GPUs (but can be changed to "cpu")
+
+    # cost sensitive loss settings
+    use_cost_sensitive_loss: bool = True
+    cost_lambda: float = 0.5 # strength of cost penalty
+    cost_matrix: Optional[List[List[float]]] = None # (3, 3)
 
 class Trainer:
     """
@@ -153,6 +173,16 @@ class Trainer:
         self.class_weights = class_weights
         self.criterion = nn.CrossEntropyLoss(weight=self.class_weights)
 
+        # cost sensitive penalty matrix
+        if self.config.use_cost_sensitive_loss:
+            if self.config.cost_matrix is None:
+                self.cost_matrix = build_default_cost_matrix().to(self.device)
+            else:
+                self.cost_matrix = torch.tensor(self.config.cost_matrix, dtype=torch.float32, device=self.device)
+            validate_cost_matrix(self.cost_matrix)
+        else:
+            self.cost_matrix = None
+
         # inital log for reproduceability
         num_params = sum(p.numel() for p in self.model.parameters())
         self.logger.info("trainer_init", 
@@ -165,7 +195,10 @@ class Trainer:
                              "weight_decay": self.config.weight_decay, 
                              "num_params": num_params, 
                              "has_val_loader": self.val_loader is not None, 
-                             "class_weights": self.class_weights.tolist()
+                             "class_weights": self.class_weights.detach().cpu().tolist() if self.class_weights is not None else None, 
+                             "use_cost_sensitive_loss": self.config.use_cost_sensitive_loss, 
+                             "cost_lambda": self.config.cost_lambda if self.config.use_cost_sensitive_loss else None, 
+                             "cost_matrix": self.cost_matrix.detach().cpu().tolist() if self.cost_matrix is not None else None
                          }})
         
         # log class distributions
@@ -179,14 +212,14 @@ class Trainer:
 
     def _batch_step(self, batch: torch.Tensor, train: bool = True) -> Dict[str, Any]:
         """Steps through a batch to train and optimize the model."""
-        X, y_onehot = batch # (B, L, E), (B, 3)
+        X, y_onehot = batch
         non_blocking = (self.device.type == "cuda")
         X = X.to(self.device, non_blocking=non_blocking)
         y_onehot = y_onehot.to(self.device, non_blocking=non_blocking)
 
         # validate targets
         if y_onehot.dim() != 3 or y_onehot.size(-1) != 3:
-            raise ValueError(f"Expected y_onehot shape (B, 3), got {tuple(y_onehot.shape)}")
+            raise ValueError(f"Expected y_onehot shape (B, L, 3), got {tuple(y_onehot.shape)}")
         row_sums = y_onehot.sum(dim=-1)
         if not torch.all((row_sums == 1)):
             raise ValueError("Targets must be one-hot encoded per sample")
@@ -201,7 +234,7 @@ class Trainer:
         logits = logits.view(-1, logits.size(-1)) # (B * L, 3)
         y = y.view(-1) # (B * L,)
         # calculate loss and validate for NaNs
-        loss = self.criterion(logits, y)
+        loss = self._compute_loss(logits, y)
         if not torch.isfinite(loss):
             raise FloatingPointError(f"Non-finite loss caught: {loss.item()}")
 
@@ -231,6 +264,22 @@ class Trainer:
                 "y": y.detach().cpu(),         # (B,)
                 "preds": preds.detach().cpu(), # (B,)
                 "probs": probs.detach().cpu()} # (B, 3)
+    
+    def _compute_loss(self, logits: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        """Compute loss with optional cost-sensitive penalty."""
+        base_loss = self.criterion(logits, y)
+
+        if not self.config.use_cost_sensitive_loss:
+            return base_loss
+        
+        probs = torch.softmax(logits, dim=-1) # (N, 3)
+
+        # cost rows for true class of each example
+        cost_rows = self.cost_matrix[y]
+
+        # expected cost under predicted distribution
+        expected_cost = (cost_rows * probs).sum(dim=-1).mean()
+        return base_loss + (self.config.cost_lambda * expected_cost)
 
     def _run_epoch(self, epoch: int, train: bool = True) -> Dict[str, Any]:
         """Runs one complete epoch (training step) from start to finish."""
@@ -283,14 +332,10 @@ class Trainer:
             if cm is not None:
                 yt = out["y"]
                 yp = out["preds"]
-                for t, p in zip(yt.cpu().numpy(), yp.cpu().numpy()):
-                    cm[t, p] += 1
-
-                # # compute eval metrics
-                # y_true = torch.cat(all_y, dim=0).numpy()
-                # y_pred = torch.cat(all_preds, dim=0).numpy()
-                # y_prob = torch.cat(all_probs, dim=0).numpy()
-                # eval_metrics = compute_eval_metrics(y_true, y_pred, y_prob)
+                # for t, p in zip(yt.cpu().numpy(), yp.cpu().numpy()):
+                #     cm[t, p] += 1
+                idx = yt * 3 + yp
+                cm += torch.bincount(idx, minlength=9).view(3, 3)
 
         # compute eval metrics
         if not train:
@@ -351,6 +396,7 @@ class Trainer:
         best_val_loss = float("inf")
         best_metrics: Dict[str, Any] = {}
         if save_dir is not None:
+            save_dir = Path(save_dir)
             save_dir.mkdir(parents=True, exist_ok=True)
 
         self.logger.info("training_started", 
@@ -405,6 +451,7 @@ class Trainer:
         Fits model using Optuna for hyperparameter optimization.
         """
         best_val_loss = float("inf")
+        best_val_loss_at_score = float("inf")
         best_score = float("-inf")
         best_epoch = -1
         best_metrics: Dict[str, Any] = {}
@@ -440,22 +487,29 @@ class Trainer:
                     if trial.should_prune():
                         raise optuna.TrialPruned()
                     
-            # save loss
-            if save_dir is not None and val_loss < best_val_loss:
-                best_val_loss = val_loss
-                self._save_checkpoint(save_dir / "best_model.pt", epoch, best_val_loss, metrics)
+            # track overall best loss
+            best_val_loss = min(best_val_loss, val_loss)
 
-            # track best score for Optuna
+            # track best loss, score, and metrics for Optuna
             if np.isfinite(score) and score > best_score:
-                best_score = score
-                best_epoch = epoch
+                best_val_loss_at_score = float(val_loss)
+                best_score = float(score)
+                best_epoch = int(epoch)
                 best_metrics = metrics
+
+                best_metrics["best_val_loss_overall"] = best_val_loss
+                best_metrics["best_val_loss_at_score"] = best_val_loss_at_score
+                    
+                # save by score metric (F1, MCC, AUC, etc.)
+                if save_dir is not None:
+                    self._save_checkpoint(save_dir / "best_model_by_score.pt", epoch, best_val_loss_at_score, best_metrics)
 
         self.logger.info("training_done", 
                          extra={"extra": {
-                             "best_val_loss": best_val_loss, 
+                             "best_val_loss_at_score": best_val_loss_at_score, 
+                             "best_val_loss_overall": best_val_loss, 
                              f"best_{score_key}_score": best_score, 
                              "best_epoch": best_epoch
                          }})
         
-        return float(best_score), int(best_epoch), float(best_val_loss), best_metrics
+        return float(best_score), int(best_epoch), float(best_val_loss_at_score), best_metrics

@@ -12,7 +12,7 @@ from pipelineio.logger import setup_logger
 from pipelineio.peptidedataset import PeptideDataset
 from nn.models.ffnn import PepSeqFFNN
 from nn.train.trainer import Trainer, TrainerConfig
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, Tuple, List
 
 def compute_class_weights(data: DataLoader, num_classes: int = 3) -> torch.Tensor:
     """
@@ -114,6 +114,13 @@ def append_csv_row(csv_path: Path | str, row: Dict[str, Any]) -> None:
                   header=(not csv_path.exists()), 
                   index=False)
     
+def build_ordinal_cost_matrix(cost_near: float, cost_far: float) -> List[List[float]]:
+    return [
+        [0.0, cost_near, cost_far], 
+        [cost_near, 0.0, cost_near], 
+        [cost_far, cost_near, 0.0]
+    ]
+    
 def main() -> None:
     parser = argparse.ArgumentParser(description="Optuna tuning CLI for PepSeqPredFFNN.")
     parser.add_argument("input_data", 
@@ -142,7 +149,7 @@ def main() -> None:
     parser.add_argument("--metric", 
                         type=str, 
                         default="macro_f1", 
-                        choices=["macro_f1", "mcc"], 
+                        choices=["macro_f1", "mcc", "auc_macro"], 
                         help="Metric to maximize")
     parser.add_argument("--val-frac", 
                         type=float, 
@@ -205,6 +212,34 @@ def main() -> None:
                         type=float, 
                         default=1e-2, 
                         help="Max weight decay")
+    parser.add_argument("--use-cost-sensitive-loss", 
+                        action="store_true", 
+                        help="Enables cost sensitive loss in TrainerConfig")
+    parser.add_argument("--cost-lambda-min",
+                        type=float,
+                        default=0.0,
+                        help="Min lambda for expected cost penalty term")
+    parser.add_argument("--cost-lambda-max",
+                        type=float,
+                        default=1.0,
+                        help="Max lambda for expected cost penalty term")
+    parser.add_argument("--cost-far-min",
+                        type=float,
+                        default=2.0,
+                        help="Min far mistake cost for (0<->2)")
+    parser.add_argument("--cost-far-max",
+                        type=float,
+                        default=10.0,
+                        help="Max far mistake cost for (0<->2)")
+    parser.add_argument("--cost-near",
+                        type=float,
+                        default=1.0,
+                        help="Near mistake cost for (0<->1) and (1<->2)")
+    parser.add_argument("--cost-matrix-mode",
+                        type=str,
+                        default="ordinal",
+                        choices=["ordinal", "fixed"],
+                        help="`ordinal` builds matrix from near and far costs, `fixed` uses TrainerConfig default")
     parser.add_argument("--pruner-warmup", 
                         type=int, 
                         default=2, 
@@ -291,6 +326,24 @@ def main() -> None:
         wd = trial.suggest_float("weight_decay", args.wd_min, args.wd_max, log=True)
         batch_size = trial.suggest_categorical("batch_size", batch_sizes)
 
+        # cost sensitive hyperparameters
+        use_cost_sensitive_loss = bool(args.use_cost_sensitive_loss)
+        cost_lambda = 0.0
+        cost_near = float("nan")
+        cost_far = float("nan")
+        cost_matrix = None
+
+        if use_cost_sensitive_loss:
+            cost_lambda = trial.suggest_float("cost_lambda", args.cost_lambda_min, args.cost_lambda_max)
+
+            if args.cost_matrix_mode == "ordinal":
+                cost_far = trial.suggest_float("cost_far", args.cost_far_min, args.cost_far_max)
+                cost_near = args.cost_near
+                cost_matrix = build_ordinal_cost_matrix(cost_near, cost_far)
+            else:
+                # Trainer will use default matrix, Optuna cannot tune it
+                cost_matrix = None
+
         # setup data loaders
         train_loader = DataLoader(train_data, 
                                   batch_size=batch_size, 
@@ -316,7 +369,10 @@ def main() -> None:
                                batch_size=batch_size, 
                                learning_rate=lr, 
                                weight_decay=wd, 
-                               device="cuda" if torch.cuda.is_available() else "cpu")
+                               device="cuda" if torch.cuda.is_available() else "cpu", 
+                               use_cost_sensitive_loss=use_cost_sensitive_loss, 
+                               cost_lambda=cost_lambda, 
+                               cost_matrix=cost_matrix)
         trial_dir = args.save_path / "trials" / f"trial_{trial.number:04d}"
         trial_dir.mkdir(parents=True, exist_ok=True)
         trainer = Trainer(model=model, 
@@ -328,7 +384,7 @@ def main() -> None:
         
         # start and time trial
         start = time.time()
-        best_score, best_epoch, best_val_loss, best_metrics = trainer.fit_optuna(
+        best_score, best_epoch, best_val_loss_at_score, best_metrics = trainer.fit_optuna(
             save_dir=trial_dir, 
             trial=trial, 
             score_key=args.metric
@@ -350,8 +406,13 @@ def main() -> None:
             "BatchSize": int(batch_size),
             "LearningRate": float(lr),
             "WeightDecay": float(wd),
+            "UseCostSensitiveLoss": bool(use_cost_sensitive_loss),
+            "CostLambda": float(cost_lambda) if use_cost_sensitive_loss else float("nan"),
+            "CostNear": float(cost_near) if use_cost_sensitive_loss and args.cost_matrix_mode == "ordinal" else float("nan"),
+            "CostFar": float(cost_far) if use_cost_sensitive_loss and args.cost_matrix_mode == "ordinal" else float("nan"),
+            "CostMatrixMode": str(args.cost_matrix_mode) if use_cost_sensitive_loss else "",
             "Epochs": int(args.epochs),
-            "BestValLoss": float(best_val_loss),
+            "BestValLossAtScore": float(best_val_loss_at_score),
             "BestEpoch": int(best_epoch),
             "MacroPrecision": float(best_metrics.get("macro_precision", float("nan"))),
             "PrecClass0": float(best_metrics.get("precision_per_class", [float("nan")] * 3)[0]),
@@ -387,7 +448,7 @@ def main() -> None:
 
         trial.set_user_attr("trial_dir", str(trial_dir))
         trial.set_user_attr("best_epoch", int(best_epoch))
-        trial.set_user_attr("best_val_loss", float(best_val_loss))
+        trial.set_user_attr("best_val_loss_at_score", float(best_val_loss_at_score))
         trial.set_user_attr("best_metrics", best_metrics)
 
         return float(best_score)

@@ -66,13 +66,13 @@ class PeptideDataset(Dataset):
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
         """Retrieve a single embeddings sample and its target label."""
         X = self.embeddings[idx] # (L, D)
-        y_pep = self.targets[idx] # (3,)
+        y_bin = self.targets[idx].float() # scalar or shape ()
 
-        # binary label 1 if class 0 is true, else 0
-        if y_pep.numel() != 3:
-            raise ValueError(f"Expected peptide target shape (3,), got {tuple(y_pep.shape)}")
-        y_bin = y_pep[0].to(torch.float32) # 1.0 if epitope, else 0.0
-        y_res = y_bin.repeat(X.size[0]) # (L,)
+        # ensure scalar
+        if y_bin.dim() != 0:
+            y_bin = y_bin.view(())
+        
+        y_res = y_bin.repeat(X.size(0)) # (L,)
         return X, y_res
     
     # ----- Convenient props -----

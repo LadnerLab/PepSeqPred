@@ -82,8 +82,8 @@ class PepSeqFFNN(PepSeqClassifierBase):
         dropouts : Sequence[float]
             A sequence containing the dropout rates at each layer. This can be larger than 3 dropouts but must be the same size as hidden_sizes.
         num_classes : int
-            The number of output classes. Default is `3` where each class represents the probability of a peptide
-            containing an epitope, uncertain about containing an epitope, and not containing an epitope.
+            The number of output classes. Default is `1` which represents the probability of a residue
+            being an epitope and not containing an epitope with some simple math.
         use_layer_norm : bool
             Whether to use layer normalization after each hidden layer. Default is `False`.
         use_residual : bool
@@ -92,7 +92,7 @@ class PepSeqFFNN(PepSeqClassifierBase):
     def __init__(self, emb_dim: int = 1281, 
                  hidden_sizes: Sequence[int] = (150, 120, 45), 
                  dropouts: Sequence[float] = (0.2, 0.2, 0.2), 
-                 num_classes: int = 3, 
+                 num_classes: int = 1, 
                  use_layer_norm: bool = False, 
                  use_residual: bool = False):
         super().__init__(emb_dim=emb_dim, num_classes=num_classes)

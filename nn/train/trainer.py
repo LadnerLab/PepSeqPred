@@ -13,7 +13,7 @@ from sklearn.metrics import (precision_recall_fscore_support,
 from dataclasses import dataclass
 from typing import Optional, List, Dict, Any, Tuple
 
-def count_classes(loader: DataLoader, num_classes: int = 3) -> List[int]:
+def count_classes(loader: DataLoader) -> List[int]:
     """
     Counts total number of peptides per class.
 
@@ -21,19 +21,18 @@ def count_classes(loader: DataLoader, num_classes: int = 3) -> List[int]:
     ----------
         loader : DataLoader
             The DataLoader containing one-hot encoded targets to sum.
-        num_classes : int
-            Number of classes to sum. Default is 3.
 
     Returns
     -------
         counts : List[int]
             List containing the sum of each class.
     """
-    counts = torch.zeros(num_classes, dtype=torch.long)
-    for _, y_onehot in loader:
-        y = y_onehot.argmax(dim=-1).view(-1).to(torch.long) # flatten residues
-        counts += torch.bincount(y.cpu(), minlength=num_classes)
-    return counts.tolist()
+    neg, pos = 0, 0
+    for _, y in loader:
+        y = y.view(-1)
+        pos += int((y == 1).sum().item())
+        neg += int((y == 0).sum().item())
+    return [neg, pos]
 
 def compute_eval_metrics(y_true: torch.Tensor, y_pred: torch.Tensor, y_prob: torch.Tensor) -> Dict[str, Any]:
     """
@@ -55,65 +54,35 @@ def compute_eval_metrics(y_true: torch.Tensor, y_pred: torch.Tensor, y_prob: tor
     """
     metrics: Dict[str, Any] = {}
 
-    # calculate macro precesion, recall, and f1
-    precision, recall, f1, _ = precision_recall_fscore_support(y_true, y_pred, average="macro", zero_division=0)
-    metrics["macro_precision"] = float(precision)
-    metrics["macro_recall"] = float(recall)
-    metrics["macro_f1"] = float(f1)
-
-    # calculate precision, recall, and f1 per class
-    precision_per_class, recall_per_class, f1_per_class, _ = precision_recall_fscore_support(
-        y_true, y_pred, average=None, labels=[0, 1, 2], zero_division=0
-    )
-    metrics["precision_per_class"] = [float(prec) for prec in precision_per_class]
-    metrics["recall_per_class"] = [float(rec) for rec in recall_per_class]
-    metrics["f1_per_class"] = [float(f1c) for f1c in f1_per_class]
-
+    # calculate precesion, recall, f1, and mcc
+    precision, recall, f1, _ = precision_recall_fscore_support(
+        y_true, y_pred, average="binary", zero_division=0)
+    metrics["precision"] = float(precision)
+    metrics["recall"] = float(recall)
+    metrics["f1"] = float(f1)
     metrics["mcc"] = matthews_corrcoef(y_true, y_pred)
 
-    # ROC AUC (one-vs-rest)
+    # ROC AUC
     try:
-        auc_macro = roc_auc_score(y_true, y_prob, multi_class="ovr", average="macro")
-        auc_per_class = roc_auc_score(y_true, y_prob, multi_class="ovr", average=None)
-        metrics["auc_macro"] = auc_macro
-        metrics["auc_per_class"] = [float(x) for x in auc_per_class]
+        metrics["auc"] = float(roc_auc_score(y_true, y_prob))
 
     except Exception:
-        metrics["auc_macro"] = float("nan")
-        metrics["auc_per_class"] = [float("nan")] * 3
+        metrics["auc"] = float("nan")
 
-    # AUC10 calculation
-    def auc10_binary(y_true_bin, y_score) -> float:
-        fpr, tpr, _ = roc_curve(y_true_bin, y_score)
+    # AUC10 calculation]
+    try:
+        fpr, tpr, _ = roc_curve(y_true, y_prob)
         mask = fpr <= 0.10
-        if mask.sum() < 2:
-            return float("nan")
-        return float(auc(fpr[mask], tpr[mask]) / 0.10)
+        if mask.sum() >= 2:
+            metrics["auc10"] = float(auc(fpr[mask], tpr[mask]) / 0.10)
+        
+        else:
+            metrics["auc10"] = float("nan")
     
-    auc10s = []
-    for c in range(3):
-        y_bin = (y_true == c).astype(np.int32)
-        auc10s.append(auc10_binary(y_bin, y_prob[:, c]))
-
-    metrics["auc10_per_class"] = [float(x) for x in auc10s]
-    metrics["auc10_macro"] = float(np.nanmean(auc10s))
+    except Exception:
+        metrics["auc10"] = float("nan")
 
     return metrics
-
-def build_default_cost_matrix() -> torch.Tensor:
-    return torch.Tensor([
-        [0.0, 1.0, 4.0], 
-        [1.0, 0.0, 1.0], 
-        [4.0, 1.0, 0.0]
-    ])
-
-def validate_cost_matrix(cost_matrix: torch.Tensor, num_classes: int = 3) -> None:
-    if cost_matrix.shape != (num_classes, num_classes):
-        raise ValueError(f"cost_matrix must be shape {(num_classes, num_classes)}")
-    if not torch.all(cost_matrix.diag() == 0):
-        raise ValueError("cost_matrix diagonal must be all zeros")
-    if torch.any(cost_matrix < 0):
-        raise ValueError("cost_matrix must be non-negative")
 
 @dataclass
 class TrainerConfig:
@@ -124,11 +93,7 @@ class TrainerConfig:
     weight_decay: float = 0.0
     num_workers: int = 0
     device: str = "cuda" # should only train using GPUs (but can be changed to "cpu")
-
-    # cost sensitive loss settings
-    use_cost_sensitive_loss: bool = True
-    cost_lambda: float = 0.5 # strength of cost penalty
-    cost_matrix: Optional[List[List[float]]] = None # (3, 3)
+    pos_weight: Optional[float] = None
 
 class Trainer:
     """
@@ -146,15 +111,12 @@ class Trainer:
             Optional model evaluation data.
         config : TrainerConfig
             Neural network specific parameters to tweak.
-        class_weights : Tensor or None
-            Optional weights per class in the case of class imbalance.
     """
     def __init__(self, model: nn.Module, 
                  train_loader: DataLoader, 
                  logger: logging.Logger, 
                  val_loader: Optional[DataLoader] = None, 
-                 config: TrainerConfig = TrainerConfig(), 
-                 class_weights: Optional[torch.Tensor] = None):
+                 config: TrainerConfig = TrainerConfig()):
         self.model = model
         self.train_loader = train_loader
         self.val_loader = val_loader
@@ -168,37 +130,26 @@ class Trainer:
         self.optimizer = torch.optim.Adam(self.model.parameters(), 
                                           lr=self.config.learning_rate, 
                                           weight_decay=self.config.weight_decay)
-        if class_weights is not None:
-            class_weights = class_weights.to(self.device)
-        self.class_weights = class_weights
-        self.criterion = nn.CrossEntropyLoss(weight=self.class_weights)
+        
+        pos_weight = None
+        if self.config.pos_weight is not None:
+            pos_weight = torch.tensor([self.config.pos_weight], device=self.device)
+        self.criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
 
-        # cost sensitive penalty matrix
-        if self.config.use_cost_sensitive_loss:
-            if self.config.cost_matrix is None:
-                self.cost_matrix = build_default_cost_matrix().to(self.device)
-            else:
-                self.cost_matrix = torch.tensor(self.config.cost_matrix, dtype=torch.float32, device=self.device)
-            validate_cost_matrix(self.cost_matrix)
-        else:
-            self.cost_matrix = None
 
         # inital log for reproduceability
         num_params = sum(p.numel() for p in self.model.parameters())
         self.logger.info("trainer_init", 
                          extra={"extra": {
                              "device": str(self.device), 
-                             "seed": torch.initial_seed(), 
+                             "seed": torch.initial_seed(),  
                              "epochs": self.config.epochs, 
                              "batch_size": self.config.batch_size, 
                              "learning_rate": self.config.learning_rate, 
                              "weight_decay": self.config.weight_decay, 
                              "num_params": num_params, 
                              "has_val_loader": self.val_loader is not None, 
-                             "class_weights": self.class_weights.detach().cpu().tolist() if self.class_weights is not None else None, 
-                             "use_cost_sensitive_loss": self.config.use_cost_sensitive_loss, 
-                             "cost_lambda": self.config.cost_lambda if self.config.use_cost_sensitive_loss else None, 
-                             "cost_matrix": self.cost_matrix.detach().cpu().tolist() if self.cost_matrix is not None else None
+                             "pos_weight": self.config.pos_weight
                          }})
         
         # log class distributions
@@ -212,39 +163,33 @@ class Trainer:
 
     def _batch_step(self, batch: torch.Tensor, train: bool = True) -> Dict[str, Any]:
         """Steps through a batch to train and optimize the model."""
-        X, y_onehot = batch
+        X, y = batch
         non_blocking = (self.device.type == "cuda")
         X = X.to(self.device, non_blocking=non_blocking)
-        y_onehot = y_onehot.to(self.device, non_blocking=non_blocking)
+        y = y.to(self.device, non_blocking=non_blocking).float()
 
         # validate targets
-        if y_onehot.dim() != 3 or y_onehot.size(-1) != 3:
-            raise ValueError(f"Expected y_onehot shape (B, L, 3), got {tuple(y_onehot.shape)}")
-        row_sums = y_onehot.sum(dim=-1)
-        if not torch.all((row_sums == 1)):
-            raise ValueError("Targets must be one-hot encoded per sample")
-
-        # convert one-hot to class indices {0, 1, 2} for loss calculation
-        y = y_onehot.argmax(dim=-1) # (B, L)
+        if y.dim() != 2:
+            raise ValueError(f"Expected y_onehot shape (B, L), got {tuple(y.shape)}")
 
         # get logits to calculate loss and validate shape
         logits = self.model(X)
-        if logits.dim() != 3 or logits.size(-1) != 3:
-            raise ValueError(f"Expected logits shape (B, L, 3), got {tuple(logits.shape)}")
-        logits = logits.view(-1, logits.size(-1)) # (B * L, 3)
-        y = y.view(-1) # (B * L,)
-        # calculate loss and validate for NaNs
-        loss = self._compute_loss(logits, y)
-        if not torch.isfinite(loss):
-            raise FloatingPointError(f"Non-finite loss caught: {loss.item()}")
+        if logits.shape != y.shape:
+            raise ValueError(f"Expected logits shape {tuple(y.shape)}, got {tuple(logits.shape)}")
 
-        # simple accuracy
-        preds = logits.argmax(dim=1)
-        probs = torch.softmax(logits, dim=-1)
-        correct = (preds == y).sum().item()
+        # calculate loss
+        loss = self.criterion(logits, y)
+
+        probs = torch.sigmoid(logits) # (B, L)
+        preds = (probs >= 0.5).to(torch.long) # (B, L)
+        y_int = y.to(torch.long)
+
+        # simple accuracy calculation for batch step
+        correct = (preds == y_int).sum().item()
         total = y.numel()
         acc = correct / total
 
+        # optimize model in training batch
         if train:
             self.optimizer.zero_grad(set_to_none=True)
             loss.backward()
@@ -261,25 +206,9 @@ class Trainer:
         return {"loss": float(loss.item()), 
                 "correct": int(correct), 
                 "n": int(total), 
-                "y": y.detach().cpu(),         # (B,)
-                "preds": preds.detach().cpu(), # (B,)
-                "probs": probs.detach().cpu()} # (B, 3)
-    
-    def _compute_loss(self, logits: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-        """Compute loss with optional cost-sensitive penalty."""
-        base_loss = self.criterion(logits, y)
-
-        if not self.config.use_cost_sensitive_loss:
-            return base_loss
-        
-        probs = torch.softmax(logits, dim=-1) # (N, 3)
-
-        # cost rows for true class of each example
-        cost_rows = self.cost_matrix[y]
-
-        # expected cost under predicted distribution
-        expected_cost = (cost_rows * probs).sum(dim=-1).mean()
-        return base_loss + (self.config.cost_lambda * expected_cost)
+                "y": y_int.view(-1).detach().cpu(), 
+                "preds": preds.view(-1).detach().cpu(), 
+                "probs": probs.view(-1).detach().cpu()}
 
     def _run_epoch(self, epoch: int, train: bool = True) -> Dict[str, Any]:
         """Runs one complete epoch (training step) from start to finish."""
@@ -306,7 +235,7 @@ class Trainer:
         # set up confusion matrix to see eval stats
         cm = None
         if not train:
-            cm = torch.zeros((3, 3), dtype=torch.int64) # rows true, cols pred
+            cm = torch.zeros((2, 2), dtype=torch.int64) # rows true, cols pred
 
         all_y: List[torch.Tensor] = []
         all_preds: List[torch.Tensor] = []
@@ -332,10 +261,9 @@ class Trainer:
             if cm is not None:
                 yt = out["y"]
                 yp = out["preds"]
-                # for t, p in zip(yt.cpu().numpy(), yp.cpu().numpy()):
-                #     cm[t, p] += 1
-                idx = yt * 3 + yp
-                cm += torch.bincount(idx, minlength=9).view(3, 3)
+
+                idx = yt * 2 + yp
+                cm += torch.bincount(idx, minlength=4).view(2, 2)
 
         # compute eval metrics
         if not train:
@@ -347,15 +275,6 @@ class Trainer:
 
         avg_loss = total_loss / total_samples
         avg_acc = total_correct / total_samples
-
-        self.logger.info("epoch_complete", 
-                         extra={"extra": {
-                             "epoch": epoch, 
-                             "mode": "train" if train else "val", 
-                             "avg_loss": avg_loss, 
-                             "avg_acc": avg_acc, 
-                             "total_samples": total_samples
-                         }})
         
         # log confusion matrix
         if cm is not None:
@@ -369,17 +288,12 @@ class Trainer:
                                 "confusion_matrix": cm.tolist(),
                                 "balanced_acc": balanced_acc,
                                 "per_class_acc": per_class_acc.tolist(),
-                                "macro_precision": eval_metrics["macro_precision"],
-                                "per_class_precision": eval_metrics["precision_per_class"],
-                                "macro_recall": eval_metrics["macro_recall"],
-                                "per_class_recall": eval_metrics["recall_per_class"],
-                                "macro_f1": eval_metrics["macro_f1"],
-                                "per_class_f1": eval_metrics["f1_per_class"],
+                                "precision": eval_metrics["precision"],
+                                "recall": eval_metrics["recall"],
+                                "f1": eval_metrics["f1"],
                                 "mcc": eval_metrics["mcc"],
-                                "auc_macro": eval_metrics["auc_macro"],
-                                "auc_per_class": eval_metrics["auc_per_class"],
-                                "auc10_macro": eval_metrics["auc10_macro"],
-                                "auc10_per_class": eval_metrics["auc10_per_class"],
+                                "auc": eval_metrics["auc"],
+                                "auc10": eval_metrics["auc10"]
                              }})
 
         return {"loss": avg_loss, "acc": avg_acc, "eval_metrics": eval_metrics if not train else None}
@@ -407,25 +321,48 @@ class Trainer:
 
         for epoch in range(self.config.epochs):
             train_metrics = self._run_epoch(epoch, train=True)
+            self.logger.info("train_epoch_summary", 
+                             extra={"extra": {
+                                 "epoch": epoch, 
+                                 "train_loss": float(train_metrics["loss"]), 
+                                 "train_acc": float(train_metrics["acc"])
+                             }})
 
-            val_metrics = None
+            eval_out = None
             if self.val_loader is not None:
-                val_metrics = self._run_epoch(epoch, train=False)
+                eval_out = self._run_epoch(epoch, train=False)
+                self.logger.info("eval_epoch_summary", 
+                    extra={"extra": {
+                        "epoch": epoch, 
+                        "eval_loss": float(eval_out["loss"]),
+                        "eval_acc": float(eval_out["acc"]),
+                        "precision": float(eval_out["eval_metrics"]["precision"]),
+                        "recall": float(eval_out["eval_metrics"]["recall"]),
+                        "f1": float(eval_out["eval_metrics"]["f1"]),
+                        "mcc": float(eval_out["eval_metrics"]["mcc"]),
+                        "auc": float(eval_out["eval_metrics"]["auc"]),
+                        "auc10": float(eval_out["eval_metrics"]["auc10"])
+                    }})
 
-            if save_dir is not None:
-                metric_loss = val_metrics["loss"] if val_metrics is not None else train_metrics["loss"]
-                if metric_loss < best_val_loss:
-                    best_val_loss = metric_loss
-                    best_metrics = val_metrics["eval_metrics"] if val_metrics is not None else {}
-                    self._save_checkpoint(save_dir / "best_model.pt", epoch, best_val_loss, best_metrics)
+                # save from validated model only
+                if save_dir is not None:
+                    metric_loss = eval_out["loss"]
+                    if metric_loss < best_val_loss:
+                        best_val_loss = metric_loss
+                        best_metrics = eval_out["eval_metrics"]
+                        self._save_checkpoint(save_dir / "best_model.pt", epoch, best_val_loss, metrics=best_metrics)
+
+        # final check to save a model if no validation set 
+        if self.val_loader is None and save_dir is not None:
+            self._save_checkpoint(save_dir / "best_model_no_val.pt", self.config.epochs - 1, float(train_metrics["loss"]))
 
         self.logger.info("training_done", 
                          extra={"extra": {
-                             "best_val_loss": best_val_loss, 
-                             "best_metrics": best_metrics
+                             "best_loss": best_val_loss if self.val_loader else train_metrics["loss"], 
+                             "best_metrics": best_metrics if self.val_loader else None
                          }})
 
-    def _save_checkpoint(self, path: Path | str, epoch: int, loss: float, metrics: Dict[str, Any]) -> None:
+    def _save_checkpoint(self, path: Path | str, epoch: int, loss: float, metrics: Optional[Dict[str, Any]] = None) -> None:
         """Saves model checkpoint to path."""
         path.parent.mkdir(parents=True, exist_ok=True)
         state = {"model_state_dict": self.model.state_dict(), 
@@ -446,7 +383,7 @@ class Trainer:
     def fit_optuna(self, 
                    save_dir: Optional[Path | str] = None, 
                    trial: Optional[optuna.trial.Trial] = None, 
-                   score_key: str = "macro_f1") -> Tuple[float, int, float, Dict[str, Any]]:
+                   score_key: str = "f1") -> Tuple[float, int, float, Dict[str, Any]]:
         """
         Fits model using Optuna for hyperparameter optimization.
         """
@@ -467,7 +404,13 @@ class Trainer:
                          }})
         
         for epoch in range(self.config.epochs):
-            _ = self._run_epoch(epoch, train=True)
+            train_metrics = self._run_epoch(epoch, train=True)
+            self.logger.info("train_epoch_summary", 
+                             extra={"extra": {
+                                 "epoch": epoch, 
+                                 "train_loss": train_metrics["loss"], 
+                                 "train_acc": train_metrics["acc"]
+                             }})
 
             val_metrics = None
             if self.val_loader is not None:
@@ -495,10 +438,13 @@ class Trainer:
                 best_val_loss_at_score = float(val_loss)
                 best_score = float(score)
                 best_epoch = int(epoch)
-                best_metrics = metrics
 
+                best_metrics = dict(metrics)
                 best_metrics["best_val_loss_overall"] = best_val_loss
                 best_metrics["best_val_loss_at_score"] = best_val_loss_at_score
+                best_metrics["best_epoch"] = best_epoch
+                best_metrics["best_score_key"] = score_key
+                best_metrics["best_score_value"] = best_score
                     
                 # save by score metric (F1, MCC, AUC, etc.)
                 if save_dir is not None:

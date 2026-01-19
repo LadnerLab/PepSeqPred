@@ -129,15 +129,7 @@ class PepSeqFFNN(PepSeqClassifierBase):
         Returns
         -------
             Tensor
-                Logits of shape (B, C), where C is the number of output classes (usually 3).
-
-        Notes
-        -----
-        This model performs mean pooling acorss the sequence length dimension 
-        to convert residue-level embeddings into a single fixed size peptide 
-        representation. This representation is then passed through this 
-        feed-forward neural network to produce class logits. Predictions are 
-        made at the peptide level rather than at the individual residue level.
+                Logits of shape (B, C), where C is the number of output classes.
         """
         if X.dim() != 3:
             raise ValueError(f"Expected shape (B, L, E), got {X.shape}")
@@ -148,6 +140,6 @@ class PepSeqFFNN(PepSeqClassifierBase):
         # predict at residue level
         B, L, D = X.shape
         X = X.view(B * L, D) # flatten residues
-        logits = self.ff_model(X) # (B * L, 3)
-        logits = logits.view(B, L, -1)
+        logits = self.ff_model(X) # (B * L, 1)
+        logits = logits.view(B, L) # (B, L)
         return logits

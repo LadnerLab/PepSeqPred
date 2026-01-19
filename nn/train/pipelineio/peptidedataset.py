@@ -54,6 +54,10 @@ class PeptideDataset(Dataset):
         if isinstance(self.targets, list):
             self.targets = torch.stack(self.targets, dim=0)
 
+        # collapse (N, 3) one hot to (N,) binary
+        if self.targets.dim() == 2 and self.targets.size(1) == 3:
+            self.targets = self.targets[:, 0].to(torch.float32)
+
     # ----- Dataset API -----
     def __len__(self) -> int:
         """Return number of samples in dataset."""
@@ -63,7 +67,12 @@ class PeptideDataset(Dataset):
         """Retrieve a single embeddings sample and its target label."""
         X = self.embeddings[idx] # (L, D)
         y_pep = self.targets[idx] # (3,)
-        y_res = y_pep.unsqueeze(0).repeat(X.size(0), 1) # (L, 3)
+
+        # binary label 1 if class 0 is true, else 0
+        if y_pep.numel() != 3:
+            raise ValueError(f"Expected peptide target shape (3,), got {tuple(y_pep.shape)}")
+        y_bin = y_pep[0].to(torch.float32) # 1.0 if epitope, else 0.0
+        y_res = y_bin.repeat(X.size[0]) # (L,)
         return X, y_res
     
     # ----- Convenient props -----

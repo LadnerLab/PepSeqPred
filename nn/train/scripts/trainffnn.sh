@@ -2,11 +2,11 @@
 #SBATCH --job-name=ffnn_v1
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=8
+#SBATCH --cpus-per-task=4
 #SBATCH --partition=gpu
 #SBATCH --gpus=a100
-#SBATCH --mem=128G
-#SBATCH --time=12:00:00
+#SBATCH --mem=96G
+#SBATCH --time=1:00:00
 #SBATCH --output=/scratch/%u/train_ffnn_slurm/%j/%x.out
 #SBATCH --error=/scratch/%u/train_ffnn_slurm/%j/%x.err
 
@@ -59,6 +59,7 @@ ${LAUNCHER} python -u train_ffnn.pyz \
     --batch-size "${BATCH_SIZE}" \
     --lr "${LR}" \
     --wd "${WD}" \
+    --use-pos-weight \
     --val-frac "${VAL_FRAC}" \
     --save-path "${SAVE_PATH}" \
     --num-workers "${NUM_WORKERS}"

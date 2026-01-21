@@ -23,9 +23,9 @@ INPUT_DATA=$1
 
 # tuning controls
 STUDY_NAME="${STUDY_NAME:-ffnn_optuna_v1}"
-N_TRIALS="${N_TRIALS:-40}"
-EPOCHS="${EPOCHS:-10}"
-METRIC="${METRIC:-macro_f1}"
+N_TRIALS="${N_TRIALS:-50}"
+EPOCHS="${EPOCHS:-25}"
+METRIC="${METRIC:-recall}"
 VAL_FRAC="${VAL_FRAC:-0.2}"
 SUBSET="${SUBSET:-0}"
 NUM_WORKERS="${NUM_WORKERS:-4}"
@@ -49,13 +49,7 @@ LR_MIN="${LR_MIN:-1e-4}"
 LR_MAX="${LR_MAX:-3e-3}"
 WD_MIN="${WD_MIN:-1e-8}"
 WD_MAX="${WD_MAX:-1e-2}"
-BATCH_SIZES="${BATCH_SIZES:-32,64,128}"
-COST_LAMBDA_MIN="${COST_LAMBDA_MIN:-0.0}"
-COST_LAMBDA_MAX="${COST_LAMBDA_MAX:-1.0}"
-COST_FAR_MIN="${COST_FAR_MIN:-2.0}"
-COST_FAR_MAX="${COST_FAR_MAX:-10.0}"
-COST_NEAR="${COST_NEAR:-1.0}"
-COST_MATRIX_MODE="${COST_MATRIX_MODE:-ordinal}"
+BATCH_SIZES="${BATCH_SIZES:-64,128,256,512,1024}"
 
 # pruning and timeout controls
 PRUNER_WARMUP="${PRUNER_WARMUP:-2}"
@@ -96,12 +90,6 @@ srun python -u train_ffnn_optuna.pyz \
     --lr-max "$LR_MAX" \
     --wd-min "$WD_MIN" \
     --wd-max "$WD_MAX" \
-    --use-cost-sensitive-loss \
-    --cost-lambda-min "$COST_LAMBDA_MIN" \
-    --cost-lambda-max "$COST_LAMBDA_MAX" \
-    --cost-far-min "$COST_FAR_MIN" \
-    --cost-far-max "$COST_FAR_MAX" \
-    --cost-near "$COST_NEAR" \
-    --cost-matrix-mode "$COST_MATRIX_MODE" \
+    --use-pos-weight \
     --pruner-warmup "$PRUNER_WARMUP" \
     --timeout-s "$TIMEOUT_S"

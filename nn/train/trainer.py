@@ -85,9 +85,11 @@ def compute_eval_metrics(y_true: torch.Tensor, y_pred: torch.Tensor, y_prob: tor
     return metrics
 
 def _safe_divide(n: float, d: float) -> float:
+    """Checks for divide by zero before division operation."""
     return float(n / d) if d != 0.0 else 0.0
 
 def _confusion_from_probs(y_true: np.ndarray, y_prob: np.ndarray, threshold: float) -> Tuple[int, int, int, int]:
+    """Builds a confusion matrix given model probabilities for threshold calculation."""
     y_pred = (y_prob >= threshold).astype(np.int64)
     y_true = y_true.astype(np.int64)
 
@@ -103,6 +105,29 @@ def find_threshold_max_recall_min_precision(y_true: np.ndarray, y_prob: np.ndarr
     """
     Finds the threshold that maximizes recall subject such that `precision >= min_precision`. 
     If no precision meets this constrain, the best possible threshold is returned.
+
+    Parameters
+    ----------
+        y_true : ndarray
+            An array of the true labels for a batch of residues.
+
+        y_prob : ndarray
+            An array of the model's estimated probabilities that a residue is an epitope for a given batch.
+
+        min_precision : float
+            Minimum accepted precision while recall is optimized. Default is `0.50`.
+
+        num_thresholds : int
+            The number of different thresholds to try between 0.001 and 0.999. Default is `999`.
+
+    Returns
+    -------
+        Dict[str, Any]
+            A dictionary containing the most optimal threshold, confusion matrix 
+            used to calculate the most optimal threshold, precision and recall 
+            at that threshold, the minimum precision accepted, and the status 
+            which is either `"ok"` if precision >= `min_precision` otherwise 
+            `"min_precision_unreachable"`.
     """
     thresholds = np.linspace(0.001, 0.999, num_thresholds, dtype=np.float64)
 
@@ -298,7 +323,7 @@ class Trainer:
 
             # compute predictions at most optimal threshold calculated
             thresh_out = find_threshold_max_recall_min_precision(
-                y_true, y_prob, min_precision=0.50, num_thresholds=999
+                y_true, y_prob, min_precision=0.20, num_thresholds=999
             )
             best_thresh = float(thresh_out["threshold"])
             y_pred = (y_prob >= best_thresh).astype(np.int64)
@@ -385,7 +410,7 @@ class Trainer:
                     extra={"extra": {
                         "epoch": epoch, 
                         "eval_loss": float(eval_out["loss"]),
-                        "eval_acc": float(eval_out["acc"]),
+                        "overall_acc_at_threshold": float(eval_out["acc"]),
                         "precision": float(eval_out["eval_metrics"]["precision"]),
                         "recall": float(eval_out["eval_metrics"]["recall"]),
                         "f1": float(eval_out["eval_metrics"]["f1"]),
@@ -436,6 +461,31 @@ class Trainer:
                    score_key: str = "f1") -> Tuple[float, int, float, Dict[str, Any]]:
         """
         Fits model using Optuna for hyperparameter optimization.
+
+        Parameters
+        ----------
+            save_dir : Path or str
+                Directory to save the model state to. Default is `None`.
+
+            trial : Trial
+                The current state of the Optuna trial used to optimize model hyperparameters. Default is `None`.
+
+            score_key : str
+                The metric used to score the model during a trial. Can be any accepted metric like `"f1"`, `"mcc"`, `"recall"`, `"precision"`, or `"auc"`.
+
+        Returns
+        -------
+            best_score : int
+                Best score achieved through hyperparameter tuning determined by `score_key`.
+
+            best_epoch : int
+                Best performing epoch by score.
+
+            best_val_loss_at_score : float
+                The best (lowest) loss acheived at the best score. 
+
+            best_metrics : Dict[str, Any]
+                All other metrics generated during evaluation step.
         """
         best_val_loss = float("inf")
         best_val_loss_at_score = float("inf")

@@ -5,13 +5,14 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 import numpy as np
 import optuna
-from sklearn.metrics import (precision_recall_fscore_support, 
-                             matthews_corrcoef, 
-                             roc_auc_score, 
-                             roc_curve, 
+from sklearn.metrics import (precision_recall_fscore_support,
+                             matthews_corrcoef,
+                             roc_auc_score,
+                             roc_curve,
                              auc)
 from dataclasses import dataclass
 from typing import Optional, List, Dict, Any, Tuple
+
 
 def count_classes(loader: DataLoader) -> List[int]:
     """
@@ -33,6 +34,7 @@ def count_classes(loader: DataLoader) -> List[int]:
         pos += int((y == 1).sum().item())
         neg += int((y == 0).sum().item())
     return [neg, pos]
+
 
 def compute_eval_metrics(y_true: torch.Tensor, y_pred: torch.Tensor, y_prob: torch.Tensor) -> Dict[str, Any]:
     """
@@ -75,18 +77,20 @@ def compute_eval_metrics(y_true: torch.Tensor, y_pred: torch.Tensor, y_prob: tor
         mask = fpr <= 0.10
         if mask.sum() >= 2:
             metrics["auc10"] = float(auc(fpr[mask], tpr[mask]) / 0.10)
-        
+
         else:
             metrics["auc10"] = float("nan")
-    
+
     except Exception:
         metrics["auc10"] = float("nan")
 
     return metrics
 
+
 def _safe_divide(n: float, d: float) -> float:
     """Checks for divide by zero before division operation."""
     return float(n / d) if d != 0.0 else 0.0
+
 
 def _confusion_from_probs(y_true: np.ndarray, y_prob: np.ndarray, threshold: float) -> Tuple[int, int, int, int]:
     """Builds a confusion matrix given model probabilities for threshold calculation."""
@@ -101,6 +105,7 @@ def _confusion_from_probs(y_true: np.ndarray, y_prob: np.ndarray, threshold: flo
 
     return tp, fp, tn, fn
 
+
 def find_threshold_max_recall_min_precision(y_true: np.ndarray, y_prob: np.ndarray, min_precision: float = 0.50, num_thresholds: int = 999) -> Dict[str, Any]:
     """
     Finds the threshold that maximizes recall subject such that `precision >= min_precision`. 
@@ -110,13 +115,10 @@ def find_threshold_max_recall_min_precision(y_true: np.ndarray, y_prob: np.ndarr
     ----------
         y_true : ndarray
             An array of the true labels for a batch of residues.
-
         y_prob : ndarray
             An array of the model's estimated probabilities that a residue is an epitope for a given batch.
-
         min_precision : float
             Minimum accepted precision while recall is optimized. Default is `0.50`.
-
         num_thresholds : int
             The number of different thresholds to try between 0.001 and 0.999. Default is `999`.
 
@@ -131,35 +133,42 @@ def find_threshold_max_recall_min_precision(y_true: np.ndarray, y_prob: np.ndarr
     """
     thresholds = np.linspace(0.001, 0.999, num_thresholds, dtype=np.float64)
 
-    best = None
-    best_fallback = None
+    best: Optional[Dict[str, Any]] = None
+    best_fallback: Optional[Dict[str, Any]] = None
 
     for thresh in thresholds:
         tp, fp, tn, fn = _confusion_from_probs(y_true, y_prob, thresh)
         precision = _safe_divide(tp, tp + fp)
         recall = _safe_divide(tp, tp + fn)
 
-        row = {"threshold": float(thresh), 
-               "tp": tp, "fp": fp, "tn": tn, "fn": fn, 
-               "precision": precision, 
+        row = {"threshold": float(thresh),
+               "tp": tp, "fp": fp, "tn": tn, "fn": fn,
+               "precision": precision,
                "recall": recall}
-        
-        # always hold fallback in case precision is always < min_precision
-        if (best_fallback is None) or (precision > best_fallback["precision"]):
+
+        # always hold fallback which maximizes threshold in case precision is always < min_precision
+        if best_fallback is None:
+            best_fallback = row
+        elif (row["precision"] > best_fallback["precision"]) or (
+                row["precision"] == best_fallback["precision"] and
+                row["threshold"] > best_fallback["threshold"]):
             best_fallback = row
 
         # best case when precision > min_precision and/or recall is increasing
         if precision >= min_precision:
-            if (best is None or 
-                (recall > best["recall"]) or 
-                (recall == best["recall"] and precision > best["precision"])):
+            if best is None:
+                best = row
+            elif (row["recall"] > best["recall"] or (
+                  row["recall"] == best["recall"] and
+                  row["precision"] > best["precision"])):
                 best = row
 
     if best is not None:
         best["status"] = "ok"
         best["min_precision"] = min_precision
         return best
-        
+
+    # minimum precision contraint failed
     best_fallback["status"] = "min_precision_unreachable"
     best_fallback["min_precision"] = min_precision
     return best_fallback
@@ -173,8 +182,10 @@ class TrainerConfig:
     learning_rate: float = 1e-3
     weight_decay: float = 0.0
     num_workers: int = 0
-    device: str = "cuda" # should only train using GPUs (but can be changed to "cpu")
+    # should only train using GPUs (but can be changed to "cpu")
+    device: str = "cuda"
     pos_weight: Optional[float] = None
+
 
 class Trainer:
     """
@@ -193,10 +204,11 @@ class Trainer:
         config : TrainerConfig
             Neural network specific parameters to tweak.
     """
-    def __init__(self, model: nn.Module, 
-                 train_loader: DataLoader, 
-                 logger: logging.Logger, 
-                 val_loader: Optional[DataLoader] = None, 
+
+    def __init__(self, model: nn.Module,
+                 train_loader: DataLoader,
+                 logger: logging.Logger,
+                 val_loader: Optional[DataLoader] = None,
                  config: TrainerConfig = TrainerConfig()):
         self.model = model
         self.train_loader = train_loader
@@ -204,41 +216,43 @@ class Trainer:
         self.config = config
         self.logger = logger
 
-        self.device = torch.device(config.device if torch.cuda.is_available() else "cpu")
+        self.device = torch.device(
+            config.device if torch.cuda.is_available() else "cpu")
         self.model.to(self.device)
 
         # default to Adam optimizer (may change later)
-        self.optimizer = torch.optim.Adam(self.model.parameters(), 
-                                          lr=self.config.learning_rate, 
+        self.optimizer = torch.optim.Adam(self.model.parameters(),
+                                          lr=self.config.learning_rate,
                                           weight_decay=self.config.weight_decay)
-        
+
         pos_weight = None
         if self.config.pos_weight is not None:
-            pos_weight = torch.tensor([self.config.pos_weight], device=self.device)
+            pos_weight = torch.tensor(
+                [self.config.pos_weight], device=self.device)
         self.criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
-
 
         # inital log for reproduceability
         num_params = sum(p.numel() for p in self.model.parameters())
-        self.logger.info("trainer_init", 
+        self.logger.info("trainer_init",
                          extra={"extra": {
-                             "device": str(self.device), 
-                             "seed": torch.initial_seed(),  
-                             "epochs": self.config.epochs, 
-                             "batch_size": self.config.batch_size, 
-                             "learning_rate": self.config.learning_rate, 
-                             "weight_decay": self.config.weight_decay, 
-                             "num_params": num_params, 
-                             "has_val_loader": self.val_loader is not None, 
+                             "device": str(self.device),
+                             "seed": torch.initial_seed(),
+                             "epochs": self.config.epochs,
+                             "batch_size": self.config.batch_size,
+                             "learning_rate": self.config.learning_rate,
+                             "weight_decay": self.config.weight_decay,
+                             "num_params": num_params,
+                             "has_val_loader": self.val_loader is not None,
                              "pos_weight": self.config.pos_weight
                          }})
-        
+
         # log class distributions
         train_counts = count_classes(train_loader)
-        val_counts = count_classes(val_loader) if val_loader is not None else None
-        self.logger.info("class_distribution", 
+        val_counts = count_classes(
+            val_loader) if val_loader is not None else None
+        self.logger.info("class_distribution",
                          extra={"extra": {
-                             "train_counts": train_counts, 
+                             "train_counts": train_counts,
                              "val_counts": val_counts
                          }})
 
@@ -251,12 +265,14 @@ class Trainer:
 
         # validate targets
         if y.dim() != 2:
-            raise ValueError(f"Expected y_onehot shape (B, L), got {tuple(y.shape)}")
+            raise ValueError(
+                f"Expected y_onehot shape (B, L), got {tuple(y.shape)}")
 
         # get logits to calculate loss and validate shape
         logits = self.model(X)
         if logits.shape != y.shape:
-            raise ValueError(f"Expected logits shape {tuple(y.shape)}, got {tuple(logits.shape)}")
+            raise ValueError(
+                f"Expected logits shape {tuple(y.shape)}, got {tuple(logits.shape)}")
         # calculate loss
         loss = self.criterion(logits, y)
 
@@ -267,10 +283,10 @@ class Trainer:
             self.optimizer.step()
             return {"loss": float(loss.item()), "n": int(y.numel())}
 
-        probs = torch.sigmoid(logits) # (B, L)
-        return {"loss": float(loss.item()), 
-                "n": int(y.numel()), 
-                "y": y.to(torch.long).view(-1).detach().cpu(), 
+        probs = torch.sigmoid(logits)  # (B, L)
+        return {"loss": float(loss.item()),
+                "n": int(y.numel()),
+                "y": y.to(torch.long).view(-1).detach().cpu(),
                 "probs": probs.view(-1).detach().cpu()}
 
     def _run_epoch(self, epoch: int, train: bool = True) -> Dict[str, Any]:
@@ -279,10 +295,10 @@ class Trainer:
         if loader is None:
             return {"loss": float("nan"), "acc": float("nan")}
 
-        self.logger.info("epoch_start", 
+        self.logger.info("epoch_start",
                          extra={"extra": {
-                             "epoch": epoch, 
-                             "mode": "train" if train else "val", 
+                             "epoch": epoch,
+                             "mode": "train" if train else "val",
                              "num_batches": len(loader)
                          }})
 
@@ -332,7 +348,7 @@ class Trainer:
             avg_acc = total_correct / max(total_samples, 1)
 
             # build confusion matrix from true and predicted values
-            cm = torch.zeros((2, 2), dtype=torch.int64) # rows true, cols pred
+            cm = torch.zeros((2, 2), dtype=torch.int64)  # rows true, cols pred
             cm[0, 0] = int(((y_true == 0) & (y_pred == 0)).sum())
             cm[0, 1] = int(((y_true == 0) & (y_pred == 1)).sum())
             cm[1, 0] = int(((y_true == 1) & (y_pred == 0)).sum())
@@ -342,32 +358,33 @@ class Trainer:
             eval_metrics["threshold"] = best_thresh
             eval_metrics["threshold_status"] = thresh_out["status"]
             eval_metrics["threshold_min_precision"] = thresh_out["min_precision"]
-        
+
         # log confusion matrix
         if not train and cm is not None and eval_metrics is not None:
             per_class_acc = cm.diag().float() / cm.sum(dim=1).clamp_min(1).float()
             balanced_acc = float(per_class_acc.mean())
-            eval_metrics["per_class_acc"] = [float(x) for x in per_class_acc.tolist()]
+            eval_metrics["per_class_acc"] = [
+                float(x) for x in per_class_acc.tolist()]
             eval_metrics["res_balanced_acc"] = balanced_acc
 
-            self.logger.info("res_confusion_matrix", 
+            self.logger.info("res_confusion_matrix",
                              extra={"extra": {
-                                "epoch": epoch,
-                                "confusion_matrix": cm.tolist(),
-                                "balanced_acc": balanced_acc,
-                                "per_class_acc": per_class_acc.tolist(),
-                                "threshold": eval_metrics["threshold"], 
-                                "threshold_status": eval_metrics["threshold_status"], 
-                                "threshold_min_precision": eval_metrics["threshold_min_precision"],
-                                "precision": eval_metrics["precision"],
-                                "recall": eval_metrics["recall"],
-                                "f1": eval_metrics["f1"],
-                                "mcc": eval_metrics["mcc"],
-                                "auc": eval_metrics["auc"],
-                                "auc10": eval_metrics["auc10"]
+                                 "epoch": epoch,
+                                 "confusion_matrix": cm.tolist(),
+                                 "balanced_acc": balanced_acc,
+                                 "per_class_acc": per_class_acc.tolist(),
+                                 "threshold": eval_metrics["threshold"],
+                                 "threshold_status": eval_metrics["threshold_status"],
+                                 "threshold_min_precision": eval_metrics["threshold_min_precision"],
+                                 "precision": eval_metrics["precision"],
+                                 "recall": eval_metrics["recall"],
+                                 "f1": eval_metrics["f1"],
+                                 "mcc": eval_metrics["mcc"],
+                                 "auc": eval_metrics["auc"],
+                                 "auc10": eval_metrics["auc10"]
                              }})
-            
-        # handle training vs eval output    
+
+        # handle training vs eval output
         out = {"loss": avg_loss}
         if not train:
             out["acc"] = avg_acc
@@ -389,35 +406,35 @@ class Trainer:
             save_dir = Path(save_dir)
             save_dir.mkdir(parents=True, exist_ok=True)
 
-        self.logger.info("training_started", 
+        self.logger.info("training_started",
                          extra={"extra": {
-                             "epochs": self.config.epochs, 
+                             "epochs": self.config.epochs,
                              "save_dir": str(save_dir) if save_dir is not None else None
                          }})
 
         for epoch in range(self.config.epochs):
             train_metrics = self._run_epoch(epoch, train=True)
-            self.logger.info("train_epoch_summary", 
+            self.logger.info("train_epoch_summary",
                              extra={"extra": {
-                                 "epoch": epoch, 
+                                 "epoch": epoch,
                                  "train_loss": float(train_metrics["loss"])
                              }})
 
             eval_out = None
             if self.val_loader is not None:
                 eval_out = self._run_epoch(epoch, train=False)
-                self.logger.info("eval_epoch_summary", 
-                    extra={"extra": {
-                        "epoch": epoch, 
-                        "eval_loss": float(eval_out["loss"]),
-                        "overall_acc_at_threshold": float(eval_out["acc"]),
-                        "precision": float(eval_out["eval_metrics"]["precision"]),
-                        "recall": float(eval_out["eval_metrics"]["recall"]),
-                        "f1": float(eval_out["eval_metrics"]["f1"]),
-                        "mcc": float(eval_out["eval_metrics"]["mcc"]),
-                        "auc": float(eval_out["eval_metrics"]["auc"]),
-                        "auc10": float(eval_out["eval_metrics"]["auc10"])
-                    }})
+                self.logger.info("eval_epoch_summary",
+                                 extra={"extra": {
+                                     "epoch": epoch,
+                                     "eval_loss": float(eval_out["loss"]),
+                                     "overall_acc_at_threshold": float(eval_out["acc"]),
+                                     "precision": float(eval_out["eval_metrics"]["precision"]),
+                                     "recall": float(eval_out["eval_metrics"]["recall"]),
+                                     "f1": float(eval_out["eval_metrics"]["f1"]),
+                                     "mcc": float(eval_out["eval_metrics"]["mcc"]),
+                                     "auc": float(eval_out["eval_metrics"]["auc"]),
+                                     "auc10": float(eval_out["eval_metrics"]["auc10"])
+                                 }})
 
                 # save from validated model only
                 if save_dir is not None:
@@ -425,39 +442,41 @@ class Trainer:
                     if metric_loss < best_val_loss:
                         best_val_loss = metric_loss
                         best_metrics = eval_out["eval_metrics"]
-                        self._save_checkpoint(save_dir / "best_model.pt", epoch, best_val_loss, metrics=best_metrics)
+                        self._save_checkpoint(
+                            save_dir / "best_model.pt", epoch, best_val_loss, metrics=best_metrics)
 
-        # final check to save a model if no validation set 
+        # final check to save a model if no validation set
         if self.val_loader is None and save_dir is not None:
-            self._save_checkpoint(save_dir / "best_model_no_val.pt", self.config.epochs - 1, float(train_metrics["loss"]))
+            self._save_checkpoint(save_dir / "best_model_no_val.pt",
+                                  self.config.epochs - 1, float(train_metrics["loss"]))
 
-        self.logger.info("training_done", 
+        self.logger.info("training_done",
                          extra={"extra": {
-                             "best_loss": best_val_loss if self.val_loader else train_metrics["loss"], 
+                             "best_loss": best_val_loss if self.val_loader else train_metrics["loss"],
                              "best_metrics": best_metrics if self.val_loader else None
                          }})
 
     def _save_checkpoint(self, path: Path | str, epoch: int, loss: float, metrics: Optional[Dict[str, Any]] = None) -> None:
         """Saves model checkpoint to path."""
         path.parent.mkdir(parents=True, exist_ok=True)
-        state = {"model_state_dict": self.model.state_dict(), 
-                 "optim_state_dict": self.optimizer.state_dict(), 
-                 "epoch": epoch, 
-                 "config": self.config.__dict__, 
-                 "best_loss": loss, 
+        state = {"model_state_dict": self.model.state_dict(),
+                 "optim_state_dict": self.optimizer.state_dict(),
+                 "epoch": epoch,
+                 "config": self.config.__dict__,
+                 "best_loss": loss,
                  "metrics": metrics}
         torch.save(state, path)
 
-        self.logger.info("checkpoint_saved", 
+        self.logger.info("checkpoint_saved",
                          extra={"extra": {
-                             "checkpoint_path": str(path), 
-                             "epoch": epoch, 
+                             "checkpoint_path": str(path),
+                             "epoch": epoch,
                              "loss": loss
                          }})
-        
-    def fit_optuna(self, 
-                   save_dir: Optional[Path | str] = None, 
-                   trial: Optional[optuna.trial.Trial] = None, 
+
+    def fit_optuna(self,
+                   save_dir: Optional[Path | str] = None,
+                   trial: Optional[optuna.trial.Trial] = None,
                    score_key: str = "f1") -> Tuple[float, int, float, Dict[str, Any]]:
         """
         Fits model using Optuna for hyperparameter optimization.
@@ -497,17 +516,17 @@ class Trainer:
             save_dir = Path(save_dir)
             save_dir.mkdir(parents=True, exist_ok=True)
 
-        self.logger.info("training_started", 
-                         extra={"extra":{
-                             "epochs": self.config.epochs, 
+        self.logger.info("training_started",
+                         extra={"extra": {
+                             "epochs": self.config.epochs,
                              "save_dir": str(save_dir) if save_dir else None
                          }})
-        
+
         for epoch in range(self.config.epochs):
             train_metrics = self._run_epoch(epoch, train=True)
-            self.logger.info("train_epoch_summary", 
+            self.logger.info("train_epoch_summary",
                              extra={"extra": {
-                                 "epoch": epoch, 
+                                 "epoch": epoch,
                                  "train_loss": train_metrics["loss"]
                              }})
 
@@ -522,13 +541,18 @@ class Trainer:
             metrics = val_metrics.get("eval_metrics", {})
             score = metrics.get(score_key, float("nan"))
 
+            # prune any trials that could not maintain minimum accepted precision
+            status = metrics.get("threshold_status", "ok")
+            if status != "ok" and trial is not None:
+                raise optuna.TrialPruned
+
             # report intermediate score for pruning
             if trial is not None:
                 if np.isfinite(score):
                     trial.report(score, step=epoch)
                     if trial.should_prune():
                         raise optuna.TrialPruned()
-                    
+
             # track overall best loss
             best_val_loss = min(best_val_loss, val_loss)
 
@@ -544,17 +568,18 @@ class Trainer:
                 best_metrics["best_epoch"] = best_epoch
                 best_metrics["best_score_key"] = score_key
                 best_metrics["best_score_value"] = best_score
-                    
+
                 # save by score metric (F1, MCC, AUC, etc.)
                 if save_dir is not None:
-                    self._save_checkpoint(save_dir / "best_model_by_score.pt", epoch, best_val_loss_at_score, best_metrics)
+                    self._save_checkpoint(
+                        save_dir / "best_model_by_score.pt", epoch, best_val_loss_at_score, best_metrics)
 
-        self.logger.info("training_done", 
+        self.logger.info("training_done",
                          extra={"extra": {
-                             "best_val_loss_at_score": best_val_loss_at_score, 
-                             "best_val_loss_overall": best_val_loss, 
-                             f"best_{score_key}_score": best_score, 
+                             "best_val_loss_at_score": best_val_loss_at_score,
+                             "best_val_loss_overall": best_val_loss,
+                             f"best_{score_key}_score": best_score,
                              "best_epoch": best_epoch
                          }})
-        
+
         return float(best_score), int(best_epoch), float(best_val_loss_at_score), best_metrics

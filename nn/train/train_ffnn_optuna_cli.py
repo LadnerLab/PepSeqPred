@@ -149,7 +149,8 @@ def main() -> None:
     parser.add_argument("--metric",
                         type=str,
                         default="f1",
-                        choices=["precision", "recall", "f1", "mcc", "auc"],
+                        choices=["precision", "recall",
+                                 "f1", "mcc", "auc", "pr_auc"],
                         help="Metric to maximize")
     parser.add_argument("--val-frac",
                         type=float,
@@ -379,6 +380,7 @@ def main() -> None:
             "BalancedAcc": float(best_metrics.get("res_balanced_acc", float("nan"))),
             "AUC": float(best_metrics.get("auc", float("nan"))),
             "AUC10": float(best_metrics.get("auc10", float("nan"))),
+            "PR_AUC": float(best_metrics.get("pr_auc", float("nan"))),
             "Threshold": float(best_metrics.get("threshold", float("nan"))),
             "ThresholdStatus": str(best_metrics.get("threshold_status", "")),
             "ThresholdMinPrecision": float(best_metrics.get("threshold_min_precision", float("nan"))),

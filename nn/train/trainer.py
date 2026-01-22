@@ -6,6 +6,7 @@ from torch.utils.data import DataLoader
 import numpy as np
 import optuna
 from sklearn.metrics import (precision_recall_fscore_support,
+                             average_precision_score,
                              matthews_corrcoef,
                              roc_auc_score,
                              roc_curve,
@@ -70,6 +71,13 @@ def compute_eval_metrics(y_true: torch.Tensor, y_pred: torch.Tensor, y_prob: tor
 
     except Exception:
         metrics["auc"] = float("nan")
+
+    # PR AUC
+    try:
+        metrics["pr_auc"] = float(average_precision_score(y_true, y_prob))
+
+    except Exception:
+        metrics["pr_auc"] = float("nan")
 
     # AUC10 calculation]
     try:
@@ -381,7 +389,8 @@ class Trainer:
                                  "f1": eval_metrics["f1"],
                                  "mcc": eval_metrics["mcc"],
                                  "auc": eval_metrics["auc"],
-                                 "auc10": eval_metrics["auc10"]
+                                 "auc10": eval_metrics["auc10"],
+                                 "pr_auc": eval_metrics["pr_auc"]
                              }})
 
         # handle training vs eval output
@@ -433,7 +442,8 @@ class Trainer:
                                      "f1": float(eval_out["eval_metrics"]["f1"]),
                                      "mcc": float(eval_out["eval_metrics"]["mcc"]),
                                      "auc": float(eval_out["eval_metrics"]["auc"]),
-                                     "auc10": float(eval_out["eval_metrics"]["auc10"])
+                                     "auc10": float(eval_out["eval_metrics"]["auc10"]),
+                                     "pr_auc": float(eval_out["eval_metrics"]["pr_auc"])
                                  }})
 
                 # save from validated model only
@@ -490,7 +500,7 @@ class Trainer:
                 The current state of the Optuna trial used to optimize model hyperparameters. Default is `None`.
 
             score_key : str
-                The metric used to score the model during a trial. Can be any accepted metric like `"f1"`, `"mcc"`, `"recall"`, `"precision"`, or `"auc"`.
+                The metric used to score the model during a trial. Can be any accepted metric like `"f1"`, `"mcc"`, `"recall"`, `"precision"`, `"auc"`, or `"pr_auc"`.
 
         Returns
         -------
@@ -541,10 +551,10 @@ class Trainer:
             metrics = val_metrics.get("eval_metrics", {})
             score = metrics.get(score_key, float("nan"))
 
-            # prune any trials that could not maintain minimum accepted precision
-            status = metrics.get("threshold_status", "ok")
-            if status != "ok" and trial is not None:
-                raise optuna.TrialPruned
+            # prune trials that could not maintain min_threshold if metric is threshold-based
+            if trial is not None and score_key in {"precision", "recall", "f1", "mcc"}:
+                if metrics.get("threshold_status", "ok") != "ok":
+                    raise optuna.TrialPruned
 
             # report intermediate score for pruning
             if trial is not None:

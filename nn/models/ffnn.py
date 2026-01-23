@@ -82,8 +82,8 @@ class PepSeqFFNN(PepSeqClassifierBase):
         dropouts : Sequence[float]
             A sequence containing the dropout rates at each layer. This can be larger than 3 dropouts but must be the same size as hidden_sizes.
         num_classes : int
-            The number of output classes. Default is `3` where each class represents the probability of a peptide
-            containing an epitope, uncertain about containing an epitope, and not containing an epitope.
+            The number of output classes. Default is `1` which represents the probability of a residue
+            being an epitope and not containing an epitope with some simple math.
         use_layer_norm : bool
             Whether to use layer normalization after each hidden layer. Default is `False`.
         use_residual : bool
@@ -92,7 +92,7 @@ class PepSeqFFNN(PepSeqClassifierBase):
     def __init__(self, emb_dim: int = 1281, 
                  hidden_sizes: Sequence[int] = (150, 120, 45), 
                  dropouts: Sequence[float] = (0.2, 0.2, 0.2), 
-                 num_classes: int = 3, 
+                 num_classes: int = 1, 
                  use_layer_norm: bool = False, 
                  use_residual: bool = False):
         super().__init__(emb_dim=emb_dim, num_classes=num_classes)
@@ -129,15 +129,7 @@ class PepSeqFFNN(PepSeqClassifierBase):
         Returns
         -------
             Tensor
-                Logits of shape (B, C), where C is the number of output classes (usually 3).
-
-        Notes
-        -----
-        This model performs mean pooling acorss the sequence length dimension 
-        to convert residue-level embeddings into a single fixed size peptide 
-        representation. This representation is then passed through this 
-        feed-forward neural network to produce class logits. Predictions are 
-        made at the peptide level rather than at the individual residue level.
+                Logits of shape (B, C), where C is the number of output classes.
         """
         if X.dim() != 3:
             raise ValueError(f"Expected shape (B, L, E), got {X.shape}")
@@ -145,7 +137,9 @@ class PepSeqFFNN(PepSeqClassifierBase):
         if X.size(-1) != self.emb_dim:
             raise ValueError(f"Expected emb_dim {self.emb_dim}, got {X.size(-1)}")
         
-        # predicting peptide contains epitope, not if each residue is an epitope
-        pooled = X.mean(dim=1) # mean pool: (B, L, E) --> (B, E)
-        logits = self.ff_model(pooled)
+        # predict at residue level
+        B, L, D = X.shape
+        X = X.view(B * L, D) # flatten residues
+        logits = self.ff_model(X) # (B * L, 1)
+        logits = logits.view(B, L) # (B, L)
         return logits

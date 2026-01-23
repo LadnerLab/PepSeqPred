@@ -1,6 +1,6 @@
 """train_ffnn_cli.py
 
-This module is designed to train a FFNN to predict if a peptide is likely to contain, not contain, or is uncertain about containing epitopes.
+This module is designed to train a FFNN to predict if a residue from a peptide is likely to be or not be an epitope.
 
 ***Usage TBD
 """
@@ -15,36 +15,36 @@ from pipelineio.peptidedataset import PeptideDataset
 from nn.models.ffnn import PepSeqFFNN
 from nn.train.trainer import Trainer, TrainerConfig
 
-def compute_class_weights(data: DataLoader, num_classes: int = 3) -> torch.Tensor:
+def compute_pos_weight(loader: DataLoader) -> float:
     """
     Calculates the weight of each class.
 
     Parameters
     ----------
-        data : DataLoader
+        loader : DataLoader
             Model training data with likely imbalanced classes.
-        num_classes : int
-            The number of classes in the data.
 
     Returns
     -------
-        Tensor
-            The class weights as a tensor.
+        float
+            The ratio of uncertain + not epitopes vs. definite epitopes.
+            If no bias is present (i.e., pos = neg = 0), 1.0 is returned
     """
-    counts = torch.zeros(num_classes, dtype=torch.long)
-    for _, y_onehot in data:
-        y = y_onehot.argmax(dim=-1)
-        y = torch.atleast_1d(y).to(torch.long)
-        counts += torch.bincount(y.cpu(), minlength=num_classes)
+    neg, pos = 0, 0
+    for _, y in loader:
+        y = y.view(-1)
+        pos += int((y == 1).sum().item())
+        neg += int((y == 0).sum().item())
     
-    # inverse frequency so mean weight = 1
-    weights = counts.sum().float() / counts.clamp_min(1).float()
-    weights = weights / weights.mean()
-    return weights
+    # if no bias, return 1.0
+    if pos == 0:
+        return 1.0
+    
+    return float(neg / pos)
 
 def main() -> None:
     """Handles command-line argument parsing and high-level execution of the Train FFNN program."""
-    parser = argparse.ArgumentParser(description="Train PepSeqPred FFNN on peptide-level ESM-2 embeddings to predict likelihood of peptide containing vs not containing vs uncertain about containing epitopes across the infectome.")
+    parser = argparse.ArgumentParser(description="Train PepSeqPred FFNN on peptide-level ESM-2 embeddings for binary residue-level epitope prediction. Class 0, 1, and 2 from legacy labeling are collapsed into epitope vs not epitope.")
     parser.add_argument("input_data", 
                         type=Path, 
                         help="Path to .pt file containing PeptideDataset")
@@ -78,6 +78,10 @@ def main() -> None:
                         type=float, 
                         default=0.0, 
                         help="Model training weight decay to prevent overfitting by shrinking model weights during training")
+    parser.add_argument("--use-pos-weight", 
+                        dest="use_pos_weight", 
+                        action="store_true", 
+                        help="Use positive weight to handle positive vs. negative class imbalances.")
     parser.add_argument("--save-path", 
                         action="store", 
                         dest="save_path", 
@@ -134,7 +138,6 @@ def main() -> None:
     # generator used for dataset split reproducibility
     gen = torch.Generator().manual_seed(seed)
     train_data, val_data = random_split(data, [n_train, n_val], generator=gen)
-    class_weights = compute_class_weights(train_data)
 
     # set up data loaders
     pin = torch.cuda.is_available() # pin memory depending on if CUDA available
@@ -149,6 +152,11 @@ def main() -> None:
                             num_workers=args.num_workers, 
                             pin_memory=pin)
     
+    # compute positive weight (like class weight)
+    pos_weight = None
+    if args.use_pos_weight:
+        pos_weight = compute_pos_weight(train_loader)
+    
     # build our FFNN model
     emb_dim = data.embeddings.size(-1)
     model = PepSeqFFNN(emb_dim=emb_dim, 
@@ -156,20 +164,20 @@ def main() -> None:
                        dropouts=(0.1, 0.1, 0.1, 0.1), 
                        use_layer_norm=True, 
                        use_residual=True, 
-                       num_classes=3)
+                       num_classes=1)
 
     # setup config and train
     config = TrainerConfig(epochs=args.epochs, 
                            batch_size=args.batch_size, 
                            learning_rate=args.lr, 
                            weight_decay=args.weight_decay, 
-                           device="cuda" if torch.cuda.is_available() else "cpu")
+                           device="cuda" if torch.cuda.is_available() else "cpu", 
+                           pos_weight=pos_weight)
     trainer = Trainer(model=model, 
                       train_loader=train_loader, 
                       logger=logger, 
                       val_loader=val_loader, 
-                      config=config, 
-                      class_weights=class_weights) # change to tensor of shape (3,) if we want to weight each class
+                      config=config)
     
     # run training
     trainer.fit(save_dir=args.save_path)

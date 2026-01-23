@@ -37,7 +37,7 @@ class PeptideDataset(Dataset):
             Stop indices of each peptide within the parent protein sequence.
     """
     embeddings: torch.Tensor | List[torch.Tensor]
-    targets: torch.Tensor | List[torch.Tensor]
+    targets: torch.Tensor | List[torch.Tensor] # peptide level targets
     code_names: List[str]
     protein_ids: List[str]
     peptides: List[str]
@@ -54,6 +54,10 @@ class PeptideDataset(Dataset):
         if isinstance(self.targets, list):
             self.targets = torch.stack(self.targets, dim=0)
 
+        # collapse (N, 3) one hot to (N,) binary
+        if self.targets.dim() == 2 and self.targets.size(1) == 3:
+            self.targets = self.targets[:, 0].to(torch.float32)
+
     # ----- Dataset API -----
     def __len__(self) -> int:
         """Return number of samples in dataset."""
@@ -62,8 +66,14 @@ class PeptideDataset(Dataset):
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
         """Retrieve a single embeddings sample and its target label."""
         X = self.embeddings[idx] # (L, D)
-        y = self.targets[idx] # (3,)
-        return X, y
+        y_bin = self.targets[idx].float() # scalar or shape ()
+
+        # ensure scalar
+        if y_bin.dim() != 0:
+            y_bin = y_bin.view(())
+        
+        y_res = y_bin.repeat(X.size(0)) # (L,)
+        return X, y_res
     
     # ----- Convenient props -----
     @property
@@ -75,7 +85,7 @@ class PeptideDataset(Dataset):
     def peptide_len(self) -> int:
         """Length of each peptide sequence."""
         if self.embeddings:
-            return self.embeddings[0].size(1)
+            return self.embeddings.size(1)
         return 0
     
     def to_dict(self) -> Dict[str, Any]:

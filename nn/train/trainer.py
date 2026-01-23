@@ -117,7 +117,7 @@ def _confusion_from_probs(y_true: np.ndarray, y_prob: np.ndarray, threshold: flo
 def find_threshold_max_recall_min_precision(y_true: np.ndarray, y_prob: np.ndarray, min_precision: float = 0.50, num_thresholds: int = 999) -> Dict[str, Any]:
     """
     Finds the threshold that maximizes recall subject such that `precision >= min_precision`. 
-    If no precision meets this constrain, the best possible threshold is returned.
+    If no precision meets this constraint, the best possible threshold is returned.
 
     Parameters
     ----------

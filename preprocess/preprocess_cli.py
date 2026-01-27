@@ -10,26 +10,34 @@ Usage
 >>> ./preprocessdata.sh <metadata_tsv> <zscore_tsv>
 """
 import argparse
-from pathlib import Path
-import pandas as pd
 import logging
 import time
-from pipelineio.logger import setup_logger
-from pipelineio.read import read_metadata, read_zscores
-from preprocess.process import merge_zscores_metadata, apply_z_threshold
 from typing import Optional
+from pathlib import Path
+import pandas as pd
+try:
+    from pipelineio.logger import setup_logger
+    from pipelineio.read import read_metadata, read_zscores
+except ModuleNotFoundError:
+    from preprocess.pipelineio.logger import setup_logger
+    from preprocess.pipelineio.read import read_metadata, read_zscores
+try:
+    from process import apply_z_threshold, merge_zscores_metadata
+except ModuleNotFoundError:
+    from preprocess.process import apply_z_threshold, merge_zscores_metadata
+
 
 # TODO: log/flag all peptides < 30 amino acids in length
-def preprocess(meta_path: Path | str, 
-               z_path: Path | str, 
-               fname_col: str = "FullName", 
-               code_col: str = "CodeName", 
-               is_epitope_z_min: float = 20.0, 
-               is_epitope_min_subjects: int = 4, 
-               not_epitope_z_max: float = 10.0, 
-               not_epitope_max_subjects: Optional[int] = None, 
-               prefix: str = "VW_", 
-               save_path: Optional[str | Path] = None, 
+def preprocess(meta_path: Path | str,
+               z_path: Path | str,
+               fname_col: str = "FullName",
+               code_col: str = "CodeName",
+               is_epitope_z_min: float = 20.0,
+               is_epitope_min_subjects: int = 4,
+               not_epitope_z_max: float = 10.0,
+               not_epitope_max_subjects: Optional[int] = None,
+               prefix: str = "VW_",
+               save_path: Optional[str | Path] = None,
                logger: Optional[logging.Logger] = None) -> pd.DataFrame:
     """
     Runs the entire data preprocessing step for ESM-2 embedding generation and machine learning epitope 
@@ -71,141 +79,148 @@ def preprocess(meta_path: Path | str,
             is passed to function.
     """
     t0 = time.perf_counter()
-    meta_df = read_metadata(meta_path, id_col=fname_col, drop_cols=["Category", "SpeciesID", "Protein", "Encoding"])
+    meta_df = read_metadata(meta_path, id_col=fname_col, drop_cols=[
+                            "Category", "SpeciesID", "Protein", "Encoding"])
     z_df = read_zscores(z_path, meta_id_col=code_col)
-    logger.info("read_files", 
+    logger.info("read_files",
                 extra={"extra": {
-                    "meta_size": len(meta_df), 
-                    "z_size": len(z_df), 
+                    "meta_size": len(meta_df),
+                    "z_size": len(z_df),
                     "read_duration_s": round(time.perf_counter() - t0, 3)
                 }})
-    
+
     t1 = time.perf_counter()
-    z_df_targets = apply_z_threshold(z_df, 
-                                     is_epitope_z_min=is_epitope_z_min, 
-                                     is_epitope_min_subjects=is_epitope_min_subjects, 
-                                     not_epitope_z_max=not_epitope_z_max, 
-                                     not_epitope_max_subjects=not_epitope_max_subjects, 
+    z_df_targets = apply_z_threshold(z_df,
+                                     is_epitope_z_min=is_epitope_z_min,
+                                     is_epitope_min_subjects=is_epitope_min_subjects,
+                                     not_epitope_z_max=not_epitope_z_max,
+                                     not_epitope_max_subjects=not_epitope_max_subjects,
                                      prefix=prefix)
-    logger.info("applied_z_score_thresh", 
+    logger.info("applied_z_score_thresh",
                 extra={"extra": {
                     "z_one_hot_encoding_duration_s": round(time.perf_counter() - t1, 3)
                 }})
-    
+
     t2 = time.perf_counter()
-    fully_pop_meta_df = merge_zscores_metadata(z_df_targets, meta_df, id_col=code_col, save_path=save_path)
-    logger.info("merged_z_and_meta", 
+    fully_pop_meta_df = merge_zscores_metadata(
+        z_df_targets, meta_df, id_col=code_col, save_path=save_path)
+    logger.info("merged_z_and_meta",
                 extra={"extra": {
-                    "merged_size": len(fully_pop_meta_df), 
-                    "merged_on": code_col, 
+                    "merged_size": len(fully_pop_meta_df),
+                    "merged_on": code_col,
                     "merge_duration_s": round(time.perf_counter() - t2, 3)
                 }})
 
     return fully_pop_meta_df
+
 
 def main() -> None:
     """
     Parse CLI arguments, set up logging, run data preprocessing script, and save results.
     """
     t0 = time.perf_counter()
-    parser = argparse.ArgumentParser(description="Preprocess and label model input data from PV1 metadata and z-score reactivity datasets.")
-    parser.add_argument("meta_file", 
-                        type=Path, 
+    parser = argparse.ArgumentParser(
+        description="Preprocess and label model input data from PV1 metadata and z-score reactivity datasets.")
+    parser.add_argument("meta_file",
+                        type=Path,
                         help="Path to metadata file.")
-    parser.add_argument("z_file", 
-                        type=Path, 
+    parser.add_argument("z_file",
+                        type=Path,
                         help="Path to z-score reactivity file.")
-    parser.add_argument("--fname-col", 
-                        action="store", 
-                        dest="fname_col", 
-                        type=str, 
-                        default="FullName", 
+    parser.add_argument("--fname-col",
+                        action="store",
+                        dest="fname_col",
+                        type=str,
+                        default="FullName",
                         help="Name of column containing 'ID=...,AC=...,OXX=...' entries.")
-    parser.add_argument("--code-col", 
-                        action="store", 
-                        dest="code_col", 
-                        type=str, 
-                        default="CodeName", 
+    parser.add_argument("--code-col",
+                        action="store",
+                        dest="code_col",
+                        type=str,
+                        default="CodeName",
                         help="Name of column containing codenames to map between metadata and z-score files.")
-    parser.add_argument("--is-epi-z-thresh", 
-                        action="store", 
-                        dest="is_epi_z_min", 
-                        type=float, 
-                        default=20.0, 
+    parser.add_argument("--is-epi-z-thresh",
+                        action="store",
+                        dest="is_epi_z_min",
+                        type=float,
+                        default=20.0,
                         help="Minimum z-score required for peptide to contain epitopes.")
-    parser.add_argument("--is-epi-min-subs", 
-                        action="store", 
-                        dest="is_epi_min_subs", 
-                        type=int, 
-                        default=4, 
+    parser.add_argument("--is-epi-min-subs",
+                        action="store",
+                        dest="is_epi_min_subs",
+                        type=int,
+                        default=4,
                         help="Minimum # of subjects required to be at or above minimum z-score for peptide to contain epitopes.")
-    parser.add_argument("--not-epi-z-thresh", 
-                        action="store", 
-                        dest="not_epi_z_max", 
-                        type=float, 
-                        default=10.0, 
+    parser.add_argument("--not-epi-z-thresh",
+                        action="store",
+                        dest="not_epi_z_max",
+                        type=float,
+                        default=10.0,
                         help="Maximum z-score required for peptide to NOT contain epitopes.")
-    parser.add_argument("--not-epi-max-subs", 
-                        action="store", 
-                        dest="not_epi_max_subs", 
-                        type=int, 
-                        default=0, 
+    parser.add_argument("--not-epi-max-subs",
+                        action="store",
+                        dest="not_epi_max_subs",
+                        type=int,
+                        default=0,
                         help="Maximum # of subjects required to be at or below maximum z-score for peptide to NOT contain epitopes. Default is 'None' which means every column is used to disqualify a peptide from containing epitopes.")
-    parser.add_argument("--subject-prefix", 
-                        action="store", 
-                        dest="subject_prefix", 
-                        type=str, 
-                        default="VW_", 
+    parser.add_argument("--subject-prefix",
+                        action="store",
+                        dest="subject_prefix",
+                        type=str,
+                        default="VW_",
                         help="Prefix for subject column labels in z-score reactivity data.")
-    parser.add_argument("--save-path", 
-                        action="store_true", 
-                        dest="save_path", 
-                        default=False, 
+    parser.add_argument("--save",
+                        action="store_true",
+                        dest="save_path",
+                        default=False,
                         help="Store results in a .tsv output file to be used in model training.")
-    
+
     args = parser.parse_args()
     logger = setup_logger(json_lines=True)
 
     not_epitope_max_subjects = args.not_epi_max_subs if args.not_epi_max_subs != 0 else None
 
-    if args.save_path:
+    if args.save:
         if not_epitope_max_subjects is None:
-            save_path = Path(f"input_data_{int(args.is_epi_z_min)}_{args.is_epi_min_subs}_{int(args.not_epi_z_max)}_all.tsv")
+            save_path = Path(
+                f"input_data_{int(args.is_epi_z_min)}_{args.is_epi_min_subs}_{int(args.not_epi_z_max)}_all.tsv")
         else:
-            save_path = Path(f"input_data_{int(args.is_epi_z_min)}_{args.is_epi_min_subs}_{int(args.not_epi_z_max)}_{not_epitope_max_subjects}.tsv")
+            save_path = Path(
+                f"input_data_{int(args.is_epi_z_min)}_{args.is_epi_min_subs}_{int(args.not_epi_z_max)}_{not_epitope_max_subjects}.tsv")
     else:
         save_path = None
 
-    is_epitope_z_min = args.is_epi_z_min, 
-    is_epitope_min_subjects = args.is_epi_min_subs, 
-    not_epitope_z_max = args.not_epi_z_max,  
-    logger.info("run_start", 
+    is_epitope_z_min = args.is_epi_z_min
+    is_epitope_min_subjects = args.is_epi_min_subs
+    not_epitope_z_max = args.not_epi_z_max
+    logger.info("run_start",
                 extra={"extra": {
-                    "is_epi_z_min": is_epitope_z_min, 
-                    "is_epi_min_subs": is_epitope_min_subjects, 
-                    "not_epi_z_max": not_epitope_z_max, 
-                    "not_epi_max_subs": not_epitope_max_subjects, 
+                    "is_epi_z_min": is_epitope_z_min,
+                    "is_epi_min_subs": is_epitope_min_subjects,
+                    "not_epi_z_max": not_epitope_z_max,
+                    "not_epi_max_subs": not_epitope_max_subjects,
                     "save_path": str(save_path)
                 }})
 
-    meta_df = preprocess(args.meta_file, 
-                         args.z_file, 
-                         fname_col=args.fname_col, 
-                         code_col=args.code_col,  
-                         is_epitope_z_min=is_epitope_z_min, 
-                         is_epitope_min_subjects=is_epitope_min_subjects, 
-                         not_epitope_z_max=not_epitope_z_max, 
-                         not_epitope_max_subjects=not_epitope_max_subjects, 
-                         prefix=args.subject_prefix, 
-                         save_path=save_path, 
+    meta_df = preprocess(args.meta_file,
+                         args.z_file,
+                         fname_col=args.fname_col,
+                         code_col=args.code_col,
+                         is_epitope_z_min=is_epitope_z_min,
+                         is_epitope_min_subjects=is_epitope_min_subjects,
+                         not_epitope_z_max=not_epitope_z_max,
+                         not_epitope_max_subjects=not_epitope_max_subjects,
+                         prefix=args.subject_prefix,
+                         save_path=save_path,
                          logger=logger)
-    
-    logger.info("preprocessing_done", 
+
+    logger.info("preprocessing_done",
                 extra={"extra": {
-                    "meta_size": len(meta_df), 
-                    "output_file_path": str(save_path), 
+                    "meta_size": len(meta_df),
+                    "output_file_path": str(save_path),
                     "total_duration_s": round(time.perf_counter() - t0, 3)
                 }})
+
 
 if __name__ == "__main__":
     main()

@@ -9,7 +9,7 @@ import torch
 import optuna
 from torch.utils.data import DataLoader, random_split
 from pipelineio.logger import setup_logger
-from pipelineio.peptidedataset import PeptideDataset
+from nn.train.pipelineio.proteindataset import PeptideDataset
 from nn.models.ffnn import PepSeqFFNN
 from nn.train.trainer import Trainer, TrainerConfig
 from typing import Any, Dict, Tuple

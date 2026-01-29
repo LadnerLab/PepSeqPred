@@ -1,10 +1,10 @@
 #!/bin/bash
 #SBATCH --job-name=ffnn_v1.0
 #SBATCH --nodes=1
-#SBATCH --ntasks=1
+#SBATCH --ntasks=4
 #SBATCH --cpus-per-task=4
 #SBATCH --partition=gpu
-#SBATCH --gpus=a100
+#SBATCH --gpus-per-task=a100:1
 #SBATCH --mem=256G
 #SBATCH --time=12:00:00
 #SBATCH --output=/scratch/%u/train_ffnn_slurm/%j_ffnn_v1.0/%x.out
@@ -52,7 +52,7 @@ fi
 
 EPOCHS="${EPOCHS:-10}"
 SEED="${SEED:-42}"
-BATCH_SIZE="${BATCH_SIZE:-64}"
+BATCH_SIZE="${BATCH_SIZE:-256}" # ensure batch size is 4 times what you would do for one GPU (for example. 256 = 64 * 4)
 LR="${LR:-0.001}"
 WD="${WD:-0.0}"
 VAL_FRAC="${VAL_FRAC:-0.2}"
@@ -77,7 +77,7 @@ else
     LAUNCHER=""
 fi
 
-${LAUNCHER} python -u train_ffnn.pyz \
+${LAUNCHER} torchrun --nproc_per_node=4 train_ffnn.pyz \
     --embedding-dirs "${EMBEDDING_DIRS[@]}" \
     --label-shards "${LABEL_SHARDS[@]}" \
     --epochs "${EPOCHS}" \

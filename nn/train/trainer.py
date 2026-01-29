@@ -15,28 +15,6 @@ from dataclasses import dataclass
 from typing import Optional, List, Dict, Any, Tuple
 
 
-def count_classes(loader: DataLoader) -> List[int]:
-    """
-    Counts total number of peptides per class.
-
-    Parameters
-    ----------
-        loader : DataLoader
-            The DataLoader containing one-hot encoded targets to sum.
-
-    Returns
-    -------
-        counts : List[int]
-            List containing the sum of each class.
-    """
-    neg, pos = 0, 0
-    for _, y in loader:
-        y = y.view(-1)
-        pos += int((y == 1).sum().item())
-        neg += int((y == 0).sum().item())
-    return [neg, pos]
-
-
 def compute_eval_metrics(y_true: torch.Tensor, y_pred: torch.Tensor, y_prob: torch.Tensor) -> Dict[str, Any]:
     """
     Computes evaluation metrics given true lables, predicted labels, and predicted probabilities.
@@ -237,7 +215,8 @@ class Trainer:
         if self.config.pos_weight is not None:
             pos_weight = torch.tensor(
                 [self.config.pos_weight], device=self.device)
-        self.criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+        self.criterion = nn.BCEWithLogitsLoss(
+            pos_weight=pos_weight, reduction="none")
 
         # inital log for reproduceability
         num_params = sum(p.numel() for p in self.model.parameters())
@@ -254,22 +233,20 @@ class Trainer:
                              "pos_weight": self.config.pos_weight
                          }})
 
-        # log class distributions
-        train_counts = count_classes(train_loader)
-        val_counts = count_classes(
-            val_loader) if val_loader is not None else None
-        self.logger.info("class_distribution",
-                         extra={"extra": {
-                             "train_counts": train_counts,
-                             "val_counts": val_counts
-                         }})
-
     def _batch_step(self, batch: torch.Tensor, train: bool = True) -> Dict[str, Any]:
         """Steps through a batch to train and optimize the model."""
-        X, y = batch
+        # ensure we grab mask when applicable
+        if len(batch) == 2:
+            X, y = batch
+            mask = None
+        else:
+            X, y, mask = batch
+
         non_blocking = (self.device.type == "cuda")
         X = X.to(self.device, non_blocking=non_blocking)
         y = y.to(self.device, non_blocking=non_blocking).float()
+        if mask is not None:
+            mask = mask.to(self.device, non_blocking=non_blocking)
 
         # validate targets
         if y.dim() != 2:
@@ -282,20 +259,40 @@ class Trainer:
             raise ValueError(
                 f"Expected logits shape {tuple(y.shape)}, got {tuple(logits.shape)}")
         # calculate loss
-        loss = self.criterion(logits, y)
+        loss_raw = self.criterion(logits, y)
+        if mask is not None:
+            if mask.shape != y.shape:
+                raise ValueError(
+                    f"Expected mask shape {tuple(y.shape)}, got {tuple(mask.shape)}")
+            denom = mask.float().sum()
+            if denom.item() == 0.0:
+                loss = loss_raw.sum() * 0.0
+                if train:
+                    return {"loss": 0.0, "n": 0}
+            else:
+                loss = (loss_raw * mask.float()).sum() / denom
+        else:
+            loss = loss_raw.mean()
 
         # optimize model in training batch
         if train:
             self.optimizer.zero_grad(set_to_none=True)
             loss.backward()
             self.optimizer.step()
-            return {"loss": float(loss.item()), "n": int(y.numel())}
+            n = int(mask.sum().item() if mask is not None else int(y.numel()))
+            return {"loss": float(loss.item()), "n": n}
 
         probs = torch.sigmoid(logits)  # (B, L)
+        y_flat = y.to(torch.long).view(-1)
+        probs_flat = probs.view(-1)
+        if mask is not None:
+            mask_flat = mask.view(-1).bool()
+            y_flat = y_flat[mask_flat]
+            probs_flat = probs_flat[mask_flat]
         return {"loss": float(loss.item()),
-                "n": int(y.numel()),
-                "y": y.to(torch.long).view(-1).detach().cpu(),
-                "probs": probs.view(-1).detach().cpu()}
+                "n": int(y_flat.numel()),
+                "y": y_flat.detach().cpu(),
+                "probs": probs_flat.detach().cpu()}
 
     def _run_epoch(self, epoch: int, train: bool = True) -> Dict[str, Any]:
         """Runs one complete epoch (training step) from start to finish."""
@@ -317,6 +314,8 @@ class Trainer:
 
         total_loss = 0.0
         total_samples = 0
+        total_pos = 0
+        total_neg = 0
 
         all_y: List[torch.Tensor] = []
         all_probs: List[torch.Tensor] = []
@@ -328,12 +327,33 @@ class Trainer:
                 out = self._batch_step(batch, train=train)
 
             # collect data for metrics
-            if not train:
+            if not train and out["n"] > 0:
                 all_y.append(out["y"])
                 all_probs.append(out["probs"])
 
             total_loss += out["loss"] * out["n"]
             total_samples += out["n"]
+
+            # track class counts from masked residues
+            if not train:
+                y_flat = out["y"]
+            else:
+                # reuse labels from batch without extra forward pass
+                if len(batch) == 2:
+                    _, y = batch
+                    mask = None
+                else:
+                    _, y, mask = batch
+
+                y = y.view(-1)
+                if mask is not None:
+                    mask = mask.view(-1).bool()
+                    y = y[mask]
+                y_flat = y
+
+            if y_flat.numel() > 0:
+                total_pos += int((y_flat == 1).sum().item())
+                total_neg += int((y_flat == 0).sum().item())
 
         # compute average loss
         avg_loss = total_loss / max(total_samples, 1)
@@ -342,30 +362,47 @@ class Trainer:
         cm = None
         eval_metrics = None
         if not train:
-            y_true = torch.cat(all_y, dim=0).numpy()
-            y_prob = torch.cat(all_probs, dim=0).numpy()
+            # guard against invalid or non-existent residues
+            if len(all_y) == 0:
+                eval_metrics = {
+                    "precision": float("nan"),
+                    "recall": float("nan"),
+                    "f1": float("nan"),
+                    "mcc": float("nan"),
+                    "auc": float("nan"),
+                    "auc10": float("nan"),
+                    "pr_auc": float("nan"),
+                    "threshold": float("nan"),
+                    "threshold_status": "no_valid_residues",
+                    "threshold_min_precision": 0.25
+                }
+                avg_acc = float("nan")
+            else:
+                y_true = torch.cat(all_y, dim=0).numpy()
+                y_prob = torch.cat(all_probs, dim=0).numpy()
 
-            # compute predictions at most optimal threshold calculated
-            thresh_out = find_threshold_max_recall_min_precision(
-                y_true, y_prob, min_precision=0.20, num_thresholds=999
-            )
-            best_thresh = float(thresh_out["threshold"])
-            y_pred = (y_prob >= best_thresh).astype(np.int64)
+                # compute predictions at most optimal threshold calculated
+                thresh_out = find_threshold_max_recall_min_precision(
+                    y_true, y_prob, min_precision=0.25, num_thresholds=999
+                )
+                best_thresh = float(thresh_out["threshold"])
+                y_pred = (y_prob >= best_thresh).astype(np.int64)
 
-            total_correct = int((y_pred == y_true).sum())
-            avg_acc = total_correct / max(total_samples, 1)
+                total_correct = int((y_pred == y_true).sum())
+                avg_acc = total_correct / max(total_samples, 1)
 
-            # build confusion matrix from true and predicted values
-            cm = torch.zeros((2, 2), dtype=torch.int64)  # rows true, cols pred
-            cm[0, 0] = int(((y_true == 0) & (y_pred == 0)).sum())
-            cm[0, 1] = int(((y_true == 0) & (y_pred == 1)).sum())
-            cm[1, 0] = int(((y_true == 1) & (y_pred == 0)).sum())
-            cm[1, 1] = int(((y_true == 1) & (y_pred == 1)).sum())
+                # build confusion matrix from true and predicted values
+                # rows true, cols pred
+                cm = torch.zeros((2, 2), dtype=torch.int64)
+                cm[0, 0] = int(((y_true == 0) & (y_pred == 0)).sum())
+                cm[0, 1] = int(((y_true == 0) & (y_pred == 1)).sum())
+                cm[1, 0] = int(((y_true == 1) & (y_pred == 0)).sum())
+                cm[1, 1] = int(((y_true == 1) & (y_pred == 1)).sum())
 
-            eval_metrics = compute_eval_metrics(y_true, y_pred, y_prob)
-            eval_metrics["threshold"] = best_thresh
-            eval_metrics["threshold_status"] = thresh_out["status"]
-            eval_metrics["threshold_min_precision"] = thresh_out["min_precision"]
+                eval_metrics = compute_eval_metrics(y_true, y_pred, y_prob)
+                eval_metrics["threshold"] = best_thresh
+                eval_metrics["threshold_status"] = thresh_out["status"]
+                eval_metrics["threshold_min_precision"] = thresh_out["min_precision"]
 
         # log confusion matrix
         if not train and cm is not None and eval_metrics is not None:
@@ -394,7 +431,8 @@ class Trainer:
                              }})
 
         # handle training vs eval output
-        out = {"loss": avg_loss}
+        out = {"loss": avg_loss, "n_residues": total_samples,
+               "pos_residues": total_pos, "neg_residues": total_neg}
         if not train:
             out["acc"] = avg_acc
             out["eval_metrics"] = eval_metrics
@@ -426,7 +464,10 @@ class Trainer:
             self.logger.info("train_epoch_summary",
                              extra={"extra": {
                                  "epoch": epoch,
-                                 "train_loss": float(train_metrics["loss"])
+                                 "train_loss": float(train_metrics["loss"]),
+                                 "train_residues": int(train_metrics["n_residues"]),
+                                 "train_pos_residues": int(train_metrics["pos_residues"]),
+                                 "train_neg_residues": int(train_metrics["neg_residues"])
                              }})
 
             eval_out = None
@@ -437,6 +478,9 @@ class Trainer:
                                      "epoch": epoch,
                                      "eval_loss": float(eval_out["loss"]),
                                      "overall_acc_at_threshold": float(eval_out["acc"]),
+                                     "eval_residues": int(eval_out["n_residues"]),
+                                     "eval_pos_residues": int(eval_out["pos_residues"]),
+                                     "eval_neg_residues": int(eval_out["neg_residues"]),
                                      "precision": float(eval_out["eval_metrics"]["precision"]),
                                      "recall": float(eval_out["eval_metrics"]["recall"]),
                                      "f1": float(eval_out["eval_metrics"]["f1"]),
@@ -537,7 +581,10 @@ class Trainer:
             self.logger.info("train_epoch_summary",
                              extra={"extra": {
                                  "epoch": epoch,
-                                 "train_loss": train_metrics["loss"]
+                                 "train_loss": float(train_metrics["loss"]),
+                                 "train_residues": int(train_metrics["n_residues"]),
+                                 "train_pos_residues": int(train_metrics["pos_residues"]),
+                                 "train_neg_residues": int(train_metrics["neg_residues"])
                              }})
 
             val_metrics = None

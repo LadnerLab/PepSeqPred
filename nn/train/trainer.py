@@ -2,6 +2,7 @@ import logging
 from pathlib import Path
 import torch
 import torch.nn as nn
+import torch.distributed as dist
 from torch.utils.data import DataLoader
 import numpy as np
 import optuna
@@ -13,6 +14,51 @@ from sklearn.metrics import (precision_recall_fscore_support,
                              auc)
 from dataclasses import dataclass
 from typing import Optional, List, Dict, Any, Tuple
+
+
+def _ddp_enabled() -> bool:
+    """Check if DDP is enabled for parallelism."""
+    return dist.is_available() and dist.is_initialized()
+
+
+def _ddp_rank() -> int:
+    """Returns rank of current process, else 0 if DDP not enabled."""
+    return dist.get_rank() if _ddp_enabled() else 0
+
+
+def _ddp_world() -> int:
+    """Returns world size if DDP enabled, else 1."""
+    return dist.get_world_size() if _ddp_enabled() else 1
+
+
+def _ddp_all_reduce_sum(t: torch.Tensor) -> torch.Tensor:
+    """Returns a reduced sum of the tensor if DDP enabled."""
+    if _ddp_enabled():
+        dist.all_reduce(t, op=dist.ReduceOp.SUM)
+    return t
+
+
+def _ddp_gather_all_1d(t: torch.Tensor, device: torch.device) -> Tuple[List[torch.Tensor], List[int]]:
+    """
+    All-gather 1D tensor across all ranks with padding to max length.
+    Returns a list of gathered tensors and the original sizes.
+    """
+    if not _ddp_enabled():
+        return [t], [int(t.numel())]
+
+    sizes = torch.tensor([t.numel()], device=device, dtype=torch.long)
+    size_list = [torch.zeros_like(sizes) for _ in range(_ddp_world())]
+    dist.all_gather(size_list, sizes)
+    sizes_int = [int(s.item()) for s in size_list]
+    max_size = max(sizes_int) if sizes_int else int(t.numel())
+
+    padded = torch.zeros(max_size, device=device, dtype=t.dtype)
+    if t.numel() > 0:
+        padded[:t.numel()] = t
+
+    gathered = [torch.zeros_like(padded) for _ in range(_ddp_world())]
+    dist.all_gather(gathered, padded)
+    return gathered, sizes_int
 
 
 def compute_eval_metrics(y_true: torch.Tensor, y_pred: torch.Tensor, y_prob: torch.Tensor) -> Dict[str, Any]:
@@ -220,18 +266,19 @@ class Trainer:
 
         # inital log for reproduceability
         num_params = sum(p.numel() for p in self.model.parameters())
-        self.logger.info("trainer_init",
-                         extra={"extra": {
-                             "device": str(self.device),
-                             "seed": torch.initial_seed(),
-                             "epochs": self.config.epochs,
-                             "batch_size": self.config.batch_size,
-                             "learning_rate": self.config.learning_rate,
-                             "weight_decay": self.config.weight_decay,
-                             "num_params": num_params,
-                             "has_val_loader": self.val_loader is not None,
-                             "pos_weight": self.config.pos_weight
-                         }})
+        if _ddp_rank() == 0:
+            self.logger.info("trainer_init",
+                             extra={"extra": {
+                                 "device": str(self.device),
+                                 "seed": torch.initial_seed(),
+                                 "epochs": self.config.epochs,
+                                 "batch_size": self.config.batch_size,
+                                 "learning_rate": self.config.learning_rate,
+                                 "weight_decay": self.config.weight_decay,
+                                 "num_params": num_params,
+                                 "has_val_loader": self.val_loader is not None,
+                                 "pos_weight": self.config.pos_weight
+                             }})
 
     def _batch_step(self, batch: torch.Tensor, train: bool = True) -> Dict[str, Any]:
         """Steps through a batch to train and optimize the model."""
@@ -300,12 +347,13 @@ class Trainer:
         if loader is None:
             return {"loss": float("nan"), "acc": float("nan")}
 
-        self.logger.info("epoch_start",
-                         extra={"extra": {
-                             "epoch": epoch,
-                             "mode": "train" if train else "val",
-                             "num_batches": len(loader)
-                         }})
+        if _ddp_rank() == 0:
+            self.logger.info("epoch_start",
+                             extra={"extra": {
+                                 "epoch": epoch,
+                                 "mode": "train" if train else "val",
+                                 "num_batches": len(loader)
+                             }})
 
         if train:
             self.model.train()
@@ -355,8 +403,25 @@ class Trainer:
                 total_pos += int((y_flat == 1).sum().item())
                 total_neg += int((y_flat == 0).sum().item())
 
-        # compute average loss
-        avg_loss = total_loss / max(total_samples, 1)
+        # compute average loss (global across ranks)
+        loss_sum = torch.tensor(
+            [total_loss], device=self.device, dtype=torch.float64)
+        n_sum = torch.tensor(
+            [total_samples], device=self.device, dtype=torch.float64)
+        loss_sum = _ddp_all_reduce_sum(loss_sum)
+        n_sum = _ddp_all_reduce_sum(n_sum)
+        total_samples = int(n_sum.item())
+        avg_loss = float((loss_sum / n_sum.clamp_min(1)).item())
+
+        # reduce pos/neg across rank for reporting
+        pos_sum = torch.tensor(
+            [total_pos], device=self.device, dtype=torch.float64)
+        neg_sum = torch.tensor(
+            [total_neg], device=self.device, dtype=torch.float64)
+        pos_sum = _ddp_all_reduce_sum(pos_sum)
+        neg_sum = _ddp_all_reduce_sum(neg_sum)
+        total_pos = int(pos_sum.item())
+        total_neg = int(neg_sum.item())
 
         # compute eval metrics
         cm = None
@@ -378,34 +443,57 @@ class Trainer:
                 }
                 avg_acc = float("nan")
             else:
-                y_true = torch.cat(all_y, dim=0).numpy()
-                y_prob = torch.cat(all_probs, dim=0).numpy()
+                # gather predictions across ranks for global metrics
+                y_local = torch.cat(all_y, dim=0).to(self.device)
+                p_local = torch.cat(all_probs, dim=0).to(self.device)
 
-                # compute predictions at most optimal threshold calculated
-                thresh_out = find_threshold_max_recall_min_precision(
-                    y_true, y_prob, min_precision=0.25, num_thresholds=999
-                )
-                best_thresh = float(thresh_out["threshold"])
-                y_pred = (y_prob >= best_thresh).astype(np.int64)
+                y_list, y_sizes = _ddp_gather_all_1d(y_local, self.device)
+                p_list, _ = _ddp_gather_all_1d(p_local, self.device)
 
-                total_correct = int((y_pred == y_true).sum())
-                avg_acc = total_correct / max(total_samples, 1)
+                if _ddp_rank() == 0:
+                    ys, ps = [], []
+                    for i, size in enumerate(y_sizes):
+                        if size > 0:
+                            ys.append(y_list[i][:size].cpu())
+                            ps.append(p_list[i][:size].cpu())
+                    y_true = torch.cat(ys, dim=0).numpy() if len(
+                        ys) > 0 else np.array([])
+                    y_prob = torch.cat(ps, dim=0).numpy() if len(
+                        ps) > 0 else np.array([])
+                else:
+                    y_true = np.array([])
+                    y_prob = np.array([])
 
-                # build confusion matrix from true and predicted values
-                # rows true, cols pred
-                cm = torch.zeros((2, 2), dtype=torch.int64)
-                cm[0, 0] = int(((y_true == 0) & (y_pred == 0)).sum())
-                cm[0, 1] = int(((y_true == 0) & (y_pred == 1)).sum())
-                cm[1, 0] = int(((y_true == 1) & (y_pred == 0)).sum())
-                cm[1, 1] = int(((y_true == 1) & (y_pred == 1)).sum())
+                # non-zero ranks skip metric computation
+                if _ddp_rank() != 0:
+                    eval_metrics = None
+                    avg_acc = float("nan")
+                else:
+                    # compute predictions at most optimal threshold calculated
+                    thresh_out = find_threshold_max_recall_min_precision(
+                        y_true, y_prob, min_precision=0.25, num_thresholds=999)
+                    best_thresh = float(thresh_out["threshold"])
+                    y_pred = (y_prob >= best_thresh).astype(np.int64)
 
-                eval_metrics = compute_eval_metrics(y_true, y_pred, y_prob)
-                eval_metrics["threshold"] = best_thresh
-                eval_metrics["threshold_status"] = thresh_out["status"]
-                eval_metrics["threshold_min_precision"] = thresh_out["min_precision"]
+                    total_correct = int((y_pred == y_true).sum())
+                    avg_acc = total_correct / max(total_samples, 1)
+
+                    # build confusion matrix from true and predicted values
+                    # rows true, cols pred
+                    cm = torch.zeros((2, 2), dtype=torch.int64)
+                    cm[0, 0] = int(((y_true == 0) & (y_pred == 0)).sum())
+                    cm[0, 1] = int(((y_true == 0) & (y_pred == 1)).sum())
+                    cm[1, 0] = int(((y_true == 1) & (y_pred == 0)).sum())
+                    cm[1, 1] = int(((y_true == 1) & (y_pred == 1)).sum())
+
+                    eval_metrics = compute_eval_metrics(y_true, y_pred, y_prob)
+                    eval_metrics["threshold"] = best_thresh
+                    eval_metrics["threshold_status"] = thresh_out["status"]
+                    eval_metrics["threshold_min_precision"] = thresh_out["min_precision"]
 
         # log confusion matrix
-        if not train and cm is not None and eval_metrics is not None:
+        if (not train and cm is not None
+                and eval_metrics is not None and _ddp_rank() == 0):
             per_class_acc = cm.diag().float() / cm.sum(dim=1).clamp_min(1).float()
             balanced_acc = float(per_class_acc.mean())
             eval_metrics["per_class_acc"] = [
@@ -453,42 +541,45 @@ class Trainer:
             save_dir = Path(save_dir)
             save_dir.mkdir(parents=True, exist_ok=True)
 
-        self.logger.info("training_started",
-                         extra={"extra": {
-                             "epochs": self.config.epochs,
-                             "save_dir": str(save_dir) if save_dir is not None else None
-                         }})
+        if _ddp_rank() == 0:
+            self.logger.info("training_started",
+                             extra={"extra": {
+                                 "epochs": self.config.epochs,
+                                 "save_dir": str(save_dir) if save_dir is not None else None
+                             }})
 
         for epoch in range(self.config.epochs):
             train_metrics = self._run_epoch(epoch, train=True)
-            self.logger.info("train_epoch_summary",
-                             extra={"extra": {
-                                 "epoch": epoch,
-                                 "train_loss": float(train_metrics["loss"]),
-                                 "train_residues": int(train_metrics["n_residues"]),
-                                 "train_pos_residues": int(train_metrics["pos_residues"]),
-                                 "train_neg_residues": int(train_metrics["neg_residues"])
-                             }})
+            if _ddp_rank() == 0:
+                self.logger.info("train_epoch_summary",
+                                 extra={"extra": {
+                                     "epoch": epoch,
+                                     "train_loss": float(train_metrics["loss"]),
+                                     "train_residues": int(train_metrics["n_residues"]),
+                                     "train_pos_residues": int(train_metrics["pos_residues"]),
+                                     "train_neg_residues": int(train_metrics["neg_residues"])
+                                 }})
 
             eval_out = None
             if self.val_loader is not None:
                 eval_out = self._run_epoch(epoch, train=False)
-                self.logger.info("eval_epoch_summary",
-                                 extra={"extra": {
-                                     "epoch": epoch,
-                                     "eval_loss": float(eval_out["loss"]),
-                                     "overall_acc_at_threshold": float(eval_out["acc"]),
-                                     "eval_residues": int(eval_out["n_residues"]),
-                                     "eval_pos_residues": int(eval_out["pos_residues"]),
-                                     "eval_neg_residues": int(eval_out["neg_residues"]),
-                                     "precision": float(eval_out["eval_metrics"]["precision"]),
-                                     "recall": float(eval_out["eval_metrics"]["recall"]),
-                                     "f1": float(eval_out["eval_metrics"]["f1"]),
-                                     "mcc": float(eval_out["eval_metrics"]["mcc"]),
-                                     "auc": float(eval_out["eval_metrics"]["auc"]),
-                                     "auc10": float(eval_out["eval_metrics"]["auc10"]),
-                                     "pr_auc": float(eval_out["eval_metrics"]["pr_auc"])
-                                 }})
+                if _ddp_rank() == 0 and eval_out["eval_metrics"] is not None:
+                    self.logger.info("eval_epoch_summary",
+                                     extra={"extra": {
+                                         "epoch": epoch,
+                                         "eval_loss": float(eval_out["loss"]),
+                                         "overall_acc_at_threshold": float(eval_out["acc"]),
+                                         "eval_residues": int(eval_out["n_residues"]),
+                                         "eval_pos_residues": int(eval_out["pos_residues"]),
+                                         "eval_neg_residues": int(eval_out["neg_residues"]),
+                                         "precision": float(eval_out["eval_metrics"]["precision"]),
+                                         "recall": float(eval_out["eval_metrics"]["recall"]),
+                                         "f1": float(eval_out["eval_metrics"]["f1"]),
+                                         "mcc": float(eval_out["eval_metrics"]["mcc"]),
+                                         "auc": float(eval_out["eval_metrics"]["auc"]),
+                                         "auc10": float(eval_out["eval_metrics"]["auc10"]),
+                                         "pr_auc": float(eval_out["eval_metrics"]["pr_auc"])
+                                     }})
 
                 # save from validated model only
                 if save_dir is not None:
@@ -504,14 +595,18 @@ class Trainer:
             self._save_checkpoint(save_dir / "best_model_no_val.pt",
                                   self.config.epochs - 1, float(train_metrics["loss"]))
 
-        self.logger.info("training_done",
-                         extra={"extra": {
-                             "best_loss": best_val_loss if self.val_loader else train_metrics["loss"],
-                             "best_metrics": best_metrics if self.val_loader else None
-                         }})
+        if _ddp_rank() == 0:
+            self.logger.info("training_done",
+                             extra={"extra": {
+                                 "best_loss": best_val_loss if self.val_loader else train_metrics["loss"],
+                                 "best_metrics": best_metrics if self.val_loader else None
+                             }})
 
     def _save_checkpoint(self, path: Path | str, epoch: int, loss: float, metrics: Optional[Dict[str, Any]] = None) -> None:
         """Saves model checkpoint to path."""
+        if _ddp_rank() != 0:
+            return
+
         path.parent.mkdir(parents=True, exist_ok=True)
         state = {"model_state_dict": self.model.state_dict(),
                  "optim_state_dict": self.optimizer.state_dict(),
@@ -570,22 +665,24 @@ class Trainer:
             save_dir = Path(save_dir)
             save_dir.mkdir(parents=True, exist_ok=True)
 
-        self.logger.info("training_started",
-                         extra={"extra": {
-                             "epochs": self.config.epochs,
-                             "save_dir": str(save_dir) if save_dir else None
-                         }})
+        if _ddp_rank() == 0:
+            self.logger.info("training_started",
+                             extra={"extra": {
+                                 "epochs": self.config.epochs,
+                                 "save_dir": str(save_dir) if save_dir else None
+                             }})
 
         for epoch in range(self.config.epochs):
             train_metrics = self._run_epoch(epoch, train=True)
-            self.logger.info("train_epoch_summary",
-                             extra={"extra": {
-                                 "epoch": epoch,
-                                 "train_loss": float(train_metrics["loss"]),
-                                 "train_residues": int(train_metrics["n_residues"]),
-                                 "train_pos_residues": int(train_metrics["pos_residues"]),
-                                 "train_neg_residues": int(train_metrics["neg_residues"])
-                             }})
+            if _ddp_rank() == 0:
+                self.logger.info("train_epoch_summary",
+                                 extra={"extra": {
+                                     "epoch": epoch,
+                                     "train_loss": float(train_metrics["loss"]),
+                                     "train_residues": int(train_metrics["n_residues"]),
+                                     "train_pos_residues": int(train_metrics["pos_residues"]),
+                                     "train_neg_residues": int(train_metrics["neg_residues"])
+                                 }})
 
             val_metrics = None
             if self.val_loader is not None:
@@ -631,12 +728,13 @@ class Trainer:
                     self._save_checkpoint(
                         save_dir / "best_model_by_score.pt", epoch, best_val_loss_at_score, best_metrics)
 
-        self.logger.info("training_done",
-                         extra={"extra": {
-                             "best_val_loss_at_score": best_val_loss_at_score,
-                             "best_val_loss_overall": best_val_loss,
-                             f"best_{score_key}_score": best_score,
-                             "best_epoch": best_epoch
-                         }})
+        if _ddp_rank() == 0:
+            self.logger.info("training_done",
+                             extra={"extra": {
+                                 "best_val_loss_at_score": best_val_loss_at_score,
+                                 "best_val_loss_overall": best_val_loss,
+                                 f"best_{score_key}_score": best_score,
+                                 "best_epoch": best_epoch
+                             }})
 
         return float(best_score), int(best_epoch), float(best_val_loss_at_score), best_metrics

@@ -20,7 +20,7 @@ def _build_label_index(label_shards: List[Path | str]) -> Dict[str, Path]:
     index: Dict[str, Path] = {}
     for shard_path in label_shards:
         shard_path = Path(shard_path)
-        shard = torch.load(shard_path, map_location="cpu")
+        shard = torch.load(shard_path, map_location="cpu", weights_only=False)
         if not isinstance(shard, dict) or "labels" not in shard:
             raise TypeError(
                 f"Label shard {shard_path} must be a dict with 'labels' key, not type {type(shard)}")
@@ -210,7 +210,8 @@ class ProteinDataset(IterableDataset):
                 continue
 
             if not self.cache_current_label_shard or (shard_path != current_shard_path):
-                current_payload = torch.load(shard_path, map_location="cpu")
+                current_payload = torch.load(
+                    shard_path, map_location="cpu", weights_only=False)
                 if not isinstance(current_payload, dict) or "labels" not in current_payload:
                     raise TypeError(
                         f"Label shard {shard_path} must be a dict with 'labels' key")
@@ -223,7 +224,7 @@ class ProteinDataset(IterableDataset):
             if current_labels is None or str(protein_id) not in current_labels:
                 continue
 
-            X = torch.load(emb_path, map_location="cpu")
+            X = torch.load(emb_path, map_location="cpu", weights_only=False)
             y_full = current_labels[str(protein_id)]
 
             if X.size(0) != y_full.size(0):
@@ -262,7 +263,9 @@ class ProteinDataset(IterableDataset):
                         Xw = pad(Xw, (0, 0, 0, pad_len))
                     else:
                         Xw = pad(Xw, (0, pad_len))
+                    # pad valid labels and mask
                     yw = pad(yw, (0, pad_len))
+                    mv = pad(mv, (0, pad_len))
 
                     # 1 for real residues, 0 for pad
                     pad_mask = torch.cat(

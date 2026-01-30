@@ -1,10 +1,10 @@
 #!/bin/bash
 #SBATCH --job-name=ffnn_v1.0
 #SBATCH --nodes=1
-#SBATCH --ntasks=4
-#SBATCH --cpus-per-task=4
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=1
 #SBATCH --partition=gpu
-#SBATCH --gpus-per-task=a100:1
+#SBATCH --gpus-per-node=a100:4
 #SBATCH --mem=256G
 #SBATCH --time=12:00:00
 #SBATCH --output=/scratch/%u/train_ffnn_slurm/%j_ffnn_v1.0/%x.out
@@ -56,8 +56,9 @@ BATCH_SIZE="${BATCH_SIZE:-256}" # ensure batch size is 4 times what you would do
 LR="${LR:-0.001}"
 WD="${WD:-0.0}"
 VAL_FRAC="${VAL_FRAC:-0.2}"
+POS_WEIGHT="${POS_WEIGHT:-13.18999647945325}" # calculated from previous script
 SAVE_PATH="/scratch/$USER/models/ffnn_v1.0"
-NUM_WORKERS="${NUM_WORKERS:-4}"
+NUM_WORKERS="${NUM_WORKERS:-1}"
 WINDOW_SIZE="${WINDOW_SIZE:-1000}"
 STRIDE="${STRIDE:-900}"
 
@@ -85,9 +86,11 @@ ${LAUNCHER} torchrun --nproc_per_node=4 train_ffnn.pyz \
     --batch-size "${BATCH_SIZE}" \
     --lr "${LR}" \
     --wd "${WD}" \
-    --use-pos-weight \
+    --pos-weight "${POS_WEIGHT}" \
     --val-frac "${VAL_FRAC}" \
     --save-path "${SAVE_PATH}" \
     --num-workers "${NUM_WORKERS}" \
     --window-size "${WINDOW_SIZE}" \
     --stride "${STRIDE}"
+
+# USAGE: sbatch trainffnn.sh /scratch/$USER/esm2/artifacts/pts/shard_000 /scratch/$USER/esm2/artifacts/pts/shard_001 /scratch/$USER/esm2/artifacts/pts/shard_002 /scratch/$USER/esm2/artifacts/pts/shard_003 -- /scratch/$USER/labels/labels_shard_000.pt /scratch/$USER/labels/labels_shard_001.pt /scratch/$USER/labels/labels_shard_002.pt /scratch/$USER/labels/labels_shard_003.pt

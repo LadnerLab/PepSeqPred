@@ -351,8 +351,7 @@ class Trainer:
             self.logger.info("epoch_start",
                              extra={"extra": {
                                  "epoch": epoch,
-                                 "mode": "train" if train else "val",
-                                 "num_batches": len(loader)
+                                 "mode": "train" if train else "val"
                              }})
 
         if train:

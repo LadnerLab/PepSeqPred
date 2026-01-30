@@ -147,10 +147,16 @@ def main() -> None:
                         type=float,
                         default=0.0,
                         help="Model training weight decay to prevent overfitting by shrinking model weights during training")
-    parser.add_argument("--use-pos-weight",
-                        dest="use_pos_weight",
+    parser.add_argument("--calc-pos-weight",
+                        dest="calc_pos_weight",
                         action="store_true",
-                        help="Use positive weight to handle positive vs. negative class imbalances.")
+                        help="Calculate positive weight to handle positive vs. negative class imbalances, note this may take a long time to run")
+    parser.add_argument("--pos-weight",
+                        dest="pos_weight",
+                        action="store",
+                        type=float,
+                        default=None,
+                        help="Optionally include a pre-calculated postive class weight")
     parser.add_argument("--save-path",
                         action="store",
                         dest="save_path",
@@ -300,9 +306,11 @@ def main() -> None:
                                 pin_memory=pin,
                                 collate_fn=pad_collate)
 
-    # compute positive weight (like class weight)
+    # compute or store positive weight (like class weight)
     pos_weight = None
-    if args.use_pos_weight:
+    if args.pos_weight is not None:
+        pos_weight = float(args.pos_weight)
+    elif args.calc_pos_weight:
         pos, neg = compute_pos_neg_counts(train_loader)
         pos_weight = _global_pos_weight(pos, neg, ddp)
 
@@ -314,6 +322,13 @@ def main() -> None:
                        use_layer_norm=True,
                        use_residual=False,
                        num_classes=1)
+
+    if ddp is not None:
+        device = torch.device(f"cuda:{ddp['local_rank']}")
+    else:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.to(device)
+
     if ddp is not None:
         model = DDP(model, device_ids=[
                     ddp["local_rank"]], output_device=ddp["local_rank"])

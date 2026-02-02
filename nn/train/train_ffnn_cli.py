@@ -53,7 +53,7 @@ def _infer_emb_dim(emb_index: Dict[str, Path]) -> int:
     if not emb_index:
         raise ValueError("No embedding found in provided directories")
     first_path = next(iter(emb_index.values()))
-    emb = torch.load(first_path, map_location="cpu")
+    emb = torch.load(first_path, map_location="cpu", weights_only=True)
     if not isinstance(emb, torch.Tensor) or emb.dim() != 2:
         raise ValueError(
             f"Expected embedding tensor of shape (L, D) in {first_path}, got {type(emb)} with shape {getattr(emb, 'shape', None)}")
@@ -219,6 +219,15 @@ def main() -> None:
     rank = ddp["rank"] if ddp is not None else 0
     world_size = ddp["world_size"] if ddp is not None else 1
 
+    # log DDP info
+    logger.info("ddp_init",
+                extra={"extra": {
+                    "ddp_enabled": ddp is not None,
+                    "world_size": world_size,
+                    "rank": rank,
+                    "local_rank": ddp["local_rank"] if ddp is not None else 0
+                }})
+
     # disable logging for other ranks when DDP enabled
     if ddp is not None and rank != 0:
         logger.disabled = True
@@ -349,6 +358,9 @@ def main() -> None:
     # run training, only save if rank 0 or single rank run
     save_dir = args.save_path if (ddp is None or rank == 0) else None
     trainer.fit(save_dir=save_dir)
+
+    if ddp is not None:
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":

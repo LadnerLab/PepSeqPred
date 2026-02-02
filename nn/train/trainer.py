@@ -597,8 +597,8 @@ class Trainer:
         if _ddp_rank() == 0:
             self.logger.info("training_done",
                              extra={"extra": {
-                                 "best_loss": best_val_loss if self.val_loader else train_metrics["loss"],
-                                 "best_metrics": best_metrics if self.val_loader else None
+                                 "best_loss": best_val_loss if self.val_loader is not None else train_metrics["loss"],
+                                 "best_metrics": best_metrics if self.val_loader is not None else None
                              }})
 
     def _save_checkpoint(self, path: Path | str, epoch: int, loss: float, metrics: Optional[Dict[str, Any]] = None) -> None:

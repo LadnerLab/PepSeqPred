@@ -84,6 +84,15 @@ def _broadcast_params(params: Dict[str, Any], ddp: Dict[str, Any] | None) -> Dic
     return obj[0]
 
 
+def _shard_ids_by_rank(ids: List[str], ddp: Dict[str, Any] | None) -> List[str]:
+    """Shards an ID list across ranks for DDP hyperparameter optimization."""
+    if ddp is None:
+        return list(ids)
+    rank = ddp["rank"]
+    world_size = ddp["world_size"]
+    return list(ids)[rank::world_size]
+
+
 def compute_pos_neg_counts(loader: DataLoader) -> Tuple[int, int]:
     """
     Calculates the positive and negative counts of each class.
@@ -362,16 +371,8 @@ def main() -> None:
 
     embedding_dirs = list(args.embedding_dirs)
     label_shards = list(args.label_shards)
-    if ddp is not None:
-        pairs = list(zip(embedding_dirs, label_shards))
-        if len(embedding_dirs) != len(label_shards):
-            raise ValueError("Embedding dirs and label shards length mismatch")
-        if len(embedding_dirs) == 0 or len(label_shards) == 0:
-            raise ValueError(
-                f"Rank {rank} for no shards, check shard counts vs. world size")
-        pairs = pairs[rank::world_size]
-        embedding_dirs = [p[0] for p in pairs]
-        label_shards = [p[1] for p in pairs]
+    if len(embedding_dirs) == 0 or len(label_shards) == 0:
+        raise ValueError("No embedding dirs or label files provided")
 
     base_dataset = ProteinDataset(
         embedding_dirs=embedding_dirs,
@@ -389,6 +390,12 @@ def main() -> None:
         protein_ids = protein_ids[:args.subset]
 
     train_ids, val_ids = _split_ids(protein_ids, args.val_frac, seed)
+    if ddp is not None:
+        train_ids = _shard_ids_by_rank(train_ids, ddp)
+        val_ids = _shard_ids_by_rank(val_ids, ddp)
+        if len(train_ids) == 0:
+            raise ValueError(
+                f"Rank {rank} got 0 train IDs after sharding, reduce world size or increment dataset size")
 
     train_data = ProteinDataset(
         embedding_dirs=embedding_dirs,
@@ -406,7 +413,7 @@ def main() -> None:
     )
 
     val_data = None
-    if len(val_ids) > 0:
+    if len(val_ids) > 0 or ddp is not None:
         val_data = ProteinDataset(
             embedding_dirs=embedding_dirs,
             label_shards=label_shards,

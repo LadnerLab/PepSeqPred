@@ -3,7 +3,7 @@ from typing import List, Dict, Iterator, Iterable, Tuple, Sequence, Optional
 import torch
 from torch.nn.utils.rnn import pad_sequence
 from torch.nn.functional import pad
-from torch.utils.data import IterableDataset
+from torch.utils.data import IterableDataset, get_worker_info
 
 
 def _build_embedding_index(embedding_dirs: List[Path]) -> Dict[str, Path]:
@@ -199,11 +199,19 @@ class ProteinDataset(IterableDataset):
             self.protein_ids = protein_ids
 
     def __iter__(self) -> Iterator:
+        # shard protein IDs across DataLoader workers to avoid duplication
+        worker_info = get_worker_info()
+        if worker_info is None:
+            protein_ids = self.protein_ids
+        else:
+            protein_ids = list(self.protein_ids)[
+                worker_info.id::worker_info.num_workers]
+
         current_shard_path: Optional[Path] = None
         current_payload: Optional[Dict[str, torch.Tensor]] = None
         current_labels: Optional[Dict[str, torch.Tensor]] = None
 
-        for protein_id in self.protein_ids:
+        for protein_id in protein_ids:
             emb_path = self.embedding_index.get(protein_id)
             shard_path = self.label_index.get(protein_id)
             if emb_path is None or shard_path is None:

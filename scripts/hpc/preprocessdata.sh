@@ -33,7 +33,7 @@ source "$ENV_DIR/Scripts/activate"
 cd "${ROOT_DIR}"
 
 # run script
-python3 -m preprocess.preprocess_cli \
+python3 -m preprocess.pyz \
     "$META_FILE" \
     "$Z_FILE" \
     --is-epi-z-thresh "$IS_EPI_MIN_Z" \

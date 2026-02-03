@@ -9,9 +9,12 @@ ENV/
 .vscode/
 smoketest/
 localdata/
+dist/
+.build_pyz/
 *.fasta
 *.csv
 *.tsv
 *.pt
 *.log
 *.txt
+*.pyz

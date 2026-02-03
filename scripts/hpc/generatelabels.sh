@@ -44,7 +44,7 @@ OUT_PATH="${OUT_DIR}/labels_shard_${SHARD_ID}.pt"
 
 mkdir -p "$OUT_DIR"
 
-srun python -u labels_cli.pyz "$META_PATH" "$OUT_PATH" \
+srun python -u labels.pyz "$META_PATH" "$OUT_PATH" \
   --emb-dir "$SHARD_DIR" \
   --restrict-to-embeddings
 

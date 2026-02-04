@@ -1,3 +1,11 @@
+"""buildpyz.py
+
+Build `.pyz` application bundles for PepSeqPred CLI tools.
+
+Creates zipapp archives for one or more entry points, optionally tagging the
+current git revision and writing a `*_latest.pyz` copy.
+"""
+
 import argparse
 import shutil
 import subprocess
@@ -39,6 +47,32 @@ def _write_main(build_dir: Path, entry: str, argv0: str) -> None:
 
 
 def build_one(name: str, out_dir: Path, interpreter: str, latest: bool) -> Path:
+    """
+    Builds a single `.pyz` archive for the specified app target.
+
+    Parameters
+    ----------
+        name : str
+            App name or `.pyz` filename to build.
+        out_dir : Path
+            Output directory for the generated archive.
+        interpreter : str
+            Interpreter path embedded in the zipapp shebang.
+        latest : bool
+            If True, also writes a `{name}_latest.pyz` copy.
+
+    Returns
+    -------
+        Path
+            Path to the generated `.pyz` archive.
+
+    Raises
+    ------
+        SystemExit
+            If the target is not registered in `APPS`.
+        SystemExit
+            If `src/pepseqpred` is missing (not running from repo root).
+    """
     if name.endswith(".pyz"):
         name = name[:-4]
 
@@ -73,6 +107,7 @@ def build_one(name: str, out_dir: Path, interpreter: str, latest: bool) -> Path:
 
 
 def main() -> None:
+    """Parses CLI arguments to build .pyz apps."""
     parser = argparse.ArgumentParser(
         description="Builds .pyz Python scripts for easy HPC usage.")
     parser.add_argument("target",

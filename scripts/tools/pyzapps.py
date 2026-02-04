@@ -1,3 +1,11 @@
+"""pyzapps.py
+
+Zipapp entry-point registry for PepSeqPred CLI tools.
+
+Defines the mapping of build target names to importable `module:callable` entry
+points used by the `buildpyz.py` packaging script.
+"""
+
 from typing import Dict, Any
 
 

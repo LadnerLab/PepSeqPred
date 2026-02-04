@@ -1,5 +1,15 @@
-"""
-Build dense per-residue labels per protein and save to labels.pt.
+"""labels_cli.py
+
+
+Spreads peptide-level labes from preprocessing step across each residue to protein sequence residues. 
+Generates an output PT file for downstream model training. Residues are labeled definite epitope, uncertain, 
+or not epitope. Because ESM-2 embeddings are generated sharded, the labels PT will correspond to each ESM-2
+embedding shard generated.
+
+Usage
+-----
+>>> # from scripts/hpc/generatelabels.sh
+>>> sbatch generatelabels.sh <metadata_tsv> /path/to/out_dir /path/to/root_emb_dir
 """
 import time
 import argparse

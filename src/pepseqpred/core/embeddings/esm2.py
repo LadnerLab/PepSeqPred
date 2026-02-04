@@ -8,6 +8,7 @@ import torch
 import numpy as np
 import pandas as pd
 
+
 def clean_seq(seq: str) -> str:
     """
     Normalize a protein sequence and drop any odd characters.
@@ -26,8 +27,9 @@ def clean_seq(seq: str) -> str:
     allowed = set("ACDEFGHIKLMNPQRSTVWYBZXUO")
     return "".join([aa for aa in seq if aa in allowed])
 
-def token_packed_batches(pairs: Iterable[Tuple[str, str]], 
-                         max_tokens: int, 
+
+def token_packed_batches(pairs: Iterable[Tuple[str, str]],
+                         max_tokens: int,
                          max_tokens_per_seq: int = 1022) -> Iterator[List[Tuple[str, str]]]:
     """
     Yields batches of (id, seq) pairs such that the sum of per sequence token counts in each batch stays
@@ -48,7 +50,7 @@ def token_packed_batches(pairs: Iterable[Tuple[str, str]],
     ------
         Iterator[List[Tuple[str, str]]]
             An iterator of a list of (id, seq) pairs whose items combined token count is within the budget.
-    
+
     Notes
     -----
     The token budget should reflect the model limit minus special tokens. For ESM2, the effective residue
@@ -60,12 +62,12 @@ def token_packed_batches(pairs: Iterable[Tuple[str, str]],
     for pid, seq in pairs:
         # tokens we expect to use for this sequence
         need = min(len(seq), max_tokens_per_seq)
-        
+
         # if adding seq exceeds budget and batch not empty, yield current batch and start new one
         if used and (used + need) > max_tokens:
             yield batch
             batch, used = [], 0
-        
+
         # add to batch and update total
         batch.append((pid, seq))
         used += need
@@ -74,11 +76,12 @@ def token_packed_batches(pairs: Iterable[Tuple[str, str]],
     if batch:
         yield batch
 
-def compute_window_embedding(token: torch.Tensor, 
-                             model: torch.nn.Module, 
-                             layer: int, 
-                             device: str, 
-                             window_size: int = 1000, 
+
+def compute_window_embedding(token: torch.Tensor,
+                             model: torch.nn.Module,
+                             layer: int,
+                             device: str,
+                             window_size: int = 1000,
                              stride: int = 900) -> torch.Tensor:
     """
     Compute per residue ESM representations for a long sequence using sliding windows.
@@ -102,11 +105,10 @@ def compute_window_embedding(token: torch.Tensor,
     Returns
     -------
         torch.Tensor
-        ------------
             An array of shape (L, D+1) where L is the number of residues (excluding CLS and EOS), and D+1 is
             the embedding dimension for the chosen layer plus an additional column for the protein sequence length.
     """
-    seq_len = token.size(1) - 2 # remove CLS and EOS tokens
+    seq_len = token.size(1) - 2  # remove CLS and EOS tokens
 
     if device.startswith("cuda"):
         token = token.to(device, non_blocking=True)
@@ -118,10 +120,12 @@ def compute_window_embedding(token: torch.Tensor,
     if D is None:
         with torch.inference_mode():
             probe_end = min(window_size, seq_len)
-            probe_tokens = torch.cat([cls_token, token[:, 1:1 + probe_end], eos_token], dim=1)
+            probe_tokens = torch.cat(
+                [cls_token, token[:, 1:1 + probe_end], eos_token], dim=1)
             if device.startswith("cuda"):
                 probe_tokens = probe_tokens.to(device, non_blocking=True)
-            probe_out = model(probe_tokens, repr_layers=[layer], return_contacts=False)
+            probe_out = model(probe_tokens, repr_layers=[
+                              layer], return_contacts=False)
             D = int(probe_out["representations"][layer].shape[-1])
             del probe_out, probe_tokens
 
@@ -142,9 +146,10 @@ def compute_window_embedding(token: torch.Tensor,
 
                 # rebuild window with CLS and EOS tokens around slice
                 window_tokens = torch.cat(
-                    [cls_token, token[:, 1 + start:1 + end], eos_token], 
+                    [cls_token, token[:, 1 + start:1 + end], eos_token],
                     dim=1)
-                output = model(window_tokens, repr_layers=[layer], return_contacts=False)
+                output = model(window_tokens, repr_layers=[
+                               layer], return_contacts=False)
                 rep = output["representations"][layer][0, 1:1 + window_len]
 
                 # store segment and window slide count
@@ -160,7 +165,7 @@ def compute_window_embedding(token: torch.Tensor,
 
         counts = counts.clamp_min(1).unsqueeze(1).to(full.dtype)
         return full / counts
-    
+
     # when GPUs are available
     autocast_ctx = torch.amp.autocast
     with torch.inference_mode(), autocast_ctx("cuda", enabled=True):
@@ -174,7 +179,8 @@ def compute_window_embedding(token: torch.Tensor,
                 # compute exclusive end index for residue span
                 end = min(start + window_size, seq_len)
                 # rebuild window with CLS and EOS tokens around slice
-                window_tokens = torch.cat([cls_token, token[:, 1 + start:1 + end], eos_token], dim=1).to(device, non_blocking=True)
+                window_tokens = torch.cat(
+                    [cls_token, token[:, 1 + start:1 + end], eos_token], dim=1).to(device, non_blocking=True)
 
                 # store window tokens and spans
                 windows.append(window_tokens)
@@ -183,23 +189,26 @@ def compute_window_embedding(token: torch.Tensor,
             # manually free list
             del windows
 
-            output = model(batch_tokens, repr_layers=[layer], return_contacts=False)
+            output = model(batch_tokens, repr_layers=[
+                           layer], return_contacts=False)
             result = output["representations"][layer]
 
             # overlap-ad on device
             for batch, (start, end) in enumerate(spans):
                 window_len = end - start
-                rep = result[batch, 1:1 + window_len].to("cpu", non_blocking=True)
+                rep = result[batch, 1:1 +
+                             window_len].to("cpu", non_blocking=True)
                 full[start:end] += rep
                 counts[start:end] += 1
 
             # manually free memory
             del output, result, batch_tokens, spans
-            
+
             # increment by windows per call
             i += 1
 
     return (full / counts.clamp_min(1).unsqueeze(1).to(full.dtype))
+
 
 def append_seq_len(res_vec: np.ndarray, seq_len: int) -> np.ndarray:
     """
@@ -219,15 +228,16 @@ def append_seq_len(res_vec: np.ndarray, seq_len: int) -> np.ndarray:
     """
     col = np.full((res_vec.shape[0], 1), float(seq_len), dtype=res_vec.dtype)
     return np.concatenate([res_vec, col], axis=1)
-    
-def esm_embeddings_from_fasta(fasta_df: pd.DataFrame, 
-                              id_col: str = "ID", 
-                              seq_col: str = "Sequence", 
-                              model_name: str = "esm2_t33_650M_UR50D", 
-                              max_tokens: int = 1022, 
-                              batch_size: int = 8, 
-                              per_seq_dir: Path | str = "esm2_per_seq", 
-                              index_csv_path: Path | str = "esm2_seq_index.csv", 
+
+
+def esm_embeddings_from_fasta(fasta_df: pd.DataFrame,
+                              id_col: str = "ID",
+                              seq_col: str = "Sequence",
+                              model_name: str = "esm2_t33_650M_UR50D",
+                              max_tokens: int = 1022,
+                              batch_size: int = 8,
+                              per_seq_dir: Path | str = "esm2_per_seq",
+                              index_csv_path: Path | str = "esm2_seq_index.csv",
                               logger: Optional[logging.Logger] = None) -> Tuple[pd.DataFrame, List[str]]:
     """
     Generate per residue ESM embeddings for sequences in a DataFrame and write outputs.
@@ -267,12 +277,13 @@ def esm_embeddings_from_fasta(fasta_df: pd.DataFrame,
 
     # set up directories to save results
     per_seq_dir.mkdir(parents=True, exist_ok=True)
-    
+
     # clean sequences
     df = fasta_df[[id_col, seq_col]].dropna().copy()
     df[seq_col] = df[seq_col].map(clean_seq)
     df = df[df[seq_col].str.len() > 0].reset_index(drop=True)
-    logger.info("embedding_start", extra={"extra": {"total_sequences": len(df)}})
+    logger.info("embedding_start", extra={
+                "extra": {"total_sequences": len(df)}})
 
     # load ESM embedding model
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -283,10 +294,10 @@ def esm_embeddings_from_fasta(fasta_df: pd.DataFrame,
     # choose representation layer based on model size
     layer = 33 if "t33" in model_name else 30 if "t30" in model_name else 12 if "t12" in model_name else 6
     logger.info("model_loaded", extra={"extra": {
-        "device": device, 
-        "first_param_device": next(model.parameters()).device.type, 
-        "layer": layer, 
-        "max_tokens": max_tokens, 
+        "device": device,
+        "first_param_device": next(model.parameters()).device.type,
+        "layer": layer,
+        "max_tokens": max_tokens,
         "model_name": model_name
     }})
 
@@ -309,43 +320,49 @@ def esm_embeddings_from_fasta(fasta_df: pd.DataFrame,
 
         # compute token lengths and determine which exceed model window
         token_lens = [len(s) for s in strings]
-        short_idxs = [i for i, len_ in enumerate(token_lens) if len_ + 2 <= max_tokens]
+        short_idxs = [i for i, len_ in enumerate(
+            token_lens) if len_ + 2 <= max_tokens]
         long_idxs = [i for i in range(len(batch)) if i not in short_idxs]
 
         logger.info("batch_start", extra={"extra": {
-            "batch_size": len(batch), 
-            "num_short": len(short_idxs), 
+            "batch_size": len(batch),
+            "num_short": len(short_idxs),
             "num_longs": len(long_idxs)
         }})
         with torch.no_grad():
             # handle short sequences first
             if short_idxs:
                 batch_tokens = tokens[short_idxs].to(device)
-                output = model(batch_tokens, repr_layers=[layer], return_contacts=False)
+                output = model(batch_tokens, repr_layers=[
+                               layer], return_contacts=False)
                 reprs = output["representations"][layer]
 
                 # for each item in the short slice, keep per-residue (L, D) embeddings
                 for j, batch_idx in enumerate(short_idxs):
                     len_ = token_lens[batch_idx]
-                    per_residue = reprs[j, 1:1 + len_] # L by D
+                    per_residue = reprs[j, 1:1 + len_]  # L by D
                     # per-residue embeddings
-                    res_vec = per_residue.cpu().numpy().astype(np.float32) # (L, D)
+                    res_vec = per_residue.cpu().numpy().astype(np.float32)  # (L, D)
                     seq_id = batch[batch_idx][0]
 
                     # append sequence length column
-                    res_vec = append_seq_len(res_vec, len_) # (L, D+1)
+                    res_vec = append_seq_len(res_vec, len_)  # (L, D+1)
 
                     # save as .pt per sequence
-                    torch.save(torch.from_numpy(res_vec), per_seq_dir / f"{seq_id}.pt")
+                    torch.save(torch.from_numpy(res_vec),
+                               per_seq_dir / f"{seq_id}.pt")
 
                     # save logs per-residue embeddings for short sequences
-                    index_records.append({"id": seq_id, 
-                                          "length": int(res_vec.shape[0]),       # L
-                                          "embed_dim": int(res_vec.shape[1]),    # D
-                                          "original_seq_len": int(len_),         # entire sequence length
-                                          "handle": "short", 
-                                          "model": model_name, 
-                                          "storage": ".pt", 
+                    index_records.append({"id": seq_id,
+                                          # L
+                                          "length": int(res_vec.shape[0]),
+                                          # D
+                                          "embed_dim": int(res_vec.shape[1]),
+                                          # entire sequence length
+                                          "original_seq_len": int(len_),
+                                          "handle": "short",
+                                          "model": model_name,
+                                          "storage": ".pt",
                                           "path": str(per_seq_dir / f"{seq_id}.pt")})
 
             # handle long sequences
@@ -354,22 +371,26 @@ def esm_embeddings_from_fasta(fasta_df: pd.DataFrame,
                 try:
                     single_token = tokens[batch_idx:batch_idx + 1]
                     # default uses sliding window to cover entirety of long sequence
-                    res_vec = compute_window_embedding(single_token, model, layer, device).cpu().numpy().astype(np.float32) # (L, D)
+                    res_vec = compute_window_embedding(
+                        # (L, D)
+                        single_token, model, layer, device).cpu().numpy().astype(np.float32)
 
                     # append sequence length column
-                    res_vec = append_seq_len(res_vec, len(protein_seq)) # (L, D+1)
+                    res_vec = append_seq_len(
+                        res_vec, len(protein_seq))  # (L, D+1)
 
                     # save logs per-residue embeddings for sliding window long sequences
-                    index_records.append({"id": protein_id, 
-                                          "length": int(res_vec.shape[0]), 
-                                          "embed_dim": int(res_vec.shape[1]), 
-                                          "original_seq_len": len(protein_seq), 
-                                          "handle": "long", 
-                                          "model": model_name, 
-                                          "storage": ".pt", 
+                    index_records.append({"id": protein_id,
+                                          "length": int(res_vec.shape[0]),
+                                          "embed_dim": int(res_vec.shape[1]),
+                                          "original_seq_len": len(protein_seq),
+                                          "handle": "long",
+                                          "model": model_name,
+                                          "storage": ".pt",
                                           "path": str(per_seq_dir / f"{protein_id}.pt")})
 
-                    torch.save(torch.from_numpy(res_vec), per_seq_dir / f"{protein_id}.pt")
+                    torch.save(torch.from_numpy(res_vec),
+                               per_seq_dir / f"{protein_id}.pt")
                 except Exception as e:
                     logger.error("sequence_failed", extra={"extra": {
                         "id": protein_id, "error": repr(e)
@@ -379,9 +400,9 @@ def esm_embeddings_from_fasta(fasta_df: pd.DataFrame,
         # make regular progress updates
         done += len(batch)
         logger.info("batch_done", extra={"extra": {
-            "done": done, 
-            "total": total, 
-            "percent": round(100.0 * done / total, 2), 
+            "done": done,
+            "total": total,
+            "percent": round(100.0 * done / total, 2),
             "batch_duration_s": round(time.perf_counter() - b_start, 3)
         }})
 
@@ -391,7 +412,8 @@ def esm_embeddings_from_fasta(fasta_df: pd.DataFrame,
     ])
 
     base = Path(per_seq_dir).resolve()
-    index_df["file_path"] = index_df["id"].astype(str).map(lambda s: str(base / f"{s}.pt"))
+    index_df["file_path"] = index_df["id"].astype(
+        str).map(lambda s: str(base / f"{s}.pt"))
     index_df.to_csv(index_csv_path, index=False)
 
     # summarize in log
@@ -399,12 +421,12 @@ def esm_embeddings_from_fasta(fasta_df: pd.DataFrame,
     ok_count = len(index_records)
     by_handle = index_df["handle"].value_counts().to_dict()
     logger.info("embedding_done", extra={"extra": {
-        "ok": ok_count, 
-        "failed": len(failed_seqs), 
-        "handled_short": int(by_handle.get("short", 0)), 
-        "handled_long": int(by_handle.get("long", 0)), 
-        "total_duration_s": round(elapsed, 3), 
-        "artifacts_path": str(os.path.abspath(per_seq_dir)), 
+        "ok": ok_count,
+        "failed": len(failed_seqs),
+        "handled_short": int(by_handle.get("short", 0)),
+        "handled_long": int(by_handle.get("long", 0)),
+        "total_duration_s": round(elapsed, 3),
+        "artifacts_path": str(os.path.abspath(per_seq_dir)),
         "index_csv_path": str(os.path.abspath(index_csv_path))
     }})
 

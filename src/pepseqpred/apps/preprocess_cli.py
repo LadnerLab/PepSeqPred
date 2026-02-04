@@ -2,11 +2,13 @@
 
 This module is designed to preprocess the metadata and z-score datasets for 
 downstream model training by cleaning up the metadata file and appending 
-one-hot encoded targets generated from the z-score dataset.
+one-hot encoded targets generated from the z-score dataset. The one-hot encoded 
+targets are at a peptide-level, labeled definite epitope, uncertain, or not epitope.
+The targets are designed to be spread across each peptide's residue downstream.
 
 Usage
 -----
->>> # from scripts/preprocessdata.sh
+>>> # from scripts/hpc/preprocessdata.sh (HPC uneccessary for this step)
 >>> ./preprocessdata.sh <metadata_tsv> <zscore_tsv>
 """
 import argparse

@@ -1,3 +1,21 @@
+"""train_ffnn_cli.py
+
+Handles end-to-end training and evaluation of a PepSeqPredFFNN with the goal to predict the locations
+of antibody epitopes within a protein sequence downstream. The resulting model will make binary predictions:
+definite epitope or not epitope, it handles residues labeled uncertain through a masking process.
+
+The training module utilizes DistributedDataParallel to train the model distributed across multiple GPUs.
+It is highly recommended you train this model using an HPC, training locally is often impossible due to time 
+constraints and limited compute. For context, our models were often trained using 4 A100 GPUs and take anywhere
+from 3 to 5 hours.
+
+Usage
+-----
+>>> # from scripts/hpc/trainffnn.sh (see shell script for CLI config)
+>>> sbatch trainffnn.sh /path/to/emb_shard_dir0 ... /path/to/emb_shard_dirN -- \\ 
+                        /path/to/label_shard0.pt ... /path/to/label_shardN.pt
+"""
+
 import argparse
 from pathlib import Path
 import torch

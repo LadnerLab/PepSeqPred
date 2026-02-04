@@ -10,20 +10,15 @@ any errors.
 
 For sequences that fit within the model token limit (residues + 2 <= 1024), embeddings are computed in 
 a single pass with full-sequence context. For longer sequences, overlapping windows are used and stitched 
-by averaging overlaps to produce a full-length (L, D+1) matrix the token limit are excluded from embedding 
-generation.  
+by averaging overlaps to produce a full-length (L, D+1) matrix.  
 
 This script can be ran on its own, but it is intended for HPC use (e.g., Monsoon). 
 See shell script `generateembeddings.sh` or `generateembeddings_cpu.sh` for typical usage.
 
 Usage
 -----
->>> # HPC usage with shell script
+>>> # from scripts/hpc/generateembeddings.sh (see shell script for CLI config)
 >>> sbatch --export=ALL,IN_FASTA=/scratch/<NAUIDD>/<targets>.fasta generateembeddings.sh
-
->>> # general example usage (illustrative)
->>> python esm_cli.py --fasta-file <input.fasta> --model-name esm2_t33_650M_UR50D \ 
-                      --batch-size <n> --log-dir <dir> [--log-json] --out-dir <dir>
 """
 import os
 import argparse
@@ -64,7 +59,7 @@ def main() -> None:
                         action="store",
                         dest="per_seq_dir",
                         type=Path,
-                        default=Path(f"artifacts/pts"),
+                        default=Path("artifacts/pts"),
                         help="Directory for individual .pt files when save mode is set to 'pt'.")
     parser.add_argument("--index-csv-path",
                         action="store",

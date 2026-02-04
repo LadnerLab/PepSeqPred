@@ -1,3 +1,28 @@
+"""train_ffnn_optuna_cli.py
+
+This CLI is very similar to `train_ffnn_cli.py`, except it optimizes for the best possible hyperparameters
+within the user-defined ranges in the shell script `scripts/hpc/trainffnnoptuna.sh`.
+
+Handles end-to-end training, evaluation, and hyperparameter optimization of a PepSeqPredFFNN with the goal 
+to predict the locations of antibody epitopes within a protein sequence downstream. The resulting model 
+will make binary predictions: definite epitope or not epitope, it handles residues labeled uncertain through
+a masking process.
+
+The training module utilizes DistributedDataParallel (DDP) to train the model distributed across multiple 
+GPUs. DDP runs one trial across N GPUs for maximum efficiency in trial runs. It is highly recommended you train 
+this model using an HPC, training locally is often impossible due to time constraints and limited compute. 
+For context, our models were often trained using 4 A100 GPUs and take anywhere from 3 to 5 hours. Given this
+script is designed to train several models during one run to optimize for the best hyperparameters, we
+recommend several hours to a few days are allocated per Optuna study session.
+
+Usage
+-----
+>>> # from scripts/hpc/trainffnnoptuna.sh (see shell script for CLI config)
+>>> sbatch trainffnnoptuna.sh /path/to/emb_shard_dir0 ... /path/to/emb_shard_dirN -- \\ 
+                              /path/to/label_shard0.pt ... /path/to/label_shardN.pt
+"""
+
+
 import argparse
 import json
 import time
@@ -40,22 +65,27 @@ def build_hidden_sizes(trial: optuna.trial.Trial,
 
     Parameters
     ----------
+        trial : optuna.trial.Trial
+            Optuna trial used to sample architecture and dropout hyperparameters.
         depth_min : int
-
+            Minimum number of hidden layers to sample.
         depth_max : int
-
+            Maximum number of hidden layers to sample.
         width_min : int
-
+            Minimum width for any hidden layer.
         width_max : int
-
+            Maximum width for any hidden layer.
         mode : str
-            `"flat"`: all layers have the same width.\n
-            `"bottleneck"`: monotonically decrease widths.\n
-            `"pyramid"`: monotonically increase widths.
+            `"flat"`: all layers have the same width.
+            `"bottleneck"`: monotonically decrease widths from base.
+            `"pyramid"`: monotonically increase widths toward base.
 
     Returns
     -------
-
+        Tuple[Tuple[int, ...], Tuple[float, ...], int, int]
+            A 4-tuple of `(sizes, dropouts, depth, base)` where `sizes` are the sampled
+            hidden layer widths, `dropouts` are per-layer dropout rates, `depth` is the
+            number of layers, and `base` is the base width sampled before shaping.
     """
     depth = trial.suggest_int("depth", depth_min, depth_max)
     step = trial.suggest_categorical("width_step", [16, 32, 64])
@@ -86,7 +116,14 @@ def build_hidden_sizes(trial: optuna.trial.Trial,
 
 def append_csv_row(csv_path: Path | str, row: Dict[str, Any]) -> None:
     """
-    Appends a new row to CSV runs file. Will create and add header if necessary.
+    Appends a single row to a CSV runs file, creating the file and header if needed.
+
+    Parameters
+    ----------
+        csv_path : Path | str
+            Path to the CSV runs file.
+        row : Dict[str, Any]
+            Row data to append as a single record.
     """
     csv_path = Path(csv_path)
     csv_path.parent.mkdir(parents=True, exist_ok=True)

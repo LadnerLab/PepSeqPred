@@ -1,3 +1,14 @@
+"""esm2.py
+
+ESM-2 embedding utilities for PepSeqPred.
+
+This module normalizes protein sequences, batches inputs by a token budget to
+reduce padding, and computes per-residue embeddings for both short and long
+proteins (using sliding windows for long sequences). It also appends sequence
+length as a feature and writes per-sequence `.pt` embeddings plus a CSV index
+describing stored artifacts.
+"""
+
 import os
 import logging
 import time

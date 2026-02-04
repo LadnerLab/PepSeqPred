@@ -1,7 +1,16 @@
+"""read.py
+
+Input parsing utilities for PepSeqPred tabular and FASTA data.
+
+Provides helpers to read PV1-style FASTA files, metadata TSVs, and z-score
+reactivity tables into normalized pandas DataFrames.
+"""
+
 import re
+from typing import Optional, Iterable
 from pathlib import Path
 import pandas as pd
-from typing import Optional, Iterable
+
 
 def read_fasta(fasta_path: Path | str, full_name: bool = False) -> pd.DataFrame:
     """
@@ -31,9 +40,10 @@ def read_fasta(fasta_path: Path | str, full_name: bool = False) -> pd.DataFrame:
             If a header line does not match the expected pattern of if a sequence line is seen before
             any header.
     """
-    header_pattern = re.compile(r"^>ID=([^\s]+)\s+AC=([^\s]+)\s+OXX=([^\s]+)\s*$")
+    header_pattern = re.compile(
+        r"^>ID=([^\s]+)\s+AC=([^\s]+)\s+OXX=([^\s]+)\s*$")
     rows = []
-    curr = None
+    curr = {}
     with open(fasta_path, "r", encoding="utf-8") as fasta:
         for raw in fasta:
             line = raw.strip()
@@ -45,19 +55,20 @@ def read_fasta(fasta_path: Path | str, full_name: bool = False) -> pd.DataFrame:
                 if curr:
                     curr["Sequence"] = "".join(curr["Sequence"])
                     rows.append(curr)
-                
+
                 if not full_name:
                     match_ = header_pattern.match(line)
                     if not match_:
-                        raise ValueError(f"Header does not match expected format: '{line}'")
+                        raise ValueError(
+                            f"Header does not match expected format: '{line}'")
 
-                    curr = {"ID": match_.group(1), 
-                            "AC": match_.group(2), 
-                            "OXX": match_.group(3), 
+                    curr = {"ID": match_.group(1),
+                            "AC": match_.group(2),
+                            "OXX": match_.group(3),
                             "Sequence": []}
                 else:
                     line = line.split(">")[1]
-                    curr = {"FullName": line, 
+                    curr = {"FullName": line,
                             "Sequence": []}
             else:
                 if curr is None:
@@ -70,14 +81,15 @@ def read_fasta(fasta_path: Path | str, full_name: bool = False) -> pd.DataFrame:
 
     if not full_name:
         return pd.DataFrame(rows, columns=["ID", "AC", "OXX", "Sequence"])
-    else: 
+    else:
         return pd.DataFrame(rows, columns=["FullName", "Sequence"])
-    
-def read_metadata(meta_path: Path | str, 
-                  id_col: str = "FullName", 
-                  category: str = "Category", 
-                  peptide_start_idx: str = "AlignStart", 
-                  peptide_end_idx: str = "AlignStop", 
+
+
+def read_metadata(meta_path: Path | str,
+                  id_col: str = "FullName",
+                  category: str = "Category",
+                  peptide_start_idx: str = "AlignStart",
+                  peptide_end_idx: str = "AlignStop",
                   drop_cols: Optional[Iterable[str]] = None) -> pd.DataFrame:
     """
     Parses a metadata TSV file with PV1-style headers into a pandas DataFrame.
@@ -110,30 +122,32 @@ def read_metadata(meta_path: Path | str,
     meta_df = pd.read_csv(meta_path, sep="\t", dtype=str)
     meta_df = meta_df[meta_df[category] == "SetCover"]
 
-    oxx_idx_pattern = re.compile(r"OXX=[^\s,]*(?:,[^\s,]*)*_(?P<align_start>\d+)_(?P<align_stop>\d+)")
+    oxx_idx_pattern = re.compile(
+        r"OXX=[^\s,]*(?:,[^\s,]*)*_(?P<align_start>\d+)_(?P<align_stop>\d+)")
     oxx_match = meta_df[id_col].str.extract(oxx_idx_pattern)
 
-    meta_df[peptide_start_idx] = (pd.to_numeric(oxx_match["align_start"], 
+    meta_df[peptide_start_idx] = (pd.to_numeric(oxx_match["align_start"],
                                                 errors="coerce", downcast="integer")) \
-                                    .astype("Int64")
-    meta_df[peptide_end_idx] = (pd.to_numeric(oxx_match["align_stop"], 
+        .astype("Int64")
+    meta_df[peptide_end_idx] = (pd.to_numeric(oxx_match["align_stop"],
                                               errors="coerce", downcast="integer")) \
-                                  .astype("Int64")
-    
+        .astype("Int64")
+
     oxx_name_pattern = re.compile(r"(\bOXX=)([^\s]+)")
-    meta_df[id_col] = meta_df[id_col].str.replace(oxx_name_pattern, 
-        lambda m: m.group(1) + ",".join(part.split("_", 1)[0] 
-                                        for part in m.group(2).split(",")), 
-        regex=True)
-    
+    meta_df[id_col] = meta_df[id_col].str.replace(oxx_name_pattern,
+                                                  lambda m: m.group(1) + ",".join(part.split("_", 1)[0]
+                                                                                  for part in m.group(2).split(",")),
+                                                  regex=True)
+
     if drop_cols:
         actual_drop_cols = [col for col in drop_cols if col in meta_df.columns]
         meta_df.drop(columns=actual_drop_cols, inplace=True)
-    
+
     return meta_df
 
-def read_zscores(z_path: Path | str, 
-                 z_id_col: str = "Sequence name", 
+
+def read_zscores(z_path: Path | str,
+                 z_id_col: str = "Sequence name",
                  meta_id_col: str = "CodeName") -> pd.DataFrame:
     """
     Parses a z-score reactivity TSV file with one ID column and 1 or more subject columns.

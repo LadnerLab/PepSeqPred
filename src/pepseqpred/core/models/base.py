@@ -1,3 +1,11 @@
+"""base.py
+
+Base model abstractions for PepSeqPred classifiers.
+
+Defines the abstract classifier interface used by downstream model
+implementations to ensure consistent forward signatures.
+"""
+
 from abc import ABC, abstractmethod
 import torch
 import torch.nn as nn

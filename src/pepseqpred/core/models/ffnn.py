@@ -1,7 +1,15 @@
+"""ffnn.py
+
+Feed-forward neural network model components for PepSeqPred.
+
+Defines a modular FFNN classifier with optional layer normalization and
+residual connections, plus a reusable feed-forward block.
+"""
+
+from typing import Iterable, Sequence
 import torch
 import torch.nn as nn
 from .base import PepSeqClassifierBase
-from typing import Iterable, Sequence
 
 
 class FFBlock(nn.Module):

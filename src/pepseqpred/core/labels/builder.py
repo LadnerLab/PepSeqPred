@@ -1,3 +1,11 @@
+"""builder.py
+
+Label building utilities for PepSeqPred peptide metadata.
+
+Provides helpers to parse PV1-style metadata, map peptides to protein embeddings,
+and build residue-level label tensors and peptide metadata for training.
+"""
+
 import logging
 from pathlib import Path
 from typing import Dict, List, Any, cast

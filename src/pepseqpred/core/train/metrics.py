@@ -1,5 +1,13 @@
-import torch
+"""metrics.py
+
+Evaluation metric helpers for PepSeqPred training.
+
+Provides a convenience function to compute common binary classification metrics
+from labels, predictions, and probabilities.
+"""
+
 from typing import Dict, Any
+import torch
 from sklearn.metrics import (precision_recall_fscore_support,
                              average_precision_score,
                              matthews_corrcoef,

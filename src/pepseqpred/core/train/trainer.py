@@ -1,3 +1,11 @@
+"""trainer.py
+
+Training loop utilities for PepSeqPred models.
+
+Defines a configurable Trainer with support for masked residue loss, evaluation
+metrics, threshold selection, checkpointing, and optional Optuna tuning.
+"""
+
 import logging
 from pathlib import Path
 from dataclasses import dataclass

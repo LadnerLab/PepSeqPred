@@ -1,3 +1,11 @@
+"""pv1.py
+
+PV1 preprocessing utilities for PepSeqPred.
+
+Provides a single entry point to read PV1 metadata and z-score tables, apply
+epitope thresholding, and merge the results into a training-ready DataFrame.
+"""
+
 import logging
 import time
 from typing import Optional

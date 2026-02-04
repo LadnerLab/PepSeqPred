@@ -13,7 +13,15 @@ import torch.distributed as dist
 
 
 def init_ddp() -> Dict[str, Any] | None:
-    """Initialize DDP if launched with srun. Returns rank info or None."""
+    """
+    Initialize DDP if launched with srun.
+
+    Returns
+    -------
+        Dict[str, Any] | None
+            Rank info dict with keys `rank`, `world_size`, and `local_rank` if DDP is enabled,
+            otherwise `None`.
+    """
     if "RANK" not in os.environ:
         return None
 
@@ -33,7 +41,14 @@ def _ddp_enabled() -> bool:
 
 
 def ddp_rank() -> int:
-    """Returns rank of current process, else 0 if DDP not enabled."""
+    """
+    Return the rank of the current process, or 0 if DDP is not enabled.
+
+    Returns
+    -------
+        int
+            Rank of the current process.
+    """
     return dist.get_rank() if _ddp_enabled() else 0
 
 
@@ -43,7 +58,19 @@ def _ddp_world() -> int:
 
 
 def ddp_all_reduce_sum(t: torch.Tensor) -> torch.Tensor:
-    """Returns a reduced sum of the tensor if DDP enabled."""
+    """
+    Sum-reduce a tensor across ranks if DDP is enabled.
+
+    Parameters
+    ----------
+        t : torch.Tensor
+            Tensor to reduce in-place.
+
+    Returns
+    -------
+        torch.Tensor
+            The reduced tensor (same object as input).
+    """
     if _ddp_enabled():
         dist.all_reduce(t, op=dist.ReduceOp.SUM)
     return t
@@ -53,6 +80,20 @@ def ddp_gather_all_1d(t: torch.Tensor, device: torch.device) -> Tuple[List[torch
     """
     All-gather 1D tensor across all ranks with padding to max length.
     Returns a list of gathered tensors and the original sizes.
+
+    Parameters
+    ----------
+        t : torch.Tensor
+            1D tensor to gather across ranks.
+        device : torch.device
+            Device to allocate intermediate buffers on.
+
+    Returns
+    -------
+        Tuple[List[torch.Tensor], List[int]]
+        -----------------------------------
+            A tuple of `(gathered, sizes)` where `gathered` is the list of padded tensors
+            from each rank and `sizes` are the original lengths per rank.
     """
     if not _ddp_enabled():
         return [t], [int(t.numel())]

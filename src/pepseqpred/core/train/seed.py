@@ -11,7 +11,14 @@ import numpy as np
 
 
 def set_all_seeds(seed: int) -> None:
-    """Sets seed value for all random number generators."""
+    """
+    Set seed values for all random number generators.
+
+    Parameters
+    ----------
+        seed : int
+            Seed value used for Python, NumPy, and PyTorch RNGs.
+    """
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     random.seed(seed)

@@ -12,7 +12,26 @@ import torch
 
 
 def infer_emb_dim(emb_index: Dict[str, Path]) -> int:
-    """Infers the embedding dimension by loading first embedding from index. We expect embedding vectors to be of length 1281."""
+    """
+    Infer embedding dimension by loading the first embedding in the index.
+
+    Parameters
+    ----------
+        emb_index : Dict[str, Path]
+            Mapping of protein IDs to embedding file paths.
+
+    Returns
+    -------
+        int
+            The embedding dimension (D) inferred from the first tensor of shape (L, D).
+
+    Raises
+    ------
+        ValueError
+            If `emb_index` is empty.
+        ValueError
+            If the loaded embedding is not a 2D tensor of shape (L, D).
+    """
     if not emb_index:
         raise ValueError("No embedding found in provided directories")
     first_path = next(iter(emb_index.values()))

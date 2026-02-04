@@ -1,3 +1,11 @@
+"""split.py
+
+Dataset splitting helpers for PepSeqPred training.
+
+Provides utilities to split protein IDs into train/validation sets and to shard
+ID lists across DDP ranks for parallel trials.
+"""
+
 import random
 from typing import List, Dict, Tuple, Any
 

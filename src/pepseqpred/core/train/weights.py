@@ -1,3 +1,11 @@
+"""weights.py
+
+Class weighting helpers for PepSeqPred training.
+
+Provides utilities to count positive/negative residues and compute a global
+positive class weight across DDP ranks.
+"""
+
 from typing import Dict, Tuple, Any
 import torch
 from torch.utils.data import DataLoader

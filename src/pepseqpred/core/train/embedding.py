@@ -1,3 +1,11 @@
+"""embedding.py
+
+Embedding inspection utilities for training.
+
+Provides helpers to infer embedding dimensionality from stored per-protein
+embedding tensors.
+"""
+
 from pathlib import Path
 from typing import Dict
 import torch

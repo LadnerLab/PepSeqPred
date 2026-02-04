@@ -1,3 +1,13 @@
+"""proteindataset.py
+
+Protein dataset utilities for streaming residue-level training samples.
+
+Provides helpers to index per-protein embedding files and label shards, build
+windowed views over long sequences, and collate padded batches for model input.
+The primary entry point is `ProteinDataset`, an IterableDataset that yields
+embedding/label/mask tuples (optionally with metadata) for training and evaluation.
+"""
+
 from pathlib import Path
 from typing import List, Dict, Iterator, Iterable, Tuple, Sequence, Optional
 import torch

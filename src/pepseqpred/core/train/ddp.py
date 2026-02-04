@@ -1,3 +1,11 @@
+"""ddp.py
+
+Distributed training helpers for PepSeqPred.
+
+Provides DDP initialization plus small utilities for rank-aware reductions and
+gathering variable-length 1D tensors across processes.
+"""
+
 import os
 from typing import Dict, List, Tuple, Any
 import torch

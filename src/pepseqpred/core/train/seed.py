@@ -1,3 +1,10 @@
+"""seed.py
+
+Seeding utilities for deterministic training runs.
+
+Provides a helper to seed Python, NumPy, and PyTorch ranges.
+"""
+
 import random
 import torch
 import numpy as np

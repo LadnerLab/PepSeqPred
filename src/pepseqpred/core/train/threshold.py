@@ -1,3 +1,11 @@
+"""threshold.py
+
+Threshold selection utilities for PepSeqPred classification outputs.
+
+Provides helpers to compute confusion statistics from probabilities and to
+select a threshold that maximizes recall subject to a minimum precision.
+"""
+
 from typing import Dict, Tuple, Optional, Any
 import numpy as np
 

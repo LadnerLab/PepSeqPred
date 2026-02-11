@@ -468,6 +468,10 @@ class Trainer:
             best_metrics : Dict[str, Any]
                 All other metrics generated during evaluation step.
         """
+        # nonzero ranks never touch Optuna APIs
+        if ddp_rank() != 0:
+            trial = None
+
         best_val_loss = float("inf")
         best_val_loss_at_score = float("inf")
         best_score = float("-inf")
@@ -497,30 +501,43 @@ class Trainer:
                                      "train_neg_residues": int(train_metrics["neg_residues"])
                                  }})
 
-            val_metrics = None
-            if self.val_loader is not None:
-                val_metrics = self._run_epoch(epoch, train=False)
+            val_metrics = self._run_epoch(
+                epoch, train=False) if self.val_loader is not None else None
+
+            metrics = {}
+            score = float("nan")
+            if val_metrics is not None:
+                metrics = val_metrics.get("eval_metrics") or {}
+                score = metrics.get(score_key, float("nan"))
+
+            # broadcast pruning across ranks
+            should_prune = False
+            if trial is not None and ddp_rank() == 0 and val_metrics is not None:
+                if score_key in {"precision", "recall", "f1", "mcc"}:
+                    if metrics.get("threshold_status", "ok") != "ok":
+                        should_prune = True
+                if np.isfinite(score):
+                    trial.report(score, step=epoch)
+                    if trial.should_prune():
+                        should_prune = True
+
+            # synchronize pruning decision across ranks
+            prune_flag = torch.tensor(
+                [1 if should_prune else 0],
+                device=self.device,
+                dtype=torch.int32
+            )
+            prune_flag = ddp_all_reduce_sum(prune_flag)
+            if prune_flag.item() > 0:
+                if ddp_rank() == 0 and trial is not None:
+                    raise optuna.TrialPruned()
+                break  # exit epoch loop on nonzero ranks
 
             if val_metrics is None:
                 continue
 
-            val_loss = float(val_metrics["loss"])
-            metrics = val_metrics.get("eval_metrics", {})
-            score = metrics.get(score_key, float("nan"))
-
-            # prune trials that could not maintain min_threshold if metric is threshold-based
-            if trial is not None and score_key in {"precision", "recall", "f1", "mcc"}:
-                if metrics.get("threshold_status", "ok") != "ok":
-                    raise optuna.TrialPruned
-
-            # report intermediate score for pruning
-            if trial is not None:
-                if np.isfinite(score):
-                    trial.report(score, step=epoch)
-                    if trial.should_prune():
-                        raise optuna.TrialPruned()
-
             # track overall best loss
+            val_loss = float(val_metrics["loss"])
             best_val_loss = min(best_val_loss, val_loss)
 
             # track best loss, score, and metrics for Optuna

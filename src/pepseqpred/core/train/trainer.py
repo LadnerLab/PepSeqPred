@@ -240,46 +240,49 @@ class Trainer:
         cm = None
         eval_metrics = None
         if not train:
-            # guard against invalid or non-existent residues
-            if len(all_y) == 0:
-                eval_metrics = {
-                    "precision": float("nan"),
-                    "recall": float("nan"),
-                    "f1": float("nan"),
-                    "mcc": float("nan"),
-                    "auc": float("nan"),
-                    "auc10": float("nan"),
-                    "pr_auc": float("nan"),
-                    "threshold": float("nan"),
-                    "threshold_status": "no_valid_residues",
-                    "threshold_min_precision": 0.25
-                }
-                avg_acc = float("nan")
-            else:
-                # gather predictions across ranks for global metrics
+            # all ranks must participate in gathers to avoid DDP divergence.
+            if len(all_y) > 0:
                 y_local = torch.cat(all_y, dim=0).to(self.device)
                 p_local = torch.cat(all_probs, dim=0).to(self.device)
+            else:
+                y_local = torch.empty(
+                    0, device=self.device, dtype=torch.long)
+                p_local = torch.empty(
+                    0, device=self.device, dtype=torch.float32)
 
-                y_list, y_sizes = ddp_gather_all_1d(y_local, self.device)
-                p_list, _ = ddp_gather_all_1d(p_local, self.device)
+            # gather predictions across ranks for global metrics
+            y_list, y_sizes = ddp_gather_all_1d(y_local, self.device)
+            p_list, _ = ddp_gather_all_1d(p_local, self.device)
 
-                if ddp_rank() == 0:
-                    ys, ps = [], []
-                    for i, size in enumerate(y_sizes):
-                        if size > 0:
-                            ys.append(y_list[i][:size].cpu())
-                            ps.append(p_list[i][:size].cpu())
-                    y_true = torch.cat(ys, dim=0).numpy() if len(
-                        ys) > 0 else np.array([])
-                    y_prob = torch.cat(ps, dim=0).numpy() if len(
-                        ps) > 0 else np.array([])
-                else:
-                    y_true = np.array([])
-                    y_prob = np.array([])
-
+            if ddp_rank() != 0:
                 # non-zero ranks skip metric computation
-                if ddp_rank() != 0:
-                    eval_metrics = None
+                eval_metrics = None
+                avg_acc = float("nan")
+            else:
+                ys, ps = [], []
+                for i, size in enumerate(y_sizes):
+                    if size > 0:
+                        ys.append(y_list[i][:size].cpu())
+                        ps.append(p_list[i][:size].cpu())
+                y_true = torch.cat(ys, dim=0).numpy() if len(
+                    ys) > 0 else np.array([])
+                y_prob = torch.cat(ps, dim=0).numpy() if len(
+                    ps) > 0 else np.array([])
+
+                # guard against invalid or non-existent residues globally
+                if y_true.size == 0:
+                    eval_metrics = {
+                        "precision": float("nan"),
+                        "recall": float("nan"),
+                        "f1": float("nan"),
+                        "mcc": float("nan"),
+                        "auc": float("nan"),
+                        "auc10": float("nan"),
+                        "pr_auc": float("nan"),
+                        "threshold": float("nan"),
+                        "threshold_status": "no_valid_residues",
+                        "threshold_min_precision": 0.25
+                    }
                     avg_acc = float("nan")
                 else:
                     # compute predictions at most optimal threshold calculated

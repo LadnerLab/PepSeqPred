@@ -39,7 +39,7 @@ from pepseqpred.core.data.proteindataset import ProteinDataset, pad_collate
 from pepseqpred.core.models.ffnn import PepSeqFFNN
 from pepseqpred.core.train.trainer import Trainer, TrainerConfig
 from pepseqpred.core.train.ddp import init_ddp
-from pepseqpred.core.train.split import split_ids, shard_ids_by_rank
+from pepseqpred.core.train.split import split_ids
 from pepseqpred.core.train.weights import compute_pos_neg_counts, global_pos_weight
 from pepseqpred.core.train.embedding import infer_emb_dim
 from pepseqpred.core.train.seed import set_all_seeds
@@ -315,6 +315,18 @@ def main() -> None:
     if len(embedding_dirs) == 0 or len(label_shards) == 0:
         raise ValueError("No embedding dirs or label files provided")
 
+    # mirror normal training DDP partitioning
+    if ddp is not None:
+        pairs = list(zip(embedding_dirs, label_shards))
+        if len(embedding_dirs) != len(label_shards):
+            raise ValueError("Embedding dirs and label shards length mismatch")
+        if len(embedding_dirs) == 0 or len(label_shards) == 0:
+            raise ValueError(
+                f"Rank {rank} for no shards, check shard counts vs. world size")
+        pairs = pairs[rank::world_size]
+        embedding_dirs = [p[0] for p in pairs]
+        label_shards = [p[1] for p in pairs]
+
     base_dataset = ProteinDataset(
         embedding_dirs=embedding_dirs,
         label_shards=label_shards,
@@ -330,13 +342,10 @@ def main() -> None:
     if args.subset > 0:
         protein_ids = protein_ids[:args.subset]
 
+    # split within local rank
     train_ids, val_ids = split_ids(protein_ids, args.val_frac, seed)
-    if ddp is not None:
-        train_ids = shard_ids_by_rank(train_ids, ddp)
-        val_ids = shard_ids_by_rank(val_ids, ddp)
-        if len(train_ids) == 0:
-            raise ValueError(
-                f"Rank {rank} got 0 train IDs after sharding, reduce world size or increment dataset size")
+    if len(train_ids) == 0:
+        raise ValueError(f"Rank {rank} got 0 train IDs after split")
 
     train_data = ProteinDataset(
         embedding_dirs=embedding_dirs,
@@ -444,21 +453,18 @@ def main() -> None:
         wd = float(params["weight_decay"])
         batch_size = int(params["batch_size"])
 
-        train_loader = DataLoader(train_data,
-                                  batch_size=batch_size,
-                                  shuffle=False,
-                                  num_workers=args.num_workers,
-                                  pin_memory=pin,
-                                  collate_fn=pad_collate)
+        # handle loader worker creation in multi-rank process
+        loader_kwargs = {"batch_size": batch_size,
+                         "shuffle": False,
+                         "num_workers": args.num_workers,
+                         "pin_memory": pin,
+                         "collate_fn": pad_collate}
+        if args.num_workers > 0:
+            loader_kwargs["multiprocessing_context"] = "spawn"
 
-        val_loader = None
-        if val_data is not None:
-            val_loader = DataLoader(val_data,
-                                    batch_size=batch_size,
-                                    shuffle=False,
-                                    num_workers=args.num_workers,
-                                    pin_memory=pin,
-                                    collate_fn=pad_collate)
+        train_loader = DataLoader(train_data, **loader_kwargs)
+        val_loader = DataLoader(
+            val_data, **loader_kwargs) if val_data is not None else None
 
         model = PepSeqFFNN(emb_dim=emb_dim,
                            hidden_sizes=hidden_sizes,
@@ -580,9 +586,20 @@ def main() -> None:
         if params.get("_stop"):
             break
 
-        score = _run_trial(params, trial)
+        # manually handle trial prunining in loop
+        trial_state = optuna.trial.TrialState.COMPLETE
+        score = float("nan")
+        try:
+            score = _run_trial(params, trial)
+        except optuna.TrialPruned:
+            trial_state = optuna.trial.TrialState.PRUNED
+
         if rank == 0:
-            study.tell(trial, score)
+            # study.tell(trial, score)
+            if trial_state == optuna.trial.TrialState.PRUNED:
+                study.tell(trial, state=trial_state)
+            else:
+                study.tell(trial, score)
 
     if rank == 0:
         # get most optimal results consolidated in rank 0

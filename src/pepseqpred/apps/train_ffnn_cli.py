@@ -195,6 +195,8 @@ def main() -> None:
         protein_ids = protein_ids[:args.subset]
 
     train_ids, val_ids = split_ids(protein_ids, args.val_frac, seed)
+    if len(train_ids) == 0:
+        raise ValueError(f"Rank {rank} got 0 train IDs after split")
 
     train_data = ProteinDataset(
         embedding_dirs=embedding_dirs,
@@ -230,20 +232,18 @@ def main() -> None:
 
     # set up data loaders
     pin = torch.cuda.is_available()  # pin memory depending on if CUDA available
-    train_loader = DataLoader(train_data,
-                              batch_size=args.batch_size,
-                              shuffle=False,
-                              num_workers=args.num_workers,
-                              pin_memory=pin,
-                              collate_fn=pad_collate)
-    val_loader = None
-    if val_data is not None:
-        val_loader = DataLoader(val_data,
-                                batch_size=args.batch_size,
-                                shuffle=False,
-                                num_workers=args.num_workers,
-                                pin_memory=pin,
-                                collate_fn=pad_collate)
+    # handle loader worker creation in multi-rank process
+    loader_kwargs = {"batch_size": args.batch_size,
+                     "shuffle": False,
+                     "num_workers": args.num_workers,
+                     "pin_memory": pin,
+                     "collate_fn": pad_collate}
+    if args.num_workers > 0:
+        loader_kwargs["multiprocessing_context"] = "spawn"
+
+    train_loader = DataLoader(train_data, **loader_kwargs)
+    val_loader = DataLoader(
+        val_data, **loader_kwargs) if val_data is not None else None
 
     # compute or store positive weight (like class weight)
     pos_weight = None

@@ -7,6 +7,7 @@ metrics, threshold selection, checkpointing, and optional Optuna tuning.
 """
 
 import logging
+import contextlib
 from pathlib import Path
 from dataclasses import dataclass
 from typing import Optional, List, Dict, Any, Tuple
@@ -128,8 +129,8 @@ class Trainer:
             denom = mask.float().sum()
             if denom.item() == 0.0:
                 loss = loss_raw.sum() * 0.0
-                if train:
-                    return {"loss": 0.0, "n": 0}
+                # if train:
+                #     return {"loss": 0.0, "n": 0}
             else:
                 loss = (loss_raw * mask.float()).sum() / denom
         else:
@@ -182,39 +183,42 @@ class Trainer:
         all_probs: List[torch.Tensor] = []
 
         # use inference mode for eval
-        ctx = torch.enable_grad() if train else torch.inference_mode()
-        for batch in loader:
-            with ctx:
-                out = self._batch_step(batch, train=train)
+        torch_ctx = torch.enable_grad() if train else torch.inference_mode()
+        loop_ctx = self.model.join() if train and hasattr(
+            self.model, "join") else contextlib.nullcontext()
+        with loop_ctx:
+            for batch in loader:
+                with torch_ctx:
+                    out = self._batch_step(batch, train=train)
 
-            # collect data for metrics
-            if not train and out["n"] > 0:
-                all_y.append(out["y"])
-                all_probs.append(out["probs"])
+                # collect data for metrics
+                if not train and out["n"] > 0:
+                    all_y.append(out["y"])
+                    all_probs.append(out["probs"])
 
-            total_loss += out["loss"] * out["n"]
-            total_samples += out["n"]
+                total_loss += out["loss"] * out["n"]
+                total_samples += out["n"]
 
-            # track class counts from masked residues
-            if not train:
-                y_flat = out["y"]
-            else:
-                # reuse labels from batch without extra forward pass
-                if len(batch) == 2:
-                    _, y = batch
-                    mask = None
+                # track class counts from masked residues
+                if not train:
+                    y_flat = out["y"]
                 else:
-                    _, y, mask = batch
+                    # reuse labels from batch without extra forward pass
+                    if len(batch) == 2:
+                        _, y = batch
+                        mask = None
+                    else:
+                        _, y, mask = batch
 
-                y = y.view(-1)
-                if mask is not None:
-                    mask = mask.view(-1).bool()
-                    y = y[mask]
-                y_flat = y
+                    y = y.view(-1)
+                    if mask is not None:
+                        mask = mask.view(-1).bool()
+                        y = y[mask]
+                    y_flat = y
 
-            if y_flat.numel() > 0:
-                total_pos += int((y_flat == 1).sum().item())
-                total_neg += int((y_flat == 0).sum().item())
+                if y_flat.numel() > 0:
+                    total_pos += int((y_flat == 1).sum().item())
+                    total_neg += int((y_flat == 0).sum().item())
 
         # compute average loss (global across ranks)
         loss_sum = torch.tensor(

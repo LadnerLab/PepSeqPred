@@ -7,6 +7,7 @@ gathering variable-length 1D tensors across processes.
 """
 
 import os
+from datetime import timedelta
 from typing import Dict, List, Tuple, Any
 import torch
 import torch.distributed as dist
@@ -14,7 +15,7 @@ import torch.distributed as dist
 
 def init_ddp() -> Dict[str, Any] | None:
     """
-    Initialize DDP if launched with srun.
+    Initialize DDP if launched with srun. Sets timeout duration in minutes.
 
     Returns
     -------
@@ -25,7 +26,13 @@ def init_ddp() -> Dict[str, Any] | None:
     if "RANK" not in os.environ:
         return None
 
-    dist.init_process_group(backend="nccl")
+    timeout_min_raw = os.environ.get("PEPSEQPRED_DDP_TIMEOUT_MIN", "60")
+    try:
+        timeout_min = max(1, int(timeout_min_raw))
+    except ValueError:
+        timeout_min = 60  # minutes
+    dist.init_process_group(
+        backend="nccl", timeout=timedelta(minutes=timeout_min))
     local_rank = int(os.environ["LOCAL_RANK"])
     torch.cuda.set_device(local_rank)
     return {

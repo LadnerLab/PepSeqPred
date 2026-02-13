@@ -108,6 +108,10 @@ else
     LAUNCHER=""
 fi
 
+# DDP timeout setting for testing
+DDP_TIMEOUT_MIN="${DDP_TIMEOUT_MIN:-5}"
+export PEPSEQPRED_DDP_TIMEOUT_MIN="$DDP_TIMEOUT_MIN"
+
 ${LAUNCHER} torchrun --nproc_per_node=4 train_ffnn_optuna.pyz \
     --embedding-dirs "${EMBEDDING_DIRS[@]}" \
     --label-shards "${LABEL_SHARDS[@]}" \

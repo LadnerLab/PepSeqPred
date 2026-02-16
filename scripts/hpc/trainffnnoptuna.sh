@@ -2,7 +2,7 @@
 #SBATCH --job-name=ffnn_optuna
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=1
+#SBATCH --cpus-per-task=20
 #SBATCH --partition=gpu
 #SBATCH --gpus-per-node=a100:4
 #SBATCH --mem=256G
@@ -82,7 +82,7 @@ LR_MIN="${LR_MIN:-1e-4}"
 LR_MAX="${LR_MAX:-3e-3}"
 WD_MIN="${WD_MIN:-1e-8}"
 WD_MAX="${WD_MAX:-1e-2}"
-BATCH_SIZES="${BATCH_SIZES:-64,128,256,512,1024}"
+BATCH_SIZES="${BATCH_SIZES:-256,512,1024}"
 
 # pruning and timeout controls
 PRUNER_WARMUP="${PRUNER_WARMUP:-2}"
@@ -109,7 +109,7 @@ else
 fi
 
 # DDP timeout setting for testing
-DDP_TIMEOUT_MIN="${DDP_TIMEOUT_MIN:-5}"
+DDP_TIMEOUT_MIN="${DDP_TIMEOUT_MIN:-60}"
 export PEPSEQPRED_DDP_TIMEOUT_MIN="$DDP_TIMEOUT_MIN"
 
 ${LAUNCHER} torchrun --nproc_per_node=4 train_ffnn_optuna.pyz \

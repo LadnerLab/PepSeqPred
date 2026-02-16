@@ -39,7 +39,7 @@ from pepseqpred.core.data.proteindataset import ProteinDataset, pad_collate
 from pepseqpred.core.models.ffnn import PepSeqFFNN
 from pepseqpred.core.train.trainer import Trainer, TrainerConfig
 from pepseqpred.core.train.ddp import init_ddp
-from pepseqpred.core.train.split import split_ids
+from pepseqpred.core.train.split import split_ids, partition_ids_weighted
 from pepseqpred.core.train.weights import compute_pos_neg_counts, global_pos_weight
 from pepseqpred.core.train.embedding import infer_emb_dim
 from pepseqpred.core.train.seed import set_all_seeds
@@ -315,18 +315,6 @@ def main() -> None:
     if len(embedding_dirs) == 0 or len(label_shards) == 0:
         raise ValueError("No embedding dirs or label files provided")
 
-    # mirror normal training DDP partitioning
-    if ddp is not None:
-        pairs = list(zip(embedding_dirs, label_shards))
-        if len(embedding_dirs) != len(label_shards):
-            raise ValueError("Embedding dirs and label shards length mismatch")
-        if len(embedding_dirs) == 0 or len(label_shards) == 0:
-            raise ValueError(
-                f"Rank {rank} for no shards, check shard counts vs. world size")
-        pairs = pairs[rank::world_size]
-        embedding_dirs = [p[0] for p in pairs]
-        label_shards = [p[1] for p in pairs]
-
     base_dataset = ProteinDataset(
         embedding_dirs=embedding_dirs,
         label_shards=label_shards,
@@ -343,9 +331,72 @@ def main() -> None:
         protein_ids = protein_ids[:args.subset]
 
     # split within local rank
-    train_ids, val_ids = split_ids(protein_ids, args.val_frac, seed)
-    if len(train_ids) == 0:
+    train_ids_all, val_ids_all = split_ids(protein_ids, args.val_frac, seed)
+    if len(train_ids_all) == 0:
         raise ValueError(f"Rank {rank} got 0 train IDs after split")
+
+    # weight by embedding file size to reduce I/O
+    id_weights: Dict[str, float] = {}
+    for protein_id in protein_ids:
+        emb_path = base_dataset.embedding_index.get(protein_id)
+        if emb_path is None:
+            id_weights[protein_id] = 1.0
+            continue
+        # use file size as weight
+        try:
+            id_weights[protein_id] = float(max(1, emb_path.stat().st_size))
+        except OSError:
+            id_weights[protein_id] = 1.0
+
+    if ddp is None:
+        train_ids = train_ids_all
+        val_ids = val_ids_all
+    else:
+        # build train and validation sets on rank 0
+        if rank == 0:
+            payload = {
+                "train_ids_by_rank": partition_ids_weighted(
+                    train_ids_all,
+                    world_size,
+                    weights=id_weights,
+                    ensure_non_empty=True
+                ),
+                "val_ids_by_rank": partition_ids_weighted(
+                    val_ids_all,
+                    world_size,
+                    weights=id_weights,
+                    ensure_non_empty=False
+                )
+            }
+        else:
+            payload = {}
+
+        # broadcast payload across each rank
+        obj = [payload]
+        dist.broadcast_object_list(obj, src=0)
+        payload = obj[0]
+
+        train_ids = list(payload["train_ids_by_rank"][rank])
+        val_ids = list(payload["val_ids_by_rank"][rank])
+
+        # gather splits per rank
+        per_rank = [None] * world_size
+        dist.all_gather_object(per_rank, {
+            "rank": rank,
+            "train_ids": len(train_ids),
+            "val_ids": len(val_ids)
+        })
+
+        if rank == 0:
+            logger.info("partition_summary", extra={"extra": {
+                "total_train_ids": len(train_ids_all),
+                "total_val_ids": len(val_ids_all),
+                "per_rank": per_rank
+            }})
+
+        if any(int(x["train_ids"]) == 0 for x in per_rank):
+            raise RuntimeError(
+                "At least one rank received 0 train IDs after weighted partitioning")
 
     train_data = ProteinDataset(
         embedding_dirs=embedding_dirs,
@@ -533,7 +584,7 @@ def main() -> None:
                 "BatchSize": int(batch_size),
                 "LearningRate": float(lr),
                 "WeightDecay": float(wd),
-                "PosWeight": float(pos_weight),
+                "PosWeight": float(pos_weight) if pos_weight else 1.0,
                 "Epochs": int(args.epochs),
                 "BestValLossAtScore": float(best_val_loss_at_score),
                 "BestEpoch": int(best_epoch),

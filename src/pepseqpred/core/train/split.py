@@ -62,10 +62,32 @@ def shard_ids_by_rank(ids: List[str], ddp: Dict[str, Any] | None) -> List[str]:
     return list(ids)[rank::world_size]
 
 
+def sort_ids_for_locality(ids: List[str],
+                          groups: Optional[Dict[str, str]] = None) -> List[str]:
+    """
+    Sort IDs so items from the same group (for example label shard path) are contiguous.
+
+    Parameters
+    ----------
+        ids : List[str]
+            Protein IDs to sort.
+        groups : Optional[Dict[str, str]]
+            Optional group dictionary mapping how to group protein IDs to keep them contiguous.
+    Returns
+    -------
+        List[str]
+            Sorted list of protein IDs optionally grouped together in contiguous manner.
+    """
+    groups = groups or {}
+    return sorted(list(ids), key=lambda protein_id: (groups.get(protein_id, ""), protein_id))
+
+
 def partition_ids_weighted(ids: List[str],
                            world_size: int,
                            weights: Optional[Dict[str, float]] = None,
-                           ensure_non_empty: bool = False) -> List[List[str]]:
+                           ensure_non_empty: bool = False,
+                           groups: Optional[Dict[str, str]] = None,
+                           sort_within_rank: bool = True) -> List[List[str]]:
     """
     Partition IDs across ranks using greedy load balancing.
 
@@ -85,6 +107,10 @@ def partition_ids_weighted(ids: List[str],
         ensure_non_empty : bool
             If True, enforce that each rank receives at least one ID. Raises if
             `len(ids) < world_size` or if an empty partition is produced.
+        groups : Optional[Dict[str, str]]
+            Optional group dictionary mapping how to group protein IDs to keep them contiguous.
+        sort_within_rank : bool
+            Sorts protein IDs within a specific rank when `True`.
 
     Returns
     -------
@@ -110,24 +136,31 @@ def partition_ids_weighted(ids: List[str],
             f"Cannot assign non-empty train shards: n_ids={len(ids)} < world_size={world_size}")
 
     weights = weights or {}
-    items: List[Tuple[str, float]] = []
+    groups = groups or {}
+    items: List[Tuple[str, float, str]] = []
     for protein_id in ids:
         # workload estimate for this protein ID
         raw = float(weights.get(protein_id, 1.0))
         weight = raw if (math.isfinite(raw) and raw > 0) else 1.0
-        items.append((protein_id, weight))
+        items.append((protein_id, weight, groups.get(protein_id, "")))
 
-    # sort by largest workloads first, break tie by protein ID
-    items.sort(key=lambda x: (-x[1], x[0]))
+    # sort by largest workloads first, then keep group locality
+    items.sort(key=lambda x: (-x[1], x[2], x[0]))
 
     parts = [[] for _ in range(world_size)]
     loads = [0.0 for _ in range(world_size)]
 
-    for protein_id, load in items:
+    for protein_id, load, _ in items:
         # pick rank with smallest current load, break tie by protein ID
         r = min(range(world_size), key=lambda k: (loads[k], len(parts[k]), k))
         parts[r].append(protein_id)
         loads[r] += load
+
+    # optionally sort wuthin each rank
+    if sort_within_rank:
+        for r in range(world_size):
+            parts[r].sort(key=lambda protein_id: (
+                groups.get(protein_id, ""), protein_id))
 
     if ensure_non_empty and any(len(p) == 0 for p in parts):
         raise RuntimeError("Weighted partition produced an empty rank shard")

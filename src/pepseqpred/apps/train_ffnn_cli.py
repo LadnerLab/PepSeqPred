@@ -28,7 +28,7 @@ from pepseqpred.core.data.proteindataset import ProteinDataset, pad_collate
 from pepseqpred.core.models.ffnn import PepSeqFFNN
 from pepseqpred.core.train.trainer import Trainer, TrainerConfig
 from pepseqpred.core.train.ddp import init_ddp
-from pepseqpred.core.train.split import split_ids, partition_ids_weighted
+from pepseqpred.core.train.split import split_ids, partition_ids_weighted, sort_ids_for_locality
 from pepseqpred.core.train.weights import compute_pos_neg_counts, global_pos_weight
 from pepseqpred.core.train.embedding import infer_emb_dim
 from pepseqpred.core.train.seed import set_all_seeds
@@ -203,9 +203,14 @@ def main() -> None:
         except OSError:
             id_weights[protein_id] = 1.0
 
+    id_groups: Dict[str, str] = {
+        protein_id: str(base_dataset.label_index.get(protein_id, ""))
+        for protein_id in protein_ids
+    }
+
     if ddp is None:
-        train_ids = train_ids_all
-        val_ids = val_ids_all
+        train_ids = sort_ids_for_locality(train_ids_all, id_groups)
+        val_ids = sort_ids_for_locality(val_ids_all, id_groups)
     else:
         if rank == 0:
             payload = {
@@ -213,12 +218,14 @@ def main() -> None:
                     train_ids_all,
                     world_size,
                     weights=id_weights,
+                    groups=id_groups,
                     ensure_non_empty=True
                 ),
                 "val_ids_by_rank": partition_ids_weighted(
                     val_ids_all,
                     world_size,
                     weights=id_weights,
+                    groups=id_groups,
                     ensure_non_empty=False
                 )
             }
@@ -292,6 +299,9 @@ def main() -> None:
                      "collate_fn": pad_collate}
     if args.num_workers > 0:
         loader_kwargs["multiprocessing_context"] = "spawn"
+        # reduce worker respawn overhead
+        loader_kwargs["persistent_workers"] = True
+        loader_kwargs["prefetch_factor"] = 4
 
     train_loader = DataLoader(train_data, **loader_kwargs)
     val_loader = DataLoader(

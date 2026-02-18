@@ -265,7 +265,7 @@ def predict_protein(psp_model: PepSeqFFNN,
     return {
         "binary_mask": binary_mask,
         "length": int(mask.numel()),
-        "n_epitope": int(mask.sum().item()),
+        "n_epitopes": int(mask.sum().item()),
         "frac_epitope": float(mask.float().mean().item()),
         "p_epitope_mean": float(probs.mean().item()),
         "p_epitope_max": float(probs.max().item()),

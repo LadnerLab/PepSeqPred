@@ -18,6 +18,7 @@ Usage
 
 import argparse
 from pathlib import Path
+from typing import Dict
 import torch
 from torch.utils.data import DataLoader
 import torch.distributed as dist
@@ -27,7 +28,7 @@ from pepseqpred.core.data.proteindataset import ProteinDataset, pad_collate
 from pepseqpred.core.models.ffnn import PepSeqFFNN
 from pepseqpred.core.train.trainer import Trainer, TrainerConfig
 from pepseqpred.core.train.ddp import init_ddp
-from pepseqpred.core.train.split import split_ids
+from pepseqpred.core.train.split import split_ids, partition_ids_weighted, sort_ids_for_locality
 from pepseqpred.core.train.weights import compute_pos_neg_counts, global_pos_weight
 from pepseqpred.core.train.embedding import infer_emb_dim
 from pepseqpred.core.train.seed import set_all_seeds
@@ -168,16 +169,8 @@ def main() -> None:
 
     embedding_dirs = list(args.embedding_dirs)
     label_shards = list(args.label_shards)
-    if ddp is not None:
-        pairs = list(zip(embedding_dirs, label_shards))
-        if len(embedding_dirs) != len(label_shards):
-            raise ValueError("Embedding dirs and label shards length mismatch")
-        if len(embedding_dirs) == 0 or len(label_shards) == 0:
-            raise ValueError(
-                f"Rank {rank} for no shards, check shard counts vs. world size")
-        pairs = pairs[rank::world_size]
-        embedding_dirs = [p[0] for p in pairs]
-        label_shards = [p[1] for p in pairs]
+    if len(embedding_dirs) == 0 or len(label_shards) == 0:
+        raise ValueError("No embedding dirs or label files provided")
 
     base_dataset = ProteinDataset(
         embedding_dirs=embedding_dirs,
@@ -194,7 +187,75 @@ def main() -> None:
     if args.subset > 0:
         protein_ids = protein_ids[:args.subset]
 
-    train_ids, val_ids = split_ids(protein_ids, args.val_frac, seed)
+    train_ids_all, val_ids_all = split_ids(protein_ids, args.val_frac, seed)
+    if len(train_ids_all) == 0:
+        raise ValueError("Global split produced 0 train IDs")
+
+    # estimate relative workload without tensor I/O by using embedding file size.
+    id_weights: Dict[str, float] = {}
+    for protein_id in protein_ids:
+        emb_path = base_dataset.embedding_index.get(protein_id)
+        if emb_path is None:
+            id_weights[protein_id] = 1.0
+            continue
+        try:
+            id_weights[protein_id] = float(max(1, emb_path.stat().st_size))
+        except OSError:
+            id_weights[protein_id] = 1.0
+
+    id_groups: Dict[str, str] = {
+        protein_id: str(base_dataset.label_index.get(protein_id, ""))
+        for protein_id in protein_ids
+    }
+
+    if ddp is None:
+        train_ids = sort_ids_for_locality(train_ids_all, id_groups)
+        val_ids = sort_ids_for_locality(val_ids_all, id_groups)
+    else:
+        if rank == 0:
+            payload = {
+                "train_ids_by_rank": partition_ids_weighted(
+                    train_ids_all,
+                    world_size,
+                    weights=id_weights,
+                    groups=id_groups,
+                    ensure_non_empty=True
+                ),
+                "val_ids_by_rank": partition_ids_weighted(
+                    val_ids_all,
+                    world_size,
+                    weights=id_weights,
+                    groups=id_groups,
+                    ensure_non_empty=False
+                )
+            }
+        else:
+            payload = {}
+
+        obj = [payload]
+        dist.broadcast_object_list(obj, src=0)
+        payload = obj[0]
+
+        train_ids = list(payload["train_ids_by_rank"][rank])
+        val_ids = list(payload["val_ids_by_rank"][rank])
+
+        per_rank = [None] * world_size
+        dist.all_gather_object(per_rank, {
+            "rank": rank,
+            "train_ids": len(train_ids),
+            "val_ids": len(val_ids)
+        })
+
+        if rank == 0:
+            logger.info("partition_summary", extra={"extra": {
+                "total_train_ids": len(train_ids_all),
+                "total_val_ids": len(val_ids_all),
+                "per_rank": per_rank
+            }})
+
+        if any(int(x["train_ids"]) == 0 for x in per_rank):
+            raise RuntimeError(
+                "At least one rank received 0 train IDs after weighted partitioning")
 
     train_data = ProteinDataset(
         embedding_dirs=embedding_dirs,
@@ -212,7 +273,7 @@ def main() -> None:
     )
 
     val_data = None
-    if len(val_ids) > 0:
+    if len(val_ids) > 0 or ddp is not None:
         val_data = ProteinDataset(
             embedding_dirs=embedding_dirs,
             label_shards=label_shards,
@@ -230,20 +291,21 @@ def main() -> None:
 
     # set up data loaders
     pin = torch.cuda.is_available()  # pin memory depending on if CUDA available
-    train_loader = DataLoader(train_data,
-                              batch_size=args.batch_size,
-                              shuffle=False,
-                              num_workers=args.num_workers,
-                              pin_memory=pin,
-                              collate_fn=pad_collate)
-    val_loader = None
-    if val_data is not None:
-        val_loader = DataLoader(val_data,
-                                batch_size=args.batch_size,
-                                shuffle=False,
-                                num_workers=args.num_workers,
-                                pin_memory=pin,
-                                collate_fn=pad_collate)
+    # handle loader worker creation in multi-rank process
+    loader_kwargs = {"batch_size": args.batch_size,
+                     "shuffle": False,
+                     "num_workers": args.num_workers,
+                     "pin_memory": pin,
+                     "collate_fn": pad_collate}
+    if args.num_workers > 0:
+        loader_kwargs["multiprocessing_context"] = "spawn"
+        # reduce worker respawn overhead
+        loader_kwargs["persistent_workers"] = True
+        loader_kwargs["prefetch_factor"] = 4
+
+    train_loader = DataLoader(train_data, **loader_kwargs)
+    val_loader = DataLoader(
+        val_data, **loader_kwargs) if val_data is not None else None
 
     # compute or store positive weight (like class weight)
     pos_weight = None

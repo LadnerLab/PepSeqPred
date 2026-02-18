@@ -39,7 +39,7 @@ from pepseqpred.core.data.proteindataset import ProteinDataset, pad_collate
 from pepseqpred.core.models.ffnn import PepSeqFFNN
 from pepseqpred.core.train.trainer import Trainer, TrainerConfig
 from pepseqpred.core.train.ddp import init_ddp
-from pepseqpred.core.train.split import split_ids, shard_ids_by_rank
+from pepseqpred.core.train.split import split_ids, partition_ids_weighted, sort_ids_for_locality
 from pepseqpred.core.train.weights import compute_pos_neg_counts, global_pos_weight
 from pepseqpred.core.train.embedding import infer_emb_dim
 from pepseqpred.core.train.seed import set_all_seeds
@@ -136,6 +136,7 @@ def append_csv_row(csv_path: Path | str, row: Dict[str, Any]) -> None:
 
 
 def main() -> None:
+    """Parses CLI arguments and runs Optuna study."""
     parser = argparse.ArgumentParser(
         description="Optuna tuning CLI for PepSeqPredFFNN.")
     parser.add_argument("--embedding-dirs",
@@ -330,13 +331,81 @@ def main() -> None:
     if args.subset > 0:
         protein_ids = protein_ids[:args.subset]
 
-    train_ids, val_ids = split_ids(protein_ids, args.val_frac, seed)
-    if ddp is not None:
-        train_ids = shard_ids_by_rank(train_ids, ddp)
-        val_ids = shard_ids_by_rank(val_ids, ddp)
-        if len(train_ids) == 0:
-            raise ValueError(
-                f"Rank {rank} got 0 train IDs after sharding, reduce world size or increment dataset size")
+    # split within local rank
+    train_ids_all, val_ids_all = split_ids(protein_ids, args.val_frac, seed)
+    if len(train_ids_all) == 0:
+        raise ValueError(f"Rank {rank} got 0 train IDs after split")
+
+    # weight by embedding file size to reduce I/O
+    id_weights: Dict[str, float] = {}
+    for protein_id in protein_ids:
+        emb_path = base_dataset.embedding_index.get(protein_id)
+        if emb_path is None:
+            id_weights[protein_id] = 1.0
+            continue
+        # use file size as weight
+        try:
+            id_weights[protein_id] = float(max(1, emb_path.stat().st_size))
+        except OSError:
+            id_weights[protein_id] = 1.0
+
+    # generate protein ID groupings
+    id_groups: Dict[str, str] = {
+        protein_id: str(base_dataset.label_index.get(protein_id, ""))
+        for protein_id in protein_ids
+    }
+
+    if ddp is None:
+        train_ids = sort_ids_for_locality(train_ids_all, id_groups)
+        val_ids = sort_ids_for_locality(val_ids_all, id_groups)
+    else:
+        # build train and validation sets on rank 0
+        if rank == 0:
+            payload = {
+                "train_ids_by_rank": partition_ids_weighted(
+                    train_ids_all,
+                    world_size,
+                    weights=id_weights,
+                    groups=id_groups,
+                    ensure_non_empty=True
+                ),
+                "val_ids_by_rank": partition_ids_weighted(
+                    val_ids_all,
+                    world_size,
+                    weights=id_weights,
+                    groups=id_groups,
+                    ensure_non_empty=False
+                )
+            }
+        else:
+            payload = {}
+
+        # broadcast payload across each rank
+        obj = [payload]
+        dist.broadcast_object_list(obj, src=0)
+        payload = obj[0]
+
+        train_ids = list(payload["train_ids_by_rank"][rank])
+        val_ids = list(payload["val_ids_by_rank"][rank])
+
+        # gather splits per rank
+        per_rank = [None] * world_size
+        dist.all_gather_object(per_rank, {
+            "rank": rank,
+            "train_ids": len(train_ids),
+            "val_ids": len(val_ids)
+        })
+
+        if rank == 0:
+            logger.info("partition_summary", extra={"extra": {
+                "total_train_ids": len(train_ids_all),
+                "total_val_ids": len(val_ids_all),
+                "per_rank": per_rank
+            }})
+
+        if any(int(x["train_ids"]) == 0 for x in per_rank):
+            raise RuntimeError(
+                "At least one rank received 0 train IDs after weighted partitioning")
 
     train_data = ProteinDataset(
         embedding_dirs=embedding_dirs,
@@ -444,21 +513,21 @@ def main() -> None:
         wd = float(params["weight_decay"])
         batch_size = int(params["batch_size"])
 
-        train_loader = DataLoader(train_data,
-                                  batch_size=batch_size,
-                                  shuffle=False,
-                                  num_workers=args.num_workers,
-                                  pin_memory=pin,
-                                  collate_fn=pad_collate)
+        # handle loader worker creation in multi-rank process
+        loader_kwargs = {"batch_size": batch_size,
+                         "shuffle": False,
+                         "num_workers": args.num_workers,
+                         "pin_memory": pin,
+                         "collate_fn": pad_collate}
+        if args.num_workers > 0:
+            loader_kwargs["multiprocessing_context"] = "spawn"
+            # reduce worker respawn overhead
+            loader_kwargs["persistent_workers"] = True
+            loader_kwargs["prefetch_factor"] = 4
 
-        val_loader = None
-        if val_data is not None:
-            val_loader = DataLoader(val_data,
-                                    batch_size=batch_size,
-                                    shuffle=False,
-                                    num_workers=args.num_workers,
-                                    pin_memory=pin,
-                                    collate_fn=pad_collate)
+        train_loader = DataLoader(train_data, **loader_kwargs)
+        val_loader = DataLoader(
+            val_data, **loader_kwargs) if val_data is not None else None
 
         model = PepSeqFFNN(emb_dim=emb_dim,
                            hidden_sizes=hidden_sizes,
@@ -527,7 +596,7 @@ def main() -> None:
                 "BatchSize": int(batch_size),
                 "LearningRate": float(lr),
                 "WeightDecay": float(wd),
-                "PosWeight": float(pos_weight),
+                "PosWeight": float(pos_weight) if pos_weight else 1.0,
                 "Epochs": int(args.epochs),
                 "BestValLossAtScore": float(best_val_loss_at_score),
                 "BestEpoch": int(best_epoch),
@@ -580,9 +649,20 @@ def main() -> None:
         if params.get("_stop"):
             break
 
-        score = _run_trial(params, trial)
+        # manually handle trial prunining in loop
+        trial_state = optuna.trial.TrialState.COMPLETE
+        score = float("nan")
+        try:
+            score = _run_trial(params, trial)
+        except optuna.TrialPruned:
+            trial_state = optuna.trial.TrialState.PRUNED
+
         if rank == 0:
-            study.tell(trial, score)
+            # study.tell(trial, score)
+            if trial_state == optuna.trial.TrialState.PRUNED:
+                study.tell(trial, state=trial_state)
+            else:
+                study.tell(trial, score)
 
     if rank == 0:
         # get most optimal results consolidated in rank 0

@@ -7,6 +7,7 @@ metrics, threshold selection, checkpointing, and optional Optuna tuning.
 """
 
 import logging
+import contextlib
 from pathlib import Path
 from dataclasses import dataclass
 from typing import Optional, List, Dict, Any, Tuple
@@ -128,8 +129,8 @@ class Trainer:
             denom = mask.float().sum()
             if denom.item() == 0.0:
                 loss = loss_raw.sum() * 0.0
-                if train:
-                    return {"loss": 0.0, "n": 0}
+                # if train:
+                #     return {"loss": 0.0, "n": 0}
             else:
                 loss = (loss_raw * mask.float()).sum() / denom
         else:
@@ -182,39 +183,42 @@ class Trainer:
         all_probs: List[torch.Tensor] = []
 
         # use inference mode for eval
-        ctx = torch.enable_grad() if train else torch.inference_mode()
-        for batch in loader:
-            with ctx:
-                out = self._batch_step(batch, train=train)
+        torch_ctx = torch.enable_grad() if train else torch.inference_mode()
+        loop_ctx = self.model.join() if train and hasattr(
+            self.model, "join") else contextlib.nullcontext()
+        with loop_ctx:
+            for batch in loader:
+                with torch_ctx:
+                    out = self._batch_step(batch, train=train)
 
-            # collect data for metrics
-            if not train and out["n"] > 0:
-                all_y.append(out["y"])
-                all_probs.append(out["probs"])
+                # collect data for metrics
+                if not train and out["n"] > 0:
+                    all_y.append(out["y"])
+                    all_probs.append(out["probs"])
 
-            total_loss += out["loss"] * out["n"]
-            total_samples += out["n"]
+                total_loss += out["loss"] * out["n"]
+                total_samples += out["n"]
 
-            # track class counts from masked residues
-            if not train:
-                y_flat = out["y"]
-            else:
-                # reuse labels from batch without extra forward pass
-                if len(batch) == 2:
-                    _, y = batch
-                    mask = None
+                # track class counts from masked residues
+                if not train:
+                    y_flat = out["y"]
                 else:
-                    _, y, mask = batch
+                    # reuse labels from batch without extra forward pass
+                    if len(batch) == 2:
+                        _, y = batch
+                        mask = None
+                    else:
+                        _, y, mask = batch
 
-                y = y.view(-1)
-                if mask is not None:
-                    mask = mask.view(-1).bool()
-                    y = y[mask]
-                y_flat = y
+                    y = y.view(-1)
+                    if mask is not None:
+                        mask = mask.view(-1).bool()
+                        y = y[mask]
+                    y_flat = y
 
-            if y_flat.numel() > 0:
-                total_pos += int((y_flat == 1).sum().item())
-                total_neg += int((y_flat == 0).sum().item())
+                if y_flat.numel() > 0:
+                    total_pos += int((y_flat == 1).sum().item())
+                    total_neg += int((y_flat == 0).sum().item())
 
         # compute average loss (global across ranks)
         loss_sum = torch.tensor(
@@ -240,46 +244,49 @@ class Trainer:
         cm = None
         eval_metrics = None
         if not train:
-            # guard against invalid or non-existent residues
-            if len(all_y) == 0:
-                eval_metrics = {
-                    "precision": float("nan"),
-                    "recall": float("nan"),
-                    "f1": float("nan"),
-                    "mcc": float("nan"),
-                    "auc": float("nan"),
-                    "auc10": float("nan"),
-                    "pr_auc": float("nan"),
-                    "threshold": float("nan"),
-                    "threshold_status": "no_valid_residues",
-                    "threshold_min_precision": 0.25
-                }
-                avg_acc = float("nan")
-            else:
-                # gather predictions across ranks for global metrics
+            # all ranks must participate in gathers to avoid DDP divergence.
+            if len(all_y) > 0:
                 y_local = torch.cat(all_y, dim=0).to(self.device)
                 p_local = torch.cat(all_probs, dim=0).to(self.device)
+            else:
+                y_local = torch.empty(
+                    0, device=self.device, dtype=torch.long)
+                p_local = torch.empty(
+                    0, device=self.device, dtype=torch.float32)
 
-                y_list, y_sizes = ddp_gather_all_1d(y_local, self.device)
-                p_list, _ = ddp_gather_all_1d(p_local, self.device)
+            # gather predictions across ranks for global metrics
+            y_list, y_sizes = ddp_gather_all_1d(y_local, self.device)
+            p_list, _ = ddp_gather_all_1d(p_local, self.device)
 
-                if ddp_rank() == 0:
-                    ys, ps = [], []
-                    for i, size in enumerate(y_sizes):
-                        if size > 0:
-                            ys.append(y_list[i][:size].cpu())
-                            ps.append(p_list[i][:size].cpu())
-                    y_true = torch.cat(ys, dim=0).numpy() if len(
-                        ys) > 0 else np.array([])
-                    y_prob = torch.cat(ps, dim=0).numpy() if len(
-                        ps) > 0 else np.array([])
-                else:
-                    y_true = np.array([])
-                    y_prob = np.array([])
-
+            if ddp_rank() != 0:
                 # non-zero ranks skip metric computation
-                if ddp_rank() != 0:
-                    eval_metrics = None
+                eval_metrics = None
+                avg_acc = float("nan")
+            else:
+                ys, ps = [], []
+                for i, size in enumerate(y_sizes):
+                    if size > 0:
+                        ys.append(y_list[i][:size].cpu())
+                        ps.append(p_list[i][:size].cpu())
+                y_true = torch.cat(ys, dim=0).numpy() if len(
+                    ys) > 0 else np.array([])
+                y_prob = torch.cat(ps, dim=0).numpy() if len(
+                    ps) > 0 else np.array([])
+
+                # guard against invalid or non-existent residues globally
+                if y_true.size == 0:
+                    eval_metrics = {
+                        "precision": float("nan"),
+                        "recall": float("nan"),
+                        "f1": float("nan"),
+                        "mcc": float("nan"),
+                        "auc": float("nan"),
+                        "auc10": float("nan"),
+                        "pr_auc": float("nan"),
+                        "threshold": float("nan"),
+                        "threshold_status": "no_valid_residues",
+                        "threshold_min_precision": 0.25
+                    }
                     avg_acc = float("nan")
                 else:
                     # compute predictions at most optimal threshold calculated
@@ -468,6 +475,10 @@ class Trainer:
             best_metrics : Dict[str, Any]
                 All other metrics generated during evaluation step.
         """
+        # nonzero ranks never touch Optuna APIs
+        if ddp_rank() != 0:
+            trial = None
+
         best_val_loss = float("inf")
         best_val_loss_at_score = float("inf")
         best_score = float("-inf")
@@ -497,30 +508,43 @@ class Trainer:
                                      "train_neg_residues": int(train_metrics["neg_residues"])
                                  }})
 
-            val_metrics = None
-            if self.val_loader is not None:
-                val_metrics = self._run_epoch(epoch, train=False)
+            val_metrics = self._run_epoch(
+                epoch, train=False) if self.val_loader is not None else None
+
+            metrics = {}
+            score = float("nan")
+            if val_metrics is not None:
+                metrics = val_metrics.get("eval_metrics") or {}
+                score = metrics.get(score_key, float("nan"))
+
+            # broadcast pruning across ranks
+            should_prune = False
+            if trial is not None and ddp_rank() == 0 and val_metrics is not None:
+                if score_key in {"precision", "recall", "f1", "mcc"}:
+                    if metrics.get("threshold_status", "ok") != "ok":
+                        should_prune = True
+                if np.isfinite(score):
+                    trial.report(score, step=epoch)
+                    if trial.should_prune():
+                        should_prune = True
+
+            # synchronize pruning decision across ranks
+            prune_flag = torch.tensor(
+                [1 if should_prune else 0],
+                device=self.device,
+                dtype=torch.int32
+            )
+            prune_flag = ddp_all_reduce_sum(prune_flag)
+            if prune_flag.item() > 0:
+                if ddp_rank() == 0 and trial is not None:
+                    raise optuna.TrialPruned()
+                break  # exit epoch loop on nonzero ranks
 
             if val_metrics is None:
                 continue
 
-            val_loss = float(val_metrics["loss"])
-            metrics = val_metrics.get("eval_metrics", {})
-            score = metrics.get(score_key, float("nan"))
-
-            # prune trials that could not maintain min_threshold if metric is threshold-based
-            if trial is not None and score_key in {"precision", "recall", "f1", "mcc"}:
-                if metrics.get("threshold_status", "ok") != "ok":
-                    raise optuna.TrialPruned
-
-            # report intermediate score for pruning
-            if trial is not None:
-                if np.isfinite(score):
-                    trial.report(score, step=epoch)
-                    if trial.should_prune():
-                        raise optuna.TrialPruned()
-
             # track overall best loss
+            val_loss = float(val_metrics["loss"])
             best_val_loss = min(best_val_loss, val_loss)
 
             # track best loss, score, and metrics for Optuna

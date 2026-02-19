@@ -5,7 +5,7 @@
 #SBATCH --cpus-per-task=20
 #SBATCH --partition=gpu
 #SBATCH --gpus-per-node=a100:4
-#SBATCH --mem=256G
+#SBATCH --mem=448G
 #SBATCH --time=48:00:00
 #SBATCH --output=/scratch/%u/optuna_ffnn/%j/%x.out
 #SBATCH --error=/scratch/%u/optuna_ffnn/%j/%x.err

@@ -1,69 +1,173 @@
-from typing import Tuple, Dict, Any
+from dataclasses import dataclass
+import math
+import re
+from typing import Tuple, Dict, Any, Mapping, List
 import esm
 import torch
 import numpy as np
 from pepseqpred.core.models.ffnn import PepSeqFFNN
 from pepseqpred.core.embeddings.esm2 import clean_seq, compute_window_embedding, append_seq_len
 
+_HIDDEN_LAYER_RE = re.compile(r"^ff_model\.(\d+)\.linear\.weight$")
+_OUTPUT_LAYER_RE = re.compile(r"^ff_model\.(\d+)\.weight$")
+_LAYER_NORM_RE = re.compile(r"^ff_model\.\d+\.layer_norm\.weight$")
+_SKIP_LINEAR_RE = re.compile(r"^ff_model\.\d+\.skip\.weight$")
 
-CLASS_NAMES = ["Def epitope", "Uncertain", "Not epitope"]
+
+@dataclass
+class FFNNModelConfig:
+    emb_dim: int
+    hidden_sizes: Tuple[int, ...]
+    dropouts: Tuple[float, ...]
+    num_classes: int
+    use_layer_norm: bool
+    use_residual: bool
 
 
-def _find_peptide_start_stop(protein_seq: str, peptide: str) -> Tuple[int, int]:
-    """
-    Find the peptide start and stop indices within an overall protein sequence if they were not provided.
+def normalize_state_dict_keys(state: Mapping[str, Any]) -> Dict[str, Any]:
+    """Strips DDP `module.` prefix so checkpoints load in non-DDP inference."""
+    out_dict: Dict[str, Any] = {}
+    for k, v in state.items():
+        key = str(k)
+        if key.startswith("module."):
+            key = key[len("module."):]
+        out_dict[key] = v
+    return out_dict
 
-    Parameters
-    ----------
-        protein_seq : str
-            The entire protein sequence used to generate the peptide.
-        peptide : str
-            The peptide as a string which should be a subset of the overall protein sequence.
 
-    Returns
-    -------
-        start : int
-            Start index of the peptide.
-        stop : int
-            Stop index of the peptide.
+def infer_model_config_from_state(state: Mapping[str, Any]) -> FFNNModelConfig:
+    """Infer PepSeqFFNN architecture directly from checkpoint `model_state_dict`."""
+    state = normalize_state_dict_keys(state)
 
-    Raises
-    ------
-        ValueError
-            If peptide is not found in the protein sequence.
-    """
-    start = protein_seq.find(peptide)
-    stop = len(peptide) + start
-    if start < 0 or stop > len(protein_seq):
+    # get hidden layers and sizes
+    hidden_layers: List[Tuple[int, int, int]] = []
+    for key, tensor in state.items():
+        match_ = _HIDDEN_LAYER_RE.match(key)
+        if match_ is None:
+            continue
+        if not torch.is_tensor(tensor) or tensor.dim() != 2:
+            raise ValueError(f"Expected 2D tensor at {key}")
+
+        idx = int(match_.group(1))
+        out_dim = int(tensor.shape[0])
+        in_dim = int(tensor.shape[1])
+        hidden_layers.append((idx, in_dim, out_dim))
+
+    hidden_layers.sort(key=lambda x: x[0])
+    hidden_sizes = tuple(out_dim for _, _, out_dim in hidden_layers)
+
+    # get output layers and number of classes
+    output_layers: List[Tuple[int, int, int]] = []
+    for key, tensor in state.items():
+        match_ = _OUTPUT_LAYER_RE.match(key)
+        if match_ is None:
+            continue
+        if not torch.is_tensor(tensor) or tensor.dim() != 2:
+            continue
+
+        idx = int(match_.group(1))
+        num_classes = int(tensor.shape[0])
+        in_dim = int(tensor.shape[1])
+        output_layers.append((idx, num_classes, in_dim))
+
+    if len(output_layers) < 1:
         raise ValueError(
-            "Peptide not found as a contiguous substring in the provided protein sequence")
-    return start, stop
+            "Could not infer output layer from checkpoint state_dict")
+
+    output_layers.sort(key=lambda x: x[0])
+    _, num_classes, out_in_dim = output_layers[-1]
+
+    # validate hidden layers make sense (previous output layer should match current input layer)
+    if len(hidden_layers) > 0:
+        emb_dim = hidden_layers[0][1]
+        for i in range(1, len(hidden_layers)):
+            prev_out = hidden_layers[i - 1][2]
+            curr_in = hidden_layers[i][1]
+            if prev_out != curr_in:
+                raise ValueError(
+                    f"Hidden layer mismatch: prev_out={prev_out}, curr_in={curr_in}")
+        if hidden_layers[-1][2] != out_in_dim:
+            raise ValueError(
+                f"Output in_features {out_in_dim} does not match last hidden size {hidden_layers[-1][2]}")
+    else:
+        emb_dim = out_in_dim
+
+    # infer if using layer normalization
+    use_layer_norm = any(_LAYER_NORM_RE.match(k) for k in state.keys())
+
+    # try to infer if residuals used (ambiguous case)
+    has_skip_linear = any(_SKIP_LINEAR_RE.match(k) for k in state.keys())
+    if has_skip_linear:
+        use_residual = True
+    else:
+        if len(hidden_layers) > 0 and all(in_dim == out_dim for _, in_dim, out_dim in hidden_layers):
+            raise ValueError(
+                "Cannot infer use_residual from state_dict when all hidden layers are width-preserving and no skip weights exist")
+        use_residual = False
+
+    # dropout is not stored in state_dict
+    dropouts = tuple(0.0 for _ in hidden_sizes)
+
+    return FFNNModelConfig(
+        emb_dim=emb_dim,
+        hidden_sizes=hidden_sizes,
+        dropouts=dropouts,
+        num_classes=num_classes,
+        use_layer_norm=use_layer_norm,
+        use_residual=use_residual
+    )
 
 
-def infer_emb_dim_from_state(state: Dict[str, Any]) -> int:
-    """
-    Infers the embedding dimension from the model state.
+def build_model_from_checkpoint(checkpoint: Mapping[str, Any], device: str = "cpu") -> Tuple[PepSeqFFNN, FFNNModelConfig]:
+    """Builds and loads model exactly from training checkpoint."""
+    if not isinstance(checkpoint, Mapping) or "model_state_dict" not in checkpoint:
+        raise ValueError(
+            "Expected checkpoint dict containing 'model_state_dict'")
 
-    Parameters
-    ----------
-        state : Dict[str, Any]
-            The current model state as a dict.
+    state = checkpoint["model_state_dict"]
+    if not isinstance(state, Mapping):
+        raise ValueError("'model_state_dict' must be a mapping")
 
-    Returns
-    -------
-        int
-            The embedding dimension (usually 1281).
+    state = normalize_state_dict_keys(state)
+    config = infer_model_config_from_state(state)
 
-    Raises
-    ------
-        ValueError
-            If no 2D weight tensors were found to infer embedding dimension.
-    """
-    for _, v in state.items():
-        if torch.is_tensor(v) and v.dim() == 2:
-            return int(v.shape[1])
-    raise ValueError(
-        "Could not infer embedding dimension from model checkpoint, no 2D weight tensors found")
+    if config.num_classes != 1:
+        raise ValueError(
+            f"Inference expects binary residue model (num_classes=1), got {config.num_classes}")
+
+    model = PepSeqFFNN(
+        emb_dim=config.emb_dim,
+        hidden_sizes=config.hidden_sizes,
+        dropouts=config.dropouts,
+        num_classes=config.num_classes,
+        use_layer_norm=config.use_layer_norm,
+        use_residual=config.use_residual
+    )
+    model.load_state_dict(state, strict=True)
+    model.eval().to(device)
+
+    return model, config
+
+
+def infer_decision_threshold(checkpoint: Mapping[str, Any], default: float = 0.5) -> float:
+    """Use validation threshold saved by training if applicable."""
+    metrics = checkpoint.get("metrics", None) if isinstance(
+        checkpoint, Mapping) else None
+    if not isinstance(metrics, Mapping):
+        return default
+
+    thresh = metrics.get("threshold", None)
+    if thresh is None:
+        return default
+
+    try:
+        thresh = float(thresh)
+    except (TypeError, ValueError):
+        return default
+    if not math.isfinite(thresh) or thresh <= 0.0 or thresh >= 1.0:
+        return default
+
+    return thresh
 
 
 def _embed_protein_seq(protein_seq: str,
@@ -121,65 +225,49 @@ def _embed_protein_seq(protein_seq: str,
     return torch.from_numpy(rep_np)
 
 
-def predict(psp_model: PepSeqFFNN,
-            esm_model: torch.nn.Module,
-            layer: int,
-            batch_converter: esm.data.BatchConverter,
-            protein_seq: str,
-            peptide: str,
-            max_tokens: int,
-            device: str) -> Dict[str, Any]:
+def predict_protein(psp_model: PepSeqFFNN,
+                    esm_model: torch.nn.Module,
+                    layer: int,
+                    batch_converter: esm.data.BatchConverter,
+                    protein_seq: str,
+                    max_tokens: int,
+                    device: str,
+                    threshold: float = 0.5) -> Dict[str, Any]:
     """
-    Predicts the epitope class probabilities for a given peptide and the protein sequence it was generated from.
-
-    Parameters
-    ----------
-        psp_model : PepSeqFFNN
-            The trained PepSeqFFNN model to make predictions.
-        esm_model : torch.nn.Module
-            The model used to generate ESM-2 embeddings from. This model must match the training model.
-        layer : int
-            The model layer to extract embeddings from.
-        batch_converter : esm.data.BatchConverter
-            The ESM batch converter for tokenizing protein sequences.
-        protein_seq : str
-            The entire protein sequence used to derive the peptide.
-        peptide : str
-            The peptide sequence that may or may not contain epitopes.
-        max_tokens : int
-            Maximum number of tokens the ESM model can fit in its context window. Default is 1022.
-        device : str
-            The device to run the embedding model on (`"cpu"` or `"cuda"`).
-
-    Returns
-    -------
-        Dict[str, Any]
-            A dictionary containing the peptide, protein sequence, predicted probabilities for each class, 
-            predicted class name, predicted class index, and the largest predicted probability.
+    Predict residue-level binary epitope mask for one protein sequence
     """
+    if threshold <= 0.0 or threshold >= 1.0:
+        raise ValueError("threshold must be in (0.0, 1.0)")
+
     protein_seq = clean_seq(protein_seq)
-    peptide = clean_seq(peptide)
+    if not protein_seq:
+        raise ValueError("Protein sequence is empty after cleaning")
 
-    align_start, align_stop = _find_peptide_start_stop(protein_seq, peptide)
-
-    # generate embedding and get peptide-level embedding
+    # generate protein sequence residue embeddings
     protein_emb = _embed_protein_seq(
         protein_seq, esm_model, layer, batch_converter, device, max_tokens)
-    peptide_emb = protein_emb[align_start:align_stop, :]
-    X = peptide_emb.unsqueeze(0).to(device, non_blocking=True)
+    non_blocking = device.startswith("cuda") and torch.cuda.is_available()
+    X = protein_emb.unsqueeze(0).to(device, non_blocking=non_blocking)
 
-    # generate probability outputs (predictions)
+    # start inference
     with torch.inference_mode():
-        logits = psp_model(X)  # (1, 3)
-        probs = torch.softmax(logits, dim=-1)[0].detach().cpu().tolist()
+        logits = psp_model(X)  # (1, L)
+        if logits.dim() != 2 or logits.size(0) != 1:
+            raise ValueError(
+                f"Expected logits shape (1, L), got {tuple(logits.shape)}")
+        # get probabiity scores then assign binary values (1=def epitope, 0=not epitope)
+        probs = torch.sigmoid(logits)[0].detach().cpu()
+        mask = (probs >= threshold).to(torch.int64)
 
-    pred_idx = int(logits.argmax(dim=-1).item())
+    # build binary string
+    binary_mask = "".join("1" if int(x) == 1 else "0" for x in mask.tolist())
 
-    return {"peptide": peptide,
-            "protein": protein_seq,
-            "p_def_epitope": probs[0],
-            "p_uncertain": probs[1],
-            "p_not_epitope": probs[2],
-            "pred_class": CLASS_NAMES[pred_idx],
-            "pred_index": pred_idx,
-            "max_prob": max(probs)}
+    return {
+        "binary_mask": binary_mask,
+        "length": int(mask.numel()),
+        "n_epitopes": int(mask.sum().item()),
+        "frac_epitope": float(mask.float().mean().item()),
+        "p_epitope_mean": float(probs.mean().item()),
+        "p_epitope_max": float(probs.max().item()),
+        "threshold": threshold
+    }

@@ -8,13 +8,13 @@ venv/
 ENV/
 .vscode/
 smoketest/
-localdata/
-dist/
 .build_pyz/
 *.fasta
 *.csv
+*.xlsx
 *.tsv
 *.pt
 *.log
 *.txt
 *.pyz
+*.png

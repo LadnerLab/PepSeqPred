@@ -8,7 +8,7 @@ ID lists across DDP ranks for parallel trials.
 
 import math
 import random
-from typing import List, Dict, Tuple, Any, Optional
+from typing import List, Dict, Tuple, Any, Optional, Set
 
 
 def split_ids(ids: List[str], val_frac: float, seed: int) -> Tuple[List[str], List[str]]:
@@ -37,6 +37,75 @@ def split_ids(ids: List[str], val_frac: float, seed: int) -> Tuple[List[str], Li
     range_.shuffle(ids)
     n_val = int(len(ids) * val_frac)
     return ids[n_val:], ids[:n_val]
+
+
+def split_ids_grouped(
+    ids: List[str],
+    val_frac: float,
+    seed: int,
+    groups: Dict[str, str]
+) -> Tuple[List[str], List[str]]:
+    """
+    Split protein IDs into training and validation subsets while keeping (taxonomic) groups intact.
+
+    Any IDs missing from `groups` are treated as singleton groups.
+    """
+    ids = list(ids)
+    if val_frac < 0.0 or val_frac > 1.0:
+        return ids, []
+    if val_frac == 0.0:
+        return ids, []
+    if val_frac == 1.0:
+        return [], ids
+    if len(ids) == 0:
+        return [], []
+
+    n_val = int(len(ids) * val_frac)
+
+    # build group --> member IDs
+    group_to_ids: Dict[str, List[str]] = {}
+    for protein_id in ids:
+        # use protein_id as fallback
+        group_id = str(groups.get(protein_id, protein_id))
+        group_to_ids.setdefault(group_id, []).append(protein_id)
+
+    range_ = random.Random(seed)
+    group_items = list(group_to_ids.items())
+    # randomize order of equal-sized groupings
+    range_.shuffle(group_items)
+    # descending order families by size (not based on original insertions since shuffled)
+    group_items.sort(key=lambda x: -len(x[1]))
+
+    val_groups: Set[str] = set()
+    val_count = 0
+    remaining = sum(len(members) for _, members in group_items)
+
+    for group_id, members in group_items:
+        group_size = len(members)
+        remaining -= group_size
+
+        if val_count == n_val:
+            continue
+
+        diff_take = abs((val_count + group_size) - n_val)
+        diff_skip = abs(val_count - n_val)
+        take = diff_take < diff_skip
+
+        # if skipping makes target unreachable, force take
+        if (not take) and (val_count < n_val) and ((val_count + remaining) < n_val):
+            take = True
+
+        if take:
+            val_groups.add(group_id)
+            val_count += group_size
+
+    val_ids = [
+        pid for pid in ids if str(groups.get(pid, pid)) in val_groups
+    ]
+    train_ids = [
+        pid for pid in ids if str(groups.get(pid, pid)) not in val_groups
+    ]
+    return train_ids, val_ids
 
 
 def shard_ids_by_rank(ids: List[str], ddp: Dict[str, Any] | None) -> List[str]:

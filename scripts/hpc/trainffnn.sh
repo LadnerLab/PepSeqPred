@@ -61,6 +61,7 @@ SAVE_PATH="/scratch/$USER/models/ffnn_v1.0"
 NUM_WORKERS="${NUM_WORKERS:-1}"
 WINDOW_SIZE="${WINDOW_SIZE:-1000}"
 STRIDE="${STRIDE:-900}"
+SPLIT_TYPE="${SPLIT_TYPE:-id-family}" # id-family or id
 
 mkdir -p "${SAVE_PATH}"
 
@@ -81,16 +82,17 @@ fi
 ${LAUNCHER} torchrun --nproc_per_node=4 train_ffnn.pyz \
     --embedding-dirs "${EMBEDDING_DIRS[@]}" \
     --label-shards "${LABEL_SHARDS[@]}" \
-    --epochs "${EPOCHS}" \
-    --seed "${SEED}" \
-    --batch-size "${BATCH_SIZE}" \
-    --lr "${LR}" \
-    --wd "${WD}" \
-    --pos-weight "${POS_WEIGHT}" \
-    --val-frac "${VAL_FRAC}" \
-    --save-path "${SAVE_PATH}" \
-    --num-workers "${NUM_WORKERS}" \
-    --window-size "${WINDOW_SIZE}" \
-    --stride "${STRIDE}"
+    --epochs "$EPOCHS" \
+    --seed "$SEED" \
+    --batch-size "$BATCH_SIZE" \
+    --lr "$LR" \
+    --wd "$WD" \
+    --pos-weight "$POS_WEIGHT" \
+    --val-frac "$VAL_FRAC" \
+    --split-type "$SPLIT_TYPE" \
+    --save-path "$SAVE_PATH" \
+    --num-workers "$NUM_WORKERS" \
+    --window-size "$WINDOW_SIZE" \
+    --stride "$STRIDE"
 
 # USAGE: sbatch trainffnn.sh /scratch/$USER/esm2/artifacts/pts/shard_000 /scratch/$USER/esm2/artifacts/pts/shard_001 /scratch/$USER/esm2/artifacts/pts/shard_002 /scratch/$USER/esm2/artifacts/pts/shard_003 -- /scratch/$USER/labels/labels_shard_000.pt /scratch/$USER/labels/labels_shard_001.pt /scratch/$USER/labels/labels_shard_002.pt /scratch/$USER/labels/labels_shard_003.pt

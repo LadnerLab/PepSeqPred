@@ -39,7 +39,12 @@ from pepseqpred.core.data.proteindataset import ProteinDataset, pad_collate
 from pepseqpred.core.models.ffnn import PepSeqFFNN
 from pepseqpred.core.train.trainer import Trainer, TrainerConfig
 from pepseqpred.core.train.ddp import init_ddp
-from pepseqpred.core.train.split import split_ids, partition_ids_weighted, sort_ids_for_locality
+from pepseqpred.core.train.split import (
+    split_ids,
+    split_ids_grouped,
+    partition_ids_weighted,
+    sort_ids_for_locality
+)
 from pepseqpred.core.train.weights import compute_pos_neg_counts, global_pos_weight
 from pepseqpred.core.train.embedding import infer_emb_dim
 from pepseqpred.core.train.seed import set_all_seeds
@@ -183,6 +188,11 @@ def main() -> None:
                         type=int,
                         default=0,
                         help="If > 0, use only first N samples from dataset")
+    parser.add_argument("--split-type",
+                        type=str,
+                        default="id-family",
+                        choices=["id", "id-family"],
+                        help="Data partition type, use ID only or ID and taxonomic family.")
     parser.add_argument("--num-workers",
                         type=int,
                         default=4,
@@ -331,10 +341,48 @@ def main() -> None:
     if args.subset > 0:
         protein_ids = protein_ids[:args.subset]
 
-    # split within local rank
-    train_ids_all, val_ids_all = split_ids(protein_ids, args.val_frac, seed)
+    # parition data by ID + family or just ID
+    if args.split_type == "id-family":
+        family_groups: Dict[str, str] = {}
+        missing_family_ids = 0
+
+        for protein_id in protein_ids:
+            family = base_dataset.embedding_family_by_id.get(protein_id)
+            if family is None or str(family).strip() == "":
+                # singleton group when family missing fallback
+                family_groups[protein_id] = f"__missing_family__:{protein_id}"
+                missing_family_ids += 1
+            else:
+                family_groups[protein_id] = str(family)
+
+        train_ids_all, val_ids_all = split_ids_grouped(
+            protein_ids, args.val_frac, seed, family_groups
+        )
+
+        train_families = {family_groups[pid] for pid in train_ids_all}
+        val_families = {family_groups[pid] for pid in val_ids_all}
+        overlap = train_families & val_families
+        if overlap:
+            raise RuntimeError(
+                f"Family leakage detected for split_type='id-family': n_overlap={len(overlap)}"
+            )
+
+        if rank == 0:
+            logger.info("family_split_summary",
+                        extra={"extra": {
+                            "split_type": args.split_type,
+                            "train_ids": len(train_ids_all),
+                            "val_ids": len(val_ids_all),
+                            "val_families": len(val_families),
+                            "missing_family_ids": missing_family_ids
+                        }})
+    else:
+        train_ids_all, val_ids_all = split_ids(
+            protein_ids, args.val_frac, seed
+        )
+
     if len(train_ids_all) == 0:
-        raise ValueError(f"Rank {rank} got 0 train IDs after split")
+        raise ValueError("Global split produced 0 train IDs")
 
     # weight by embedding file size to reduce I/O
     id_weights: Dict[str, float] = {}

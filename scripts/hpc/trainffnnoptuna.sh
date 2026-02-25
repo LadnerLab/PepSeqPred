@@ -62,6 +62,7 @@ NUM_WORKERS="${NUM_WORKERS:-1}"
 WINDOW_SIZE="${WINDOW_SIZE:-1000}"
 STRIDE="${STRIDE:-900}"
 POS_WEIGHT="${POS_WEIGHT:-13.18999647945325}" # calculated from other script
+SPLIT_TYPE="${SPLIT_TYPE:-id-family}" # id-family or id
 
 # output paths
 SAVE_PATH="${SAVE_PATH:-/scratch/$USER/models/${STUDY_NAME}}"
@@ -122,6 +123,7 @@ ${LAUNCHER} torchrun --nproc_per_node=4 train_ffnn_optuna.pyz \
     --seed "$SEED" \
     --metric "$METRIC" \
     --val-frac "$VAL_FRAC" \
+    --split-type "$SPLIT_TYPE" \
     --subset "$SUBSET" \
     --num-workers "$NUM_WORKERS" \
     --save-path "$SAVE_PATH" \

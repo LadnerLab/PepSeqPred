@@ -19,6 +19,7 @@ Usage
 import argparse
 from pathlib import Path
 from typing import Dict
+import random
 import torch
 from torch.utils.data import DataLoader
 import torch.distributed as dist
@@ -306,6 +307,9 @@ def main() -> None:
             raise RuntimeError(
                 "At least one rank received 0 train IDs after weighted partitioning")
 
+    # shuffle train IDs per best deep learning practces
+    rng = random.Random(seed)
+    rng.shuffle(train_ids)
     train_data = ProteinDataset(
         embedding_dirs=embedding_dirs,
         label_shards=label_shards,

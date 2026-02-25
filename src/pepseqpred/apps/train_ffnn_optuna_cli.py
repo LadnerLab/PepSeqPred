@@ -26,6 +26,7 @@ Usage
 import argparse
 import json
 import time
+import random
 from pathlib import Path
 from typing import Any, Dict, Tuple
 import pandas as pd
@@ -455,6 +456,9 @@ def main() -> None:
             raise RuntimeError(
                 "At least one rank received 0 train IDs after weighted partitioning")
 
+    # shuffle train IDs per best deep learning practces
+    rng = random.Random(seed)
+    rng.shuffle(train_ids)
     train_data = ProteinDataset(
         embedding_dirs=embedding_dirs,
         label_shards=label_shards,

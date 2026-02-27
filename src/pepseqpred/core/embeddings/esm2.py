@@ -18,6 +18,7 @@ import esm
 import torch
 import numpy as np
 import pandas as pd
+from pepseqpred.core.io.keys import build_emb_stem, normalize_family_value
 
 
 def clean_seq(seq: str) -> str:
@@ -37,31 +38,6 @@ def clean_seq(seq: str) -> str:
     seq = (seq or "").upper().strip()
     allowed = set("ACDEFGHIKLMNPQRSTVWYBZXUO")
     return "".join([aa for aa in seq if aa in allowed])
-
-
-def parse_viral_family(oxx: str) -> str:
-    """
-    Extract viral family as the last non-empty token in an OXX taxonomy string.
-
-    Parameters
-    ----------
-        oxx : str
-            Taxonomy string formatted like "a,b,c,d".
-
-    Returns
-    -------
-        str
-            Viral family token.
-
-    Raises
-    ------
-        ValueError
-            If no non-empty tokens are present.
-    """
-    tokens = [token.strip() for token in str(oxx).split(",") if token.strip()]
-    if len(tokens) == 0:
-        raise ValueError(f"Could not parse viral family from OXX='{oxx}'")
-    return tokens[-1]
 
 
 def token_packed_batches(pairs: Iterable[Tuple[str, str]],
@@ -269,7 +245,7 @@ def append_seq_len(res_vec: np.ndarray, seq_len: int) -> np.ndarray:
 def esm_embeddings_from_fasta(fasta_df: pd.DataFrame,
                               id_col: str = "ID",
                               seq_col: str = "Sequence",
-                              oxx_col: str = "OXX",
+                              family_col: str = "viral_family",
                               model_name: str = "esm2_t33_650M_UR50D",
                               max_tokens: int = 1022,
                               batch_size: int = 8,
@@ -289,8 +265,8 @@ def esm_embeddings_from_fasta(fasta_df: pd.DataFrame,
             Column name for record IDs used as .pt filenames.
         seq_col : str
             Column name for sequences.
-        oxx_col : str
-            Column name containing OXX taxonomy strings.
+        family_col : str
+            Column name containing viral family values from metadata.
         model_name : str
             Name of the `esm.pretrained` model factory to call.
         max_tokens : int
@@ -334,35 +310,48 @@ def esm_embeddings_from_fasta(fasta_df: pd.DataFrame,
     if key_mode == "id-family" and key_delimiter == "":
         raise ValueError(
             "key_delimiter must not be empty when key_mode='id-family'")
-    if key_mode == "id-family" and oxx_col not in fasta_df.columns:
+    if key_mode == "id-family" and family_col not in fasta_df.columns:
         raise ValueError(
-            f"Missing required taxonomy column '{oxx_col}' for key_mode='id-family'")
+            f"Missing required family column '{family_col}' for key_mode='id-family'")
 
-    # clean sequences
     selected_cols = [id_col, seq_col]
-    if oxx_col in fasta_df.columns and oxx_col not in selected_cols:
-        selected_cols.append(oxx_col)
-    df = fasta_df[selected_cols].dropna().copy()
-    if key_mode == "id-family" and oxx_col not in df.columns:
+    if family_col in fasta_df.columns and family_col not in selected_cols:
+        selected_cols.append(family_col)
+    df = fasta_df[selected_cols].dropna(subset=[id_col, seq_col]).copy()
+    if key_mode == "id-family" and family_col not in df.columns:
         raise ValueError(
-            f"Missing required taxonomy column '{oxx_col}' after filtering")
+            f"Missing required family column '{family_col}' after filtering")
     df[id_col] = df[id_col].astype(str)
-    if oxx_col in df.columns:
-        df[oxx_col] = df[oxx_col].astype(str)
     df[seq_col] = df[seq_col].map(clean_seq)
     df = df[df[seq_col].str.len() > 0].reset_index(drop=True)
 
-    if key_mode == "id-family":
-        df["viral_family"] = df[oxx_col].map(parse_viral_family)
-        df["embedding_key"] = df[id_col] + key_delimiter + df["viral_family"]
+    if family_col in df.columns:
+        df["viral_family"] = df[family_col].map(normalize_family_value)
     else:
-        if oxx_col in df.columns:
-            df["viral_family"] = df[oxx_col].map(
-                lambda raw: ([token.strip() for token in str(
-                    raw).split(",") if token.strip()] or [""])[-1]
+        df["viral_family"] = ""
+
+    if key_mode == "id-family":
+        missing_family_mask = df["viral_family"].astype(str).str.strip() == ""
+        if bool(missing_family_mask.any()):
+            missing_examples = (
+                df.loc[missing_family_mask, id_col]
+                .drop_duplicates()
+                .head(10)
+                .tolist()
             )
-        else:
-            df["viral_family"] = ""
+            raise ValueError(
+                "Missing viral family values for id-family key mode, "
+                f"examples: {missing_examples}"
+            )
+        df["embedding_key"] = [
+            build_emb_stem(
+                str(protein_id),
+                viral_family=str(family),
+                delimiter=key_delimiter
+            )
+            for protein_id, family, in zip(df[id_col], df["viral_family"])
+        ]
+    else:
         df["embedding_key"] = df[id_col]
 
     # protect against key collisions (same key with conflicting sequences)
@@ -420,7 +409,6 @@ def esm_embeddings_from_fasta(fasta_df: pd.DataFrame,
     metadata_by_key = {
         str(row["embedding_key"]): {
             "protein_id": str(row[id_col]),
-            "oxx": str(row[oxx_col]) if oxx_col in df.columns else "",
             "viral_family": str(row["viral_family"]),
             "key_mode": key_mode,
             "key_delimiter": key_delimiter if key_mode == "id-family" else ""
@@ -478,7 +466,6 @@ def esm_embeddings_from_fasta(fasta_df: pd.DataFrame,
                     # save logs per-residue embeddings for short sequences
                     index_records.append({"id": seq_key,
                                           "protein_id": str(seq_meta.get("protein_id", "")),
-                                          "oxx": str(seq_meta.get("oxx", "")),
                                           "viral_family": str(seq_meta.get("viral_family", "")),
                                           "key_mode": str(seq_meta.get("key_mode", "")),
                                           "key_delimiter": str(seq_meta.get("key_delimiter", "")),
@@ -510,7 +497,6 @@ def esm_embeddings_from_fasta(fasta_df: pd.DataFrame,
                     # save logs per-residue embeddings for sliding window long sequences
                     index_records.append({"id": str(protein_key),
                                           "protein_id": str(seq_meta.get("protein_id", "")),
-                                          "oxx": str(seq_meta.get("oxx", "")),
                                           "viral_family": str(seq_meta.get("viral_family", "")),
                                           "key_mode": str(seq_meta.get("key_mode", "")),
                                           "key_delimiter": str(seq_meta.get("key_delimiter", "")),
@@ -542,7 +528,6 @@ def esm_embeddings_from_fasta(fasta_df: pd.DataFrame,
     index_columns = [
         "id",
         "protein_id",
-        "oxx",
         "viral_family",
         "key_mode",
         "key_delimiter",

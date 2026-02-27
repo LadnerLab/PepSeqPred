@@ -373,7 +373,7 @@ def main() -> None:
     model = PepSeqFFNN(emb_dim=emb_dim,
                        hidden_sizes=(150, 120, 45),
                        dropouts=(0.1, 0.1, 0.1),
-                       use_layer_norm=True,
+                       use_layer_norm=False,
                        use_residual=False,
                        num_classes=1)
 

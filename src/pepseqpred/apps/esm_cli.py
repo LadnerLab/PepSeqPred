@@ -28,6 +28,10 @@ import esm
 import torch
 from pepseqpred.core.io.logger import setup_logger
 from pepseqpred.core.io.read import read_fasta
+from pepseqpred.core.io.keys import (
+    build_id_to_family_from_metadata,
+    normalize_family_value
+)
 from pepseqpred.core.embeddings.esm2 import esm_embeddings_from_fasta
 
 
@@ -80,6 +84,24 @@ def main() -> None:
                         type=Path,
                         required=True,
                         help="Fasta file containing antigens")
+    parser.add_argument("--metadata-file",
+                        action="store",
+                        dest="metadata_file",
+                        type=Path,
+                        default=None,
+                        help="Metadata for naming, if omitted, tries <fasta>.metadata")
+    parser.add_argument("--metadata-name-column",
+                        action="store",
+                        dest="metadata_name_col",
+                        type=str,
+                        default="Name",
+                        help="Metadata column containing full FASTA header strings.")
+    parser.add_argument("--metadata-family-column",
+                        action="store",
+                        dest="metadata_family_col",
+                        type=str,
+                        default="Family",
+                        help="Metadata column containing family values.")
     parser.add_argument("-i", "--id-column",
                         action="store",
                         dest="id_col",
@@ -92,12 +114,6 @@ def main() -> None:
                         type=str,
                         default="Sequence",
                         help="Name of sequence column.")
-    parser.add_argument("--oxx-column",
-                        action="store",
-                        dest="oxx_col",
-                        type=str,
-                        default="OXX",
-                        help="Name of OXX taxonomy column.")
     parser.add_argument("--embedding-key-mode",
                         action="store",
                         dest="embedding_key_mode",
@@ -161,8 +177,73 @@ def main() -> None:
                     "visible_devices": os.getenv("CUDA_VISIBLE_DEVICES")
                 }})
 
-    # read input fasta file and sort by sequence length
+    metadata_file = None
+    if args.embedding_key_mode == "id-family":
+        metadata_file = args.metadata_file
+        if metadata_file is None:
+            inferred_metadata = args.fasta_file.with_suffix(".metadata")
+            if inferred_metadata.exists():
+                metadata_file = inferred_metadata
+        if metadata_file is None:
+            raise ValueError(
+                "Metadata file is required for --embedding-key-mode='id-family'"
+                "Pass --metadata-file or provide '<fasta>.metadata'"
+            )
+
+    # read fasta and attach metadata-based family naming
     fasta_df = read_fasta(args.fasta_file)
+    if metadata_file is not None and args.embedding_key_mode == "id-family":
+        if not metadata_file.exists():
+            raise FileNotFoundError(
+                f"Metadata file not found: {metadata_file}"
+            )
+        id_to_family, duplicate_same_family = build_id_to_family_from_metadata(
+            metadata_file,
+            name_col=args.metadata_name_col,
+            family_col=args.metadata_family_col
+        )
+
+        fasta_df[args.id_col] = fasta_df[args.id_col].astype(str)
+        mapped_family = fasta_df[args.id_col].map(id_to_family)
+        missing_id_mask = mapped_family.isna()
+        if bool(missing_id_mask.any()):
+            missing_examples = (
+                fasta_df.loc[missing_id_mask, [args.id_col]][args.id_col]
+                .drop_duplicates()
+                .head(10)
+                .tolist()
+            )
+            raise ValueError(
+                "Metadata naming map did not contain all FASTA IDs, "
+                f"missing examples: {missing_examples}"
+            )
+
+        fasta_df["viral_family"] = mapped_family.map(normalize_family_value)
+        if args.embedding_key_mode == "id-family":
+            missing_family_mask = fasta_df["viral_family"].astype(
+                str).str.strip() == ""
+            if bool(missing_family_mask.any()):
+                missing_examples = (
+                    fasta_df.loc[missing_family_mask,
+                                 [args.id_col]][args.id_col]
+                    .drop_duplicates()
+                    .head(10)
+                    .tolist()
+                )
+                raise ValueError(
+                    "Metadata Family is missing for some FASTA IDs while using id-family keys, "
+                    f"examples: {missing_examples}"
+                )
+
+        logger.info("metadata_naming_loaded",
+                    extra={"extra": {
+                        "metadata_file": str(metadata_file),
+                        "metadata_name_col": args.metadata_name_col,
+                        "metadata_family_col": args.metadata_family_col,
+                        "mapped_ids": len(id_to_family),
+                        "duplicate_ids_same_family": duplicate_same_family
+                    }})
+
     fasta_df["len"] = fasta_df[args.seq_col].str.len()
     fasta_df = fasta_df.sort_values("len").reset_index(drop=True)
 
@@ -199,6 +280,7 @@ def main() -> None:
                     "model_name": model_name,
                     "max_tokens": max_tokens,
                     "batch_size": batch_size,
+                    "metadata_file": str(metadata_file) if metadata_file is not None else None,
                     "embedding_key_mode": args.embedding_key_mode,
                     "key_delimiter": args.key_delimiter,
                     "output_path": str(os.path.abspath(out_dir)),
@@ -211,18 +293,20 @@ def main() -> None:
                     "n_sequences_shard": len(fasta_df)
                 }})
 
-    index_df, failed_seqs = esm_embeddings_from_fasta(fasta_df,
-                                                      id_col=args.id_col,
-                                                      seq_col=args.seq_col,
-                                                      oxx_col=args.oxx_col,
-                                                      model_name=model_name,
-                                                      max_tokens=max_tokens,
-                                                      batch_size=batch_size,
-                                                      per_seq_dir=out_dir/per_seq_dir,
-                                                      index_csv_path=out_dir/idx_csv_path,
-                                                      key_mode=args.embedding_key_mode,
-                                                      key_delimiter=args.key_delimiter,
-                                                      logger=logger)
+    index_df, failed_seqs = esm_embeddings_from_fasta(
+        fasta_df,
+        id_col=args.id_col,
+        seq_col=args.seq_col,
+        family_col="viral_family",
+        model_name=model_name,
+        max_tokens=max_tokens,
+        batch_size=batch_size,
+        per_seq_dir=out_dir/per_seq_dir,
+        index_csv_path=out_dir/idx_csv_path,
+        key_mode=args.embedding_key_mode,
+        key_delimiter=args.key_delimiter,
+        logger=logger
+    )
     logger.info("run_end", extra={"extra": {
         "failed_count": len(failed_seqs),
         "index_rows": len(index_df)

@@ -1,65 +1,103 @@
 """rename_embeddings_id_family.py
 
-Rename embedding files from `ID.pt` to `ID-family.pt` using FASTA headers.
+Rename embedding files from `ID.pt` to `ID-family.pt` using metadata Name/Family columns.
 
 Example
 -------
 Dry run:
     python scripts/tools/rename_embeddings_id_family.py \
-        --fasta /scratch/$USER/data/fulldesign_2019-02-27_wGBKsw.fasta \
+        --metadata /scratch/$USER/data/fulldesign_2019-02-27_wGBKsw.metadata \
         --emb-root /scratch/$USER/esm2/artifacts/pts
 
 Apply changes:
     python scripts/tools/rename_embeddings_id_family.py \
-        --fasta /scratch/$USER/data/fulldesign_2019-02-27_wGBKsw.fasta \
+        --metadata /scratch/$USER/data/fulldesign_2019-02-27_wGBKsw.metadata \
         --emb-root /scratch/$USER/esm2/artifacts/pts \
         --apply
 """
-
-from __future__ import annotations
-
 import argparse
+import csv
 import re
 import sys
 from pathlib import Path
 from typing import Dict, Iterable, List, Tuple
 
 
-HEADER_RE = re.compile(r"^>ID=([^\s]+)\s+AC=([^\s]+)\s+OXX=([^\s]+)\s*$")
+NAME_RE = re.compile(r"^ID=([^\s]+)\s+AC=([^\s]+)\s+OXX=([^\s]+)\s*$")
 
 
-def parse_family(oxx: str) -> str:
-    """Return the last non-empty OXX token."""
-    tokens = [token.strip() for token in str(oxx).split(",") if token.strip()]
-    if len(tokens) == 0:
-        raise ValueError(f"Could not parse family from OXX='{oxx}'")
-    return tokens[-1]
+def normalize_family(raw: str | None) -> str:
+    """Normalize family token read from metadata."""
+    if raw is None:
+        return ""
+    value = str(raw).strip()
+    if value == "" or value.lower() == "nan":
+        return ""
+    if value.endswith(".0") and value[:-2].isdigit():
+        return value[:-2]
+    return value
 
 
-def build_id_to_family(fasta_path: Path) -> Tuple[Dict[str, str], int]:
+def build_id_to_family(metadata_path: Path,
+                       name_col: str,
+                       family_col: str) -> Tuple[Dict[str, str], int, int]:
     """
-    Parse FASTA headers and build ID -> family mapping.
+    Parse metadata rows and build ID -> family mapping.
 
     Returns
     -------
-    Tuple[Dict[str, str], int]
-        Mapping plus count of duplicate IDs with the same family.
+    Tuple[Dict[str, str], int, int]
+        Mapping, count of duplicate IDs with the same family, and count of rows
+        where family was missing.
     """
     mapping: Dict[str, str] = {}
     duplicate_same_family = 0
+    missing_family_rows = 0
     conflicts: List[Tuple[str, str, str]] = []
+    parse_errors: List[Tuple[int, str]] = []
+    parse_error_count = 0
 
-    with fasta_path.open("r", encoding="utf-8") as fasta:
-        for raw in fasta:
-            line = raw.strip()
-            if not line.startswith(">"):
+    with metadata_path.open("r", encoding="utf-8", newline="") as meta_f:
+        reader = csv.DictReader(meta_f, delimiter="\t")
+        if reader.fieldnames is None:
+            raise ValueError(
+                f"Metadata file has no header row: {metadata_path}")
+        missing_cols = [
+            col for col in [name_col, family_col]
+            if col not in set(reader.fieldnames)
+        ]
+        if len(missing_cols) > 0:
+            raise ValueError(
+                f"Metadata file missing required columns {missing_cols}. "
+                f"Found columns: {reader.fieldnames}"
+            )
+
+        for row_idx, row in enumerate(reader, start=2):
+            fullname = str(row.get(name_col, "")).strip()
+            if fullname == "":
+                parse_error_count += 1
+                if len(parse_errors) < 10:
+                    parse_errors.append((row_idx, fullname))
                 continue
-            match_ = HEADER_RE.match(line)
+
+            match_ = NAME_RE.match(fullname)
             if match_ is None:
-                raise ValueError(f"Header does not match expected format: '{line}'")
+                parse_error_count += 1
+                if len(parse_errors) < 10:
+                    parse_errors.append((row_idx, fullname))
+                continue
 
             protein_id = match_.group(1)
-            family = parse_family(match_.group(3))
+            family = normalize_family(row.get(family_col))
+            if family == "":
+                # Missing families remain unmapped and will be reported by rename pass.
+                missing_family_rows += 1
+                continue
+            if not family.isdigit():
+                raise ValueError(
+                    f"Invalid family value '{family}' for ID '{protein_id}' at row {row_idx}. "
+                    "Expected numeric family."
+                )
 
             prev = mapping.get(protein_id)
             if prev is None:
@@ -69,16 +107,26 @@ def build_id_to_family(fasta_path: Path) -> Tuple[Dict[str, str], int]:
             else:
                 conflicts.append((protein_id, prev, family))
 
-    if len(conflicts) > 0:
+    if parse_error_count > 0:
         preview = ", ".join(
-            [f"{protein_id} ({old} vs {new})" for protein_id, old, new in conflicts[:5]]
+            [f"row={row_num} name='{name}'" for row_num,
+                name in parse_errors[:5]]
         )
         raise ValueError(
-            f"Found {len(conflicts)} ID->family conflicts in FASTA. "
+            f"Found {parse_error_count} invalid metadata Name rows. Examples: {preview}"
+        )
+
+    if len(conflicts) > 0:
+        preview = ", ".join(
+            [f"{protein_id} ({old} vs {new})" for protein_id,
+             old, new in conflicts[:5]]
+        )
+        raise ValueError(
+            f"Found {len(conflicts)} ID->family conflicts in metadata. "
             f"Examples: {preview}"
         )
 
-    return mapping, duplicate_same_family
+    return mapping, duplicate_same_family, missing_family_rows
 
 
 def collect_shard_dirs(emb_root: Path | None, shard_dirs: Iterable[Path]) -> List[Path]:
@@ -87,15 +135,18 @@ def collect_shard_dirs(emb_root: Path | None, shard_dirs: Iterable[Path]) -> Lis
 
     if emb_root is not None:
         if not emb_root.exists():
-            raise FileNotFoundError(f"Embedding root does not exist: {emb_root}")
-        root_shards = sorted([path for path in emb_root.glob("shard_*") if path.is_dir()])
+            raise FileNotFoundError(
+                f"Embedding root does not exist: {emb_root}")
+        root_shards = sorted(
+            [path for path in emb_root.glob("shard_*") if path.is_dir()])
         if len(root_shards) == 0:
             raise ValueError(f"No shard_* directories found under: {emb_root}")
         resolved.extend(root_shards)
 
     for shard_dir in shard_dirs:
         if not shard_dir.exists():
-            raise FileNotFoundError(f"Shard directory does not exist: {shard_dir}")
+            raise FileNotFoundError(
+                f"Shard directory does not exist: {shard_dir}")
         if not shard_dir.is_dir():
             raise ValueError(f"Expected directory, got file: {shard_dir}")
         resolved.append(shard_dir)
@@ -163,13 +214,14 @@ def rename_shard(
             missing_examples.append(stem)
 
     if len(collision_examples) > 0:
-        print(f"[warn] {shard_dir}: destination collisions={len(collision_examples)}", file=sys.stderr)
+        print(
+            f"[warn] {shard_dir}: destination collisions={len(collision_examples)}", file=sys.stderr)
         for src, dst in collision_examples:
             print(f"       src={src}", file=sys.stderr)
             print(f"       dst={dst}", file=sys.stderr)
 
     if len(missing_examples) > 0:
-        msg = f"[warn] {shard_dir}: missing FASTA IDs for {stats['missing_id']} files. examples={missing_examples}"
+        msg = f"[warn] {shard_dir}: missing metadata IDs/families for {stats['missing_id']} files. examples={missing_examples}"
         if fail_on_missing_id:
             raise ValueError(msg)
         print(msg, file=sys.stderr)
@@ -180,13 +232,25 @@ def rename_shard(
 def main() -> None:
     """CLI entrypoint."""
     parser = argparse.ArgumentParser(
-        description="Rename embedding files from ID.pt to ID-family.pt using FASTA OXX headers."
+        description="Rename embedding files from ID.pt to ID-family.pt using metadata Name/Family columns."
     )
     parser.add_argument(
-        "--fasta",
+        "--metadata",
         type=Path,
         required=True,
-        help="Path to FASTA file with headers in format: >ID=... AC=... OXX=...",
+        help="Path to metadata TSV containing Name and Family columns.",
+    )
+    parser.add_argument(
+        "--name-col",
+        type=str,
+        default="Name",
+        help="Metadata column containing full headers (default: Name).",
+    )
+    parser.add_argument(
+        "--family-col",
+        type=str,
+        default="Family",
+        help="Metadata column containing family values (default: Family).",
     )
     parser.add_argument(
         "--emb-root",
@@ -216,20 +280,25 @@ def main() -> None:
     parser.add_argument(
         "--fail-on-missing-id",
         action="store_true",
-        help="Fail if any embedding stem cannot be mapped from FASTA.",
+        help="Fail if any embedding stem cannot be mapped from metadata.",
     )
     args = parser.parse_args()
 
     if args.delimiter == "":
         raise ValueError("--delimiter must not be empty")
-    if not args.fasta.exists():
-        raise FileNotFoundError(f"FASTA file not found: {args.fasta}")
+    if not args.metadata.exists():
+        raise FileNotFoundError(f"Metadata file not found: {args.metadata}")
 
     shard_dirs = collect_shard_dirs(args.emb_root, args.shard_dirs)
-    id_to_family, duplicate_same_family = build_id_to_family(args.fasta)
+    id_to_family, duplicate_same_family, missing_family_rows = build_id_to_family(
+        metadata_path=args.metadata,
+        name_col=args.name_col,
+        family_col=args.family_col,
+    )
 
-    print(f"[info] FASTA IDs mapped: {len(id_to_family)}")
+    print(f"[info] Metadata IDs mapped: {len(id_to_family)}")
     print(f"[info] Duplicate IDs (same family): {duplicate_same_family}")
+    print(f"[info] Metadata rows with missing family: {missing_family_rows}")
     print(f"[info] Shards: {len(shard_dirs)}")
     print(f"[info] Mode: {'apply' if args.apply else 'dry-run'}")
 

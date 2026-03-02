@@ -13,11 +13,12 @@ import os
 import logging
 import time
 from pathlib import Path
-from typing import Optional, Iterable, Iterator, List, Tuple
+from typing import Optional, Iterable, Iterator, List, Tuple, Dict
 import esm
 import torch
 import numpy as np
 import pandas as pd
+from pepseqpred.core.io.keys import build_emb_stem, normalize_family_value
 
 
 def clean_seq(seq: str) -> str:
@@ -244,11 +245,14 @@ def append_seq_len(res_vec: np.ndarray, seq_len: int) -> np.ndarray:
 def esm_embeddings_from_fasta(fasta_df: pd.DataFrame,
                               id_col: str = "ID",
                               seq_col: str = "Sequence",
+                              family_col: str = "viral_family",
                               model_name: str = "esm2_t33_650M_UR50D",
                               max_tokens: int = 1022,
                               batch_size: int = 8,
                               per_seq_dir: Path | str = "esm2_per_seq",
                               index_csv_path: Path | str = "esm2_seq_index.csv",
+                              key_mode: str = "id-family",
+                              key_delimiter: str = "-",
                               logger: Optional[logging.Logger] = None) -> Tuple[pd.DataFrame, List[str]]:
     """
     Generate per residue ESM embeddings for sequences in a DataFrame and write outputs.
@@ -261,6 +265,8 @@ def esm_embeddings_from_fasta(fasta_df: pd.DataFrame,
             Column name for record IDs used as .pt filenames.
         seq_col : str
             Column name for sequences.
+        family_col : str
+            Column name containing viral family values from metadata.
         model_name : str
             Name of the `esm.pretrained` model factory to call.
         max_tokens : int
@@ -272,6 +278,12 @@ def esm_embeddings_from_fasta(fasta_df: pd.DataFrame,
             The directoyy to store .pt files.
         index_csv_path : str or Path
             Output CSV with metadata about stored arrays.
+        key_mode : str
+            Filename key strategy.
+            - "id": use `id_col` value.
+            - "id-family": use `{id_col}{key_delimiter}{viral_family}`.
+        key_delimiter : str
+            Delimiter between ID and viral family when `key_mode` is "id-family".
         logger : logging.Logger or None
             Logger to use. If None, uses esm_cli logger.
 
@@ -287,14 +299,92 @@ def esm_embeddings_from_fasta(fasta_df: pd.DataFrame,
     t0 = time.perf_counter()
 
     # set up directories to save results
+    per_seq_dir = Path(per_seq_dir)
+    index_csv_path = Path(index_csv_path)
     per_seq_dir.mkdir(parents=True, exist_ok=True)
 
-    # clean sequences
-    df = fasta_df[[id_col, seq_col]].dropna().copy()
+    # handle missing/invald parameter filename parameters
+    if key_mode not in {"id", "id-family"}:
+        raise ValueError(
+            f"Unsupported key_mode='{key_mode}', expected one of: id, id-family")
+    if key_mode == "id-family" and key_delimiter == "":
+        raise ValueError(
+            "key_delimiter must not be empty when key_mode='id-family'")
+    if key_mode == "id-family" and family_col not in fasta_df.columns:
+        raise ValueError(
+            f"Missing required family column '{family_col}' for key_mode='id-family'")
+
+    selected_cols = [id_col, seq_col]
+    if family_col in fasta_df.columns and family_col not in selected_cols:
+        selected_cols.append(family_col)
+    df = fasta_df[selected_cols].dropna(subset=[id_col, seq_col]).copy()
+    if key_mode == "id-family" and family_col not in df.columns:
+        raise ValueError(
+            f"Missing required family column '{family_col}' after filtering")
+    df[id_col] = df[id_col].astype(str)
     df[seq_col] = df[seq_col].map(clean_seq)
     df = df[df[seq_col].str.len() > 0].reset_index(drop=True)
+
+    if family_col in df.columns:
+        df["viral_family"] = df[family_col].map(normalize_family_value)
+    else:
+        df["viral_family"] = ""
+
+    if key_mode == "id-family":
+        missing_family_mask = df["viral_family"].astype(str).str.strip() == ""
+        if bool(missing_family_mask.any()):
+            missing_examples = (
+                df.loc[missing_family_mask, id_col]
+                .drop_duplicates()
+                .head(10)
+                .tolist()
+            )
+            raise ValueError(
+                "Missing viral family values for id-family key mode, "
+                f"examples: {missing_examples}"
+            )
+        df["embedding_key"] = [
+            build_emb_stem(
+                str(protein_id),
+                viral_family=str(family),
+                delimiter=key_delimiter
+            )
+            for protein_id, family, in zip(df[id_col], df["viral_family"])
+        ]
+    else:
+        df["embedding_key"] = df[id_col]
+
+    # protect against key collisions (same key with conflicting sequences)
+    seen_key_to_seq: Dict[str, str] = {}
+    keep_mask: List[bool] = []
+    dropped_exact_duplicates = 0
+    for _, row in df.iterrows():
+        key = str(row["embedding_key"])
+        seq = str(row[seq_col])
+        prev_seq = seen_key_to_seq.get(key)
+        if prev_seq is None:
+            seen_key_to_seq[key] = seq
+            keep_mask.append(True)
+        elif prev_seq == seq:
+            keep_mask.append(False)
+            dropped_exact_duplicates += 1
+        else:
+            raise ValueError(
+                f"Conflicting sequences map to the same embedding key '{key}'. "
+                "Choose a different key mode or fix input FASTA duplicates."
+            )
+    if dropped_exact_duplicates > 0:
+        df = df.loc[keep_mask].reset_index(drop=True)
+        logger.info("deduped_embedding_keys", extra={"extra": {
+            "dropped_exact_duplicates": dropped_exact_duplicates
+        }})
+
     logger.info("embedding_start", extra={
-                "extra": {"total_sequences": len(df)}})
+                "extra": {
+                    "total_sequences": len(df),
+                    "key_mode": key_mode,
+                    "key_delimiter": key_delimiter
+                }})
 
     # load ESM embedding model
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -313,9 +403,18 @@ def esm_embeddings_from_fasta(fasta_df: pd.DataFrame,
     }})
 
     # prepare batches
-    ids = df[id_col].tolist()
+    keys = df["embedding_key"].tolist()
     seqs = df[seq_col].tolist()
-    seq_pairs = list(zip(ids, seqs))
+    seq_pairs = list(zip(keys, seqs))
+    metadata_by_key = {
+        str(row["embedding_key"]): {
+            "protein_id": str(row[id_col]),
+            "viral_family": str(row["viral_family"]),
+            "key_mode": key_mode,
+            "key_delimiter": key_delimiter if key_mode == "id-family" else ""
+        }
+        for _, row in df.iterrows()
+    }
 
     failed_seqs = []
 
@@ -354,17 +453,22 @@ def esm_embeddings_from_fasta(fasta_df: pd.DataFrame,
                     per_residue = reprs[j, 1:1 + len_]  # L by D
                     # per-residue embeddings
                     res_vec = per_residue.cpu().numpy().astype(np.float32)  # (L, D)
-                    seq_id = batch[batch_idx][0]
+                    seq_key = str(batch[batch_idx][0])
+                    seq_meta = metadata_by_key.get(seq_key, {})
 
                     # append sequence length column
                     res_vec = append_seq_len(res_vec, len_)  # (L, D+1)
 
                     # save as .pt per sequence
                     torch.save(torch.from_numpy(res_vec),
-                               per_seq_dir / f"{seq_id}.pt")
+                               per_seq_dir / f"{seq_key}.pt")
 
                     # save logs per-residue embeddings for short sequences
-                    index_records.append({"id": seq_id,
+                    index_records.append({"id": seq_key,
+                                          "protein_id": str(seq_meta.get("protein_id", "")),
+                                          "viral_family": str(seq_meta.get("viral_family", "")),
+                                          "key_mode": str(seq_meta.get("key_mode", "")),
+                                          "key_delimiter": str(seq_meta.get("key_delimiter", "")),
                                           # L
                                           "length": int(res_vec.shape[0]),
                                           # D
@@ -373,12 +477,11 @@ def esm_embeddings_from_fasta(fasta_df: pd.DataFrame,
                                           "original_seq_len": int(len_),
                                           "handle": "short",
                                           "model": model_name,
-                                          "storage": ".pt",
-                                          "path": str(per_seq_dir / f"{seq_id}.pt")})
+                                          "storage": ".pt"})
 
             # handle long sequences
             for batch_idx in long_idxs:
-                protein_id, protein_seq = batch[batch_idx]
+                protein_key, protein_seq = batch[batch_idx]
                 try:
                     single_token = tokens[batch_idx:batch_idx + 1]
                     # default uses sliding window to cover entirety of long sequence
@@ -390,23 +493,27 @@ def esm_embeddings_from_fasta(fasta_df: pd.DataFrame,
                     res_vec = append_seq_len(
                         res_vec, len(protein_seq))  # (L, D+1)
 
+                    seq_meta = metadata_by_key.get(str(protein_key), {})
                     # save logs per-residue embeddings for sliding window long sequences
-                    index_records.append({"id": protein_id,
+                    index_records.append({"id": str(protein_key),
+                                          "protein_id": str(seq_meta.get("protein_id", "")),
+                                          "viral_family": str(seq_meta.get("viral_family", "")),
+                                          "key_mode": str(seq_meta.get("key_mode", "")),
+                                          "key_delimiter": str(seq_meta.get("key_delimiter", "")),
                                           "length": int(res_vec.shape[0]),
                                           "embed_dim": int(res_vec.shape[1]),
                                           "original_seq_len": len(protein_seq),
                                           "handle": "long",
                                           "model": model_name,
-                                          "storage": ".pt",
-                                          "path": str(per_seq_dir / f"{protein_id}.pt")})
+                                          "storage": ".pt"})
 
                     torch.save(torch.from_numpy(res_vec),
-                               per_seq_dir / f"{protein_id}.pt")
+                               per_seq_dir / f"{protein_key}.pt")
                 except Exception as e:
                     logger.error("sequence_failed", extra={"extra": {
-                        "id": protein_id, "error": repr(e)
+                        "id": str(protein_key), "error": repr(e)
                     }})
-                    failed_seqs.append(protein_id)
+                    failed_seqs.append(str(protein_key))
 
         # make regular progress updates
         done += len(batch)
@@ -418,19 +525,40 @@ def esm_embeddings_from_fasta(fasta_df: pd.DataFrame,
         }})
 
     # metadata to describe embeddings
-    index_df = pd.DataFrame(index_records, columns=[
-        "id", "length", "embed_dim", "original_seq_len", "handle", "model"
-    ])
+    index_columns = [
+        "id",
+        "protein_id",
+        "viral_family",
+        "key_mode",
+        "key_delimiter",
+        "length",
+        "embed_dim",
+        "original_seq_len",
+        "handle",
+        "model",
+        "storage",
+        "file_path"
+    ]
+    if len(index_records) > 0:
+        index_df = pd.DataFrame(index_records)
+    else:
+        index_df = pd.DataFrame(columns=index_columns)
 
     base = Path(per_seq_dir).resolve()
-    index_df["file_path"] = index_df["id"].astype(
-        str).map(lambda s: str(base / f"{s}.pt"))
+    if "id" in index_df.columns:
+        index_df["file_path"] = index_df["id"].astype(str).map(
+            lambda s: str(base / f"{s}.pt"))
+    else:
+        index_df["file_path"] = pd.Series(dtype=object)
+
+    index_df = index_df.reindex(columns=index_columns)
     index_df.to_csv(index_csv_path, index=False)
 
     # summarize in log
     elapsed = time.perf_counter() - t0
     ok_count = len(index_records)
-    by_handle = index_df["handle"].value_counts().to_dict()
+    by_handle = index_df["handle"].value_counts(
+    ).to_dict() if "handle" in index_df.columns else {}
     logger.info("embedding_done", extra={"extra": {
         "ok": ok_count,
         "failed": len(failed_seqs),

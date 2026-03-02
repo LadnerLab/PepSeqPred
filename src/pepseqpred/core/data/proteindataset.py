@@ -9,20 +9,60 @@ embedding/label/mask tuples (optionally with metadata) for training and evaluati
 """
 
 from pathlib import Path
-from typing import List, Dict, Iterator, Iterable, Tuple, Sequence, Optional
+from typing import List, Dict, Iterator, Iterable, Tuple, Sequence, Optional, Literal
 import torch
 from torch.nn.utils.rnn import pad_sequence
 from torch.nn.functional import pad
 from torch.utils.data import IterableDataset, get_worker_info
+from pepseqpred.core.io.keys import parse_emb_stem
 
 
-def _build_embedding_index(embedding_dirs: List[Path]) -> Dict[str, Path]:
-    """Builds protein_id --> embedding_path from multiple shard directories."""
-    index: Dict[str, Path] = {}
-    for emb_dir in embedding_dirs:
+def _build_embedding_index(
+        emb_dirs: List[Path],
+        delimeter: str = "-"
+) -> Tuple[Dict[str, Path], Dict[str, str], Dict[str, Literal["id", "id-family"]]]:
+    """
+    Builds:
+        - embedding_index: protein_id --> embedding_path
+        - family_by_id: protein_id --> viral_family (if applicable)
+        - scheme_by_id: protein_id --> filename scheme ('id' or 'id-family')
+    """
+    emb_index: Dict[str, Path] = {}
+    family_by_id: Dict[str, str] = {}
+    scheme_by_id: Dict[str, Literal["id", "id-family"]] = {}
+
+    for emb_dir in emb_dirs:
         for pt_path in emb_dir.glob("*.pt"):
-            index[pt_path.stem] = pt_path
-    return index
+            protein_id, family, scheme = parse_emb_stem(
+                pt_path.stem, delimiter=delimeter)
+
+            # check for duplicates
+            prev_path = emb_index.get(protein_id)
+            if prev_path is not None and prev_path != pt_path:
+                raise ValueError(
+                    f"Duplicate embedding for protein_id={protein_id} found: "
+                    f"{prev_path} vs {pt_path}"
+                )
+            emb_index[protein_id] = pt_path
+
+            # build scheme index
+            prev_scheme = scheme_by_id.get(protein_id)
+            if prev_scheme is None:
+                scheme_by_id[protein_id] = scheme
+            elif prev_scheme != scheme:
+                scheme_by_id[protein_id] = "id-family"
+
+            # validate families
+            if family is not None:
+                prev_family = family_by_id.get(protein_id)
+                if prev_family is not None and prev_family != family:
+                    raise ValueError(
+                        f"Conflicting families for protein_id={protein_id}: "
+                        f"{prev_family} vs {family}"
+                    )
+                family_by_id[protein_id] = family
+
+    return emb_index, family_by_id, scheme_by_id
 
 
 def _build_label_index(label_shards: List[Path | str]) -> Dict[str, Path]:
@@ -93,7 +133,7 @@ class ProteinDataset(IterableDataset):
     -----------------------
     Embeddings:
         One .pt file per protein, stored under one or more directories.
-        The filename stem must equal protein_id.
+        The filename stem may be either protein_id or protein_id-family.
         File contents should be a tensor of shape (L, D).
 
     Labels:
@@ -165,6 +205,7 @@ class ProteinDataset(IterableDataset):
         protein_ids: Optional[Sequence[str]] = None,
         label_index: Optional[Dict[str, Path]] = None,
         embedding_index: Optional[Dict[str, Path]] = None,
+        embedding_key_delimiter: str = "-",
         window_size: Optional[int] = 1000,
         stride: Optional[int] = 900,
         collapse_labels: bool = True,
@@ -185,13 +226,34 @@ class ProteinDataset(IterableDataset):
         self.delete_embedding_files = delete_embedding_files
         self.cache_current_label_shard = cache_current_label_shard
         self.drop_label_after_use = drop_label_after_use
+        self.embedding_key_delimiter = embedding_key_delimiter
 
         # ensure embedding index exists for fast lookup
         if embedding_index is None:
-            self.embedding_index = _build_embedding_index(self.embedding_dirs)
+            (self.embedding_index,
+             self.embedding_family_by_id,
+             self.embedding_key_scheme_by_id) = _build_embedding_index(
+                 self.embedding_dirs,
+                 delimeter=self.embedding_key_delimiter)
         else:
             self.embedding_index = {str(k): Path(v)
                                     for k, v in embedding_index.items()}
+            self.embedding_family_by_id = {}
+            self.embedding_key_scheme_by_id = {}
+
+            # build family and scheme indexes when given existing index
+            for protein_id, emb_path in self.embedding_index.items():
+                parsed_id, family, scheme = parse_emb_stem(
+                    Path(emb_path).stem,
+                    delimiter=self.embedding_key_delimiter
+                )
+                if parsed_id != protein_id:
+                    raise ValueError(
+                        f"Embedding index key mismatch: key={protein_id}, stem={Path(emb_path).stem}"
+                    )
+                self.embedding_key_scheme_by_id[protein_id] = scheme
+                if family is not None:
+                    self.embedding_family_by_id[protein_id] = family
 
         # ensure label index exists for fast lookup
         if label_index is None:

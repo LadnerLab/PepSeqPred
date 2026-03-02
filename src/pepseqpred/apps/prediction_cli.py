@@ -12,13 +12,11 @@ Usage
 """
 import argparse
 from pathlib import Path
-from typing import Any, Tuple, Iterator
+from typing import Tuple, Iterator
 import torch
 import esm
-import pandas as pd
 from pepseqpred.core.io.logger import setup_logger
 from pepseqpred.core.embeddings.esm2 import clean_seq
-from pepseqpred.core.models.ffnn import PepSeqFFNN
 from pepseqpred.core.predict.inference import (
     build_model_from_checkpoint,
     infer_decision_threshold,

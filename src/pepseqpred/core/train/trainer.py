@@ -346,7 +346,7 @@ class Trainer:
             out["eval_metrics"] = eval_metrics
         return out
 
-    def fit(self, save_dir: Optional[Path | str] = None) -> None:
+    def fit(self, save_dir: Optional[Path | str] = None, score_key: str = "loss") -> Dict[str, Any]:
         """
         Fits a neural network model to the data provided.
 
@@ -354,9 +354,20 @@ class Trainer:
         ----------
             save_dir : Path or str or None
                 An optional path to a directory to save the best performing model to.
+            score_key : str
+                Score key used to determine the "best" model trained/evaluated so far. Default is `"loss"`.
+
+        Returns
+        -------
+            summary : Dict[str, Any]
+                A short summary dictionary including `"best_epoch"`, `"best_val_loss"`, 
+                `"best_score_key"`, `"best_score_value"`, and `"best_metrics"` for downstream analysis.
         """
         best_val_loss = float("inf")
+        best_score = -float("inf")
+        best_epoch = -1
         best_metrics: Dict[str, Any] = {}
+
         if save_dir is not None:
             save_dir = Path(save_dir)
             save_dir.mkdir(parents=True, exist_ok=True)
@@ -402,25 +413,54 @@ class Trainer:
                                      }})
 
                 # save from validated model only
-                if save_dir is not None:
-                    metric_loss = eval_out["loss"]
-                    if metric_loss < best_val_loss:
+                if save_dir is not None and ddp_rank() == 0 and eval_out["eval_metrics"] is not None:
+                    metric_loss = float(eval_out["loss"])
+                    metrics = dict(eval_out["eval_metrics"])
+                    metric_score = float(metrics.get(score_key, float(
+                        "nan"))) if score_key != "loss" else -metric_loss
+
+                    is_better = False
+                    if score_key == "loss":
+                        is_better = metric_loss < best_val_loss
+                    elif np.isfinite(metric_score):
+                        # better if score higher or score same but loss is lower
+                        is_better = (metric_score > best_score) or (
+                            metric_score == best_score and metric_loss < best_val_loss
+                        )
+
+                    if is_better:
                         best_val_loss = metric_loss
-                        best_metrics = eval_out["eval_metrics"]
+                        best_score = metric_score
+                        best_epoch = int(epoch)
+                        best_metrics = dict(metrics)
+                        best_metrics["best_score_key"] = score_key
+                        best_metrics["best_score_value"] = float(metric_score)
+                        best_metrics["best_val_loss"] = float(best_val_loss)
+                        best_metrics["best_epoch"] = int(best_epoch)
                         self._save_checkpoint(
-                            save_dir / "best_model.pt", epoch, best_val_loss, metrics=best_metrics)
+                            save_dir / "best_model.pt",
+                            epoch,
+                            best_val_loss,
+                            metrics=best_metrics
+                        )
 
         # final check to save a model if no validation set
         if self.val_loader is None and save_dir is not None:
             self._save_checkpoint(save_dir / "best_model_no_val.pt",
                                   self.config.epochs - 1, float(train_metrics["loss"]))
 
+        summary = {
+            "best_epoch": int(best_epoch),
+            "best_val_loss": float(best_val_loss) if self.val_loader is not None else float(train_metrics["loss"]),
+            "best_score_key": score_key,
+            "best_score_value": float(best_score) if self.val_loader is not None else float("nan"),
+            "best_metrics": best_metrics if self.val_loader is not None else None
+        }
+
         if ddp_rank() == 0:
-            self.logger.info("training_done",
-                             extra={"extra": {
-                                 "best_loss": best_val_loss if self.val_loader is not None else train_metrics["loss"],
-                                 "best_metrics": best_metrics if self.val_loader is not None else None
-                             }})
+            self.logger.info("training_done", extra={"extra": summary})
+
+        return summary
 
     def _save_checkpoint(self, path: Path | str, epoch: int, loss: float, metrics: Optional[Dict[str, Any]] = None) -> None:
         """Saves model checkpoint to path."""

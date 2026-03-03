@@ -17,14 +17,19 @@ Usage
 """
 
 import argparse
+import json
+import math
+import time
 from pathlib import Path
-from typing import Dict
+from typing import Dict, List, Any
 import random
 import torch
 from torch.utils.data import DataLoader
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
+import pandas as pd
 from pepseqpred.core.io.logger import setup_logger
+from pepseqpred.core.io.write import append_csv_row
 from pepseqpred.core.data.proteindataset import ProteinDataset, pad_collate
 from pepseqpred.core.models.ffnn import PepSeqFFNN
 from pepseqpred.core.train.trainer import Trainer, TrainerConfig
@@ -38,6 +43,89 @@ from pepseqpred.core.train.split import (
 from pepseqpred.core.train.weights import compute_pos_neg_counts, global_pos_weight
 from pepseqpred.core.train.embedding import infer_emb_dim
 from pepseqpred.core.train.seed import set_all_seeds
+
+
+def parse_seed_csv(raw: str, arg_name: str) -> List[int]:
+    """
+    Parses comma-separated seed values into a list.
+
+    For example, `"11,22,33,44,55"` becomes `[11, 22, 33, 44, 55]`.
+
+    Parameters
+    ----------
+        raw : str
+            The CSV string of seed values.
+        arg_name : str
+            Either `"--split-seeds"` or `"--train-seeds"` for error handling.
+
+    Returns
+    -------
+        List[int]
+            The CSV seeds as a list of integers.
+
+    Raises
+    ------
+        ValueError
+            If the string is empty or if the numbers are not integers when parsed.
+    """
+    tokens = [tok.strip() for tok in raw.split(",") if tok.strip()]
+    if not tokens:
+        raise ValueError(f"{arg_name} cannot be empty")
+    try:
+        return [int(tok) for tok in tokens]
+    except ValueError as e:
+        raise ValueError(f"{arg_name} must be a CSV list of integers") from e
+
+
+def summarize_numeric(series: pd.Series) -> Dict[str, Any]:
+    """
+    Generates a statistical summary given an input series.
+
+    Parameters
+    ----------
+        series : pd.Series
+            The input series which could be one or more metrics from training/eval.
+
+    Returns
+    -------
+        Dict[str, Any]
+            A dictionary containing the count, mean, standard deviation, minimum, and 
+            maximum summary statistics for the input series.
+    """
+    vals = pd.to_numeric(series, errors="coerce").dropna()
+    vals = vals[vals.map(lambda x: math.isfinite(float(x)))]
+    if vals.empty:
+        return {"count": 0, "mean": None, "std": None, "min": None, "max": None}
+    return {
+        "count": int(vals.shape[0]),
+        "mean": float(vals.mean()),
+        "std": float(vals.std(ddof=1)) if vals.shape[0] > 1 else 0.0,
+        "min": float(vals.min()),
+        "max": float(vals.max())
+    }
+
+
+def _sanitize_for_json(value: Any) -> Any:
+    """Recursive function to ensure all values are JSON-sanitized."""
+    # recurse into dictionary and convert to float or None
+    if isinstance(value, dict):
+        return {k: _sanitize_for_json(v) for k, v in value.items()}
+    # recurse into list and convert to float or None
+    if isinstance(value, list):
+        return [_sanitize_for_json(v) for v in value]
+    # convert current value to float or None
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    return value
+
+
+def _finite_or_none(value: Any) -> float | None:
+    """Tries to convert number to float if finite, otherwise returns None."""
+    try:
+        num = float(value)
+    except (TypeError, ValueError):
+        return None
+    return num if math.isfinite(num) else None
 
 
 def main() -> None:
@@ -151,6 +239,24 @@ def main() -> None:
                         dest="drop_label_after_use",
                         action="store_false",
                         help="Keep labels in memory after each protein is processed")
+    parser.add_argument("--split-seeds",
+                        type=str,
+                        default=None,
+                        help="CSV split seeds (e.g., 11,22,33)")
+    parser.add_argument("--train-seeds",
+                        type=str,
+                        default=None,
+                        help="CSV train seeds (e.g., 44,55,66)")
+    parser.add_argument("--best-model-metric",
+                        type=str,
+                        default="pr_auc",
+                        choices=["loss", "precision", "recall",
+                                 "f1", "mcc", "auc", "auc10", "pr_auc", "res_balanced_acc"],
+                        help="Metric used to choose the best model checkpoint per run")
+    parser.add_argument("--results-csv",
+                        type=Path,
+                        default=None,
+                        help="Optional CSV output path for per-run results")
 
     args = parser.parse_args()
     logger = setup_logger(json_lines=True,
@@ -174,9 +280,26 @@ def main() -> None:
     if ddp is not None and rank != 0:
         logger.disabled = True
 
-    # set random number seeds
-    seed = args.seed
-    set_all_seeds(seed)
+    # handle splitting and training seeds for robust training
+    if args.split_seeds is None and args.train_seeds is None:
+        split_seeds = [int(args.seed)]
+        train_seeds = [int(args.seed)]
+    elif args.split_seeds is None or args.train_seeds is None:
+        raise ValueError(
+            "Provide both --split-seeds and --train-seeds together"
+        )
+    else:
+        split_seeds = parse_seed_csv(args.split_seeds, "--split-seeds")
+        train_seeds = parse_seed_csv(args.train_seeds, "--train-seeds")
+
+    if len(split_seeds) != len(train_seeds):
+        raise ValueError(
+            "--split-seeds and --train-seeds must be the same length"
+        )
+
+    results_csv = args.results_csv or (
+        args.save_path / "multi_run_results.csv")
+    run_rows: List[Dict[str, Any]] = []
 
     embedding_dirs = list(args.embedding_dirs)
     label_shards = list(args.label_shards)
@@ -199,10 +322,9 @@ def main() -> None:
         protein_ids = protein_ids[:args.subset]
 
     # parition data by ID + family or just ID
+    family_groups: Dict[str, str] = {}
+    missing_family_ids = 0
     if args.split_type == "id-family":
-        family_groups: Dict[str, str] = {}
-        missing_family_ids = 0
-
         for protein_id in protein_ids:
             family = base_dataset.embedding_family_by_id.get(protein_id)
             if family is None or str(family).strip() == "":
@@ -211,35 +333,6 @@ def main() -> None:
                 missing_family_ids += 1
             else:
                 family_groups[protein_id] = str(family)
-
-        train_ids_all, val_ids_all = split_ids_grouped(
-            protein_ids, args.val_frac, seed, family_groups
-        )
-
-        train_families = {family_groups[pid] for pid in train_ids_all}
-        val_families = {family_groups[pid] for pid in val_ids_all}
-        overlap = train_families & val_families
-        if overlap:
-            raise RuntimeError(
-                f"Family leakage detected for split_type='id-family': n_overlap={len(overlap)}"
-            )
-
-        if rank == 0:
-            logger.info("family_split_summary",
-                        extra={"extra": {
-                            "split_type": args.split_type,
-                            "train_ids": len(train_ids_all),
-                            "val_ids": len(val_ids_all),
-                            "val_families": len(val_families),
-                            "missing_family_ids": missing_family_ids
-                        }})
-    else:
-        train_ids_all, val_ids_all = split_ids(
-            protein_ids, args.val_frac, seed
-        )
-
-    if len(train_ids_all) == 0:
-        raise ValueError("Global split produced 0 train IDs")
 
     # estimate relative workload without tensor I/O by using embedding file size.
     id_weights: Dict[str, float] = {}
@@ -258,79 +351,85 @@ def main() -> None:
         for protein_id in protein_ids
     }
 
-    if ddp is None:
-        train_ids = sort_ids_for_locality(train_ids_all, id_groups)
-        val_ids = sort_ids_for_locality(val_ids_all, id_groups)
-    else:
-        if rank == 0:
-            payload = {
-                "train_ids_by_rank": partition_ids_weighted(
-                    train_ids_all,
-                    world_size,
-                    weights=id_weights,
-                    groups=id_groups,
-                    ensure_non_empty=True
-                ),
-                "val_ids_by_rank": partition_ids_weighted(
-                    val_ids_all,
-                    world_size,
-                    weights=id_weights,
-                    groups=id_groups,
-                    ensure_non_empty=False
+    # per-run loop
+    for run_index, (split_seed, train_seed) in enumerate(zip(split_seeds, train_seeds), start=1):
+        set_all_seeds(train_seed)
+
+        # split with split_seed (by ID or ID-family)
+        if args.split_type == "id-family":
+            train_ids_all, val_ids_all = split_ids_grouped(
+                protein_ids, args.val_frac, split_seed, family_groups)
+            train_families = {family_groups[pid] for pid in train_ids_all}
+            val_families = {family_groups[pid] for pid in val_ids_all}
+            overlap = train_families & val_families
+            if overlap:
+                raise RuntimeError(
+                    f"Family leakage detected: n_overlap={len(overlap)}"
                 )
-            }
         else:
-            payload = {}
+            train_ids_all, val_ids_all = split_ids(
+                protein_ids, args.val_frac, split_seed)
 
-        obj = [payload]
-        dist.broadcast_object_list(obj, src=0)
-        payload = obj[0]
+        if len(train_ids_all) == 0:
+            raise ValueError("Global split produced 0 train IDs")
 
-        train_ids = list(payload["train_ids_by_rank"][rank])
-        val_ids = list(payload["val_ids_by_rank"][rank])
+        if ddp is None:
+            train_ids = sort_ids_for_locality(train_ids_all, id_groups)
+            val_ids = sort_ids_for_locality(val_ids_all, id_groups)
+        else:
+            if rank == 0:
+                payload = {
+                    "train_ids_by_rank": partition_ids_weighted(
+                        train_ids_all,
+                        world_size,
+                        weights=id_weights,
+                        groups=id_groups,
+                        ensure_non_empty=True
+                    ),
+                    "val_ids_by_rank": partition_ids_weighted(
+                        val_ids_all,
+                        world_size,
+                        weights=id_weights,
+                        groups=id_groups,
+                        ensure_non_empty=False
+                    )
+                }
+            else:
+                payload = {}
 
-        per_rank = [None] * world_size
-        dist.all_gather_object(per_rank, {
-            "rank": rank,
-            "train_ids": len(train_ids),
-            "val_ids": len(val_ids)
-        })
+            obj = [payload]
+            dist.broadcast_object_list(obj, src=0)
+            payload = obj[0]
 
-        if rank == 0:
-            logger.info("partition_summary", extra={"extra": {
-                "total_train_ids": len(train_ids_all),
-                "total_val_ids": len(val_ids_all),
-                "per_rank": per_rank
-            }})
+            train_ids = list(payload["train_ids_by_rank"][rank])
+            val_ids = list(payload["val_ids_by_rank"][rank])
 
-        if any(int(x["train_ids"]) == 0 for x in per_rank):
-            raise RuntimeError(
-                "At least one rank received 0 train IDs after weighted partitioning")
+            per_rank = [None] * world_size
+            dist.all_gather_object(per_rank, {
+                "rank": rank,
+                "train_ids": len(train_ids),
+                "val_ids": len(val_ids)
+            })
 
-    # shuffle train IDs per best deep learning practces
-    rng = random.Random(seed)
-    rng.shuffle(train_ids)
-    train_data = ProteinDataset(
-        embedding_dirs=embedding_dirs,
-        label_shards=label_shards,
-        protein_ids=train_ids,
-        label_index=base_dataset.label_index,
-        embedding_index=base_dataset.embedding_index,
-        window_size=args.window_size if args.window_size > 0 else None,
-        stride=args.stride,
-        collapse_labels=args.collapse_labels,
-        pad_last_window=args.pad_last_window,
-        return_meta=False,
-        cache_current_label_shard=args.cache_current_label_shard,
-        drop_label_after_use=args.drop_label_after_use
-    )
+            if rank == 0:
+                logger.info("partition_summary", extra={"extra": {
+                    "total_train_ids": len(train_ids_all),
+                    "total_val_ids": len(val_ids_all),
+                    "per_rank": per_rank
+                }})
 
-    val_data = None
-    if len(val_ids) > 0 or ddp is not None:
-        val_data = ProteinDataset(
+            if any(int(x["train_ids"]) == 0 for x in per_rank if x is not None):
+                raise RuntimeError(
+                    "At least one rank received 0 train IDs after weighted partitioning")
+
+        # shuffle train IDs per best deep learning practces
+        rng = random.Random(train_seed)
+        rng.shuffle(train_ids)
+
+        train_data = ProteinDataset(
             embedding_dirs=embedding_dirs,
             label_shards=label_shards,
-            protein_ids=val_ids,
+            protein_ids=train_ids,
             label_index=base_dataset.label_index,
             embedding_index=base_dataset.embedding_index,
             window_size=args.window_size if args.window_size > 0 else None,
@@ -341,68 +440,173 @@ def main() -> None:
             cache_current_label_shard=args.cache_current_label_shard,
             drop_label_after_use=args.drop_label_after_use
         )
+        val_data = None
+        if len(val_ids) > 0 or ddp is not None:
+            val_data = ProteinDataset(
+                embedding_dirs=embedding_dirs,
+                label_shards=label_shards,
+                protein_ids=val_ids,
+                label_index=base_dataset.label_index,
+                embedding_index=base_dataset.embedding_index,
+                window_size=args.window_size if args.window_size > 0 else None,
+                stride=args.stride,
+                collapse_labels=args.collapse_labels,
+                pad_last_window=args.pad_last_window,
+                return_meta=False,
+                cache_current_label_shard=args.cache_current_label_shard,
+                drop_label_after_use=args.drop_label_after_use
+            )
 
-    # set up data loaders
-    pin = torch.cuda.is_available()  # pin memory depending on if CUDA available
-    # handle loader worker creation in multi-rank process
-    loader_kwargs = {"batch_size": args.batch_size,
-                     "shuffle": False,
-                     "num_workers": args.num_workers,
-                     "pin_memory": pin,
-                     "collate_fn": pad_collate}
-    if args.num_workers > 0:
-        loader_kwargs["multiprocessing_context"] = "spawn"
-        # reduce worker respawn overhead
-        loader_kwargs["persistent_workers"] = True
-        loader_kwargs["prefetch_factor"] = 4
+        # set up data loaders
+        pin = torch.cuda.is_available()  # pin memory depending on if CUDA available
+        # handle loader worker creation in multi-rank process
+        loader_kwargs = {"batch_size": args.batch_size,
+                         "shuffle": False,
+                         "num_workers": args.num_workers,
+                         "pin_memory": pin,
+                         "collate_fn": pad_collate}
+        if args.num_workers > 0:
+            loader_kwargs["multiprocessing_context"] = "spawn"
+            # reduce worker respawn overhead
+            loader_kwargs["persistent_workers"] = True
+            loader_kwargs["prefetch_factor"] = 4
 
-    train_loader = DataLoader(train_data, **loader_kwargs)
-    val_loader = DataLoader(
-        val_data, **loader_kwargs) if val_data is not None else None
+        train_loader = DataLoader(train_data, **loader_kwargs)
+        val_loader = DataLoader(
+            val_data, **loader_kwargs) if val_data is not None else None
 
-    # compute or store positive weight (like class weight)
-    pos_weight = None
-    if args.pos_weight is not None:
-        pos_weight = float(args.pos_weight)
-    elif args.calc_pos_weight:
-        pos, neg = compute_pos_neg_counts(train_loader)
-        pos_weight = global_pos_weight(pos, neg, ddp)
+        # compute or store positive weight (like class weight)
+        pos_weight = None
+        if args.pos_weight is not None:
+            pos_weight = float(args.pos_weight)
+        elif args.calc_pos_weight:
+            pos, neg = compute_pos_neg_counts(train_loader)
+            pos_weight = global_pos_weight(pos, neg, ddp)
 
-    # build our FFNN model
-    emb_dim = infer_emb_dim(base_dataset.embedding_index)
-    model = PepSeqFFNN(emb_dim=emb_dim,
-                       hidden_sizes=(150, 120, 45),
-                       dropouts=(0.1, 0.1, 0.1),
-                       use_layer_norm=False,
-                       use_residual=False,
-                       num_classes=1)
+        # build our FFNN model
+        emb_dim = infer_emb_dim(base_dataset.embedding_index)
+        model = PepSeqFFNN(emb_dim=emb_dim,
+                           hidden_sizes=(150, 120, 45),
+                           dropouts=(0.1, 0.1, 0.1),
+                           use_layer_norm=False,
+                           use_residual=False,
+                           num_classes=1)
 
-    if ddp is not None:
-        device = torch.device(f"cuda:{ddp['local_rank']}")
-    else:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model.to(device)
+        if ddp is not None:
+            device = torch.device(f"cuda:{ddp['local_rank']}")
+        else:
+            device = torch.device(
+                "cuda" if torch.cuda.is_available() else "cpu")
+        model.to(device)
 
-    if ddp is not None:
-        model = DDP(model, device_ids=[
-                    ddp["local_rank"]], output_device=ddp["local_rank"])
+        if ddp is not None:
+            model = DDP(model, device_ids=[
+                        ddp["local_rank"]], output_device=ddp["local_rank"])
 
-    # setup config and train
-    config = TrainerConfig(epochs=args.epochs,
-                           batch_size=args.batch_size,
-                           learning_rate=args.lr,
-                           weight_decay=args.weight_decay,
-                           device="cuda" if torch.cuda.is_available() else "cpu",
-                           pos_weight=pos_weight)
-    trainer = Trainer(model=model,
-                      train_loader=train_loader,
-                      logger=logger,
-                      val_loader=val_loader,
-                      config=config)
+        # setup config and train
+        config = TrainerConfig(epochs=args.epochs,
+                               batch_size=args.batch_size,
+                               learning_rate=args.lr,
+                               weight_decay=args.weight_decay,
+                               device="cuda" if torch.cuda.is_available() else "cpu",
+                               pos_weight=pos_weight)
+        trainer = Trainer(model=model,
+                          train_loader=train_loader,
+                          logger=logger,
+                          val_loader=val_loader,
+                          config=config)
 
-    # run training, only save if rank 0 or single rank run
-    save_dir = args.save_path if (ddp is None or rank == 0) else None
-    trainer.fit(save_dir=save_dir)
+        # run training, only save if rank 0 or single rank run
+        if ddp is None or rank == 0:
+            run_save_dir = (args.save_path /
+                            f"run_{run_index:03d}_split_{split_seed}_train_{train_seed}")
+        else:
+            run_save_dir = None
+        t0 = time.time()
+        fit_summary = trainer.fit(
+            save_dir=run_save_dir, score_key=args.best_model_metric)
+        elapsed_s = time.time() - t0
+
+        if rank == 0:
+            best_metrics = fit_summary.get("best_metrics") or {}
+            best_epoch = int(fit_summary.get("best_epoch", -1))
+            best_val_loss = _finite_or_none(
+                fit_summary.get("best_val_loss", float("nan")))
+            best_score_value = _finite_or_none(
+                fit_summary.get("best_score_value", float("nan")))
+            display_metric_value = (
+                best_val_loss
+                if args.best_model_metric == "loss"
+                else best_score_value
+            )
+            run_valid = (
+                best_epoch >= 0
+                and (
+                    best_val_loss is not None
+                    if args.best_model_metric == "loss"
+                    else best_score_value is not None
+                )
+            )
+            run_status = "OK" if run_valid else "NO_VALID_SCORE"
+            if not run_valid:
+                logger.warning("run_no_valid_score", extra={"extra": {
+                    "run_index": run_index,
+                    "split_seed": split_seed,
+                    "train_seed": train_seed,
+                    "best_model_metric": args.best_model_metric,
+                    "best_epoch": best_epoch,
+                    "best_val_loss": best_val_loss,
+                    "best_score_value": best_score_value
+                }})
+            row = {
+                "RunIndex": run_index,
+                "SplitSeed": split_seed,
+                "TrainSeed": train_seed,
+                "BestMetricKey": args.best_model_metric,
+                "BestMetricValue": display_metric_value,
+                "BestEpoch": best_epoch,
+                "BestValLoss": best_val_loss,
+                "PR_AUC": _finite_or_none(best_metrics.get("pr_auc", float("nan"))),
+                "F1": _finite_or_none(best_metrics.get("f1", float("nan"))),
+                "MCC": _finite_or_none(best_metrics.get("mcc", float("nan"))),
+                "AUC": _finite_or_none(best_metrics.get("auc", float("nan"))),
+                "AUC10": _finite_or_none(best_metrics.get("auc10", float("nan"))),
+                "BalancedAcc": _finite_or_none(best_metrics.get("res_balanced_acc", float("nan"))),
+                "ElapsedSec": _finite_or_none(elapsed_s),
+                "Status": run_status
+            }
+            run_rows.append(row)
+            append_csv_row(results_csv, row)
+
+        if ddp is not None:
+            dist.barrier()
+
+    # final aggregate and clean-up
+    if rank == 0 and run_rows:
+        df_runs = pd.DataFrame(run_rows)
+        summary_payload = {
+            "n_runs": int(len(run_rows)),
+            "best_model_metric": str(args.best_model_metric),
+            "split_seeds": [int(x) for x in split_seeds],
+            "train_seeds": [int(x) for x in train_seeds],
+            "metrics": {
+                "BestMetricValue": summarize_numeric(df_runs["BestMetricValue"]),
+                "PR_AUC": summarize_numeric(df_runs["PR_AUC"]),
+                "F1": summarize_numeric(df_runs["F1"]),
+                "MCC": summarize_numeric(df_runs["MCC"]),
+                "AUC": summarize_numeric(df_runs["AUC"]),
+                "AUC10": summarize_numeric(df_runs["AUC10"]),
+                "BalancedAcc": summarize_numeric(df_runs["BalancedAcc"]),
+                "BestValLoss": summarize_numeric(df_runs["BestValLoss"]),
+                "ElapsedSec": summarize_numeric(df_runs["ElapsedSec"])
+            }
+        }
+        summary_path = args.save_path / "multi_run_summary.json"
+        summary_path.write_text(
+            json.dumps(_sanitize_for_json(summary_payload),
+                       indent=2, allow_nan=False),
+            encoding="utf-8"
+        )
 
     if ddp is not None:
         dist.destroy_process_group()

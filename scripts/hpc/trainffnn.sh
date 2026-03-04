@@ -2,13 +2,13 @@
 #SBATCH --job-name=ffnn_v1.0
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=1
+#SBATCH --cpus-per-task=20
 #SBATCH --partition=gpu
 #SBATCH --gpus-per-node=a100:4
 #SBATCH --mem=256G
 #SBATCH --time=12:00:00
-#SBATCH --output=/scratch/%u/train_ffnn_slurm/%j_ffnn_v1.0/%x.out
-#SBATCH --error=/scratch/%u/train_ffnn_slurm/%j_ffnn_v1.0/%x.err
+#SBATCH --output=/scratch/%u/train_ffnn_slurm/output/%x_%j.out
+#SBATCH --error=/scratch/%u/train_ffnn_slurm/error/%x_%j.err
 
 # for testing
 USE_SRUN="${USE_SRUN:-1}"
@@ -50,14 +50,19 @@ if [ "${#EMBEDDING_DIRS[@]}" -eq 0 ] || [ "${#LABEL_SHARDS[@]}" -eq 0 ]; then
     exit 1
 fi
 
+HIDDEN_SIZES="${HIDDEN_SIZES:-150,120,45}"
+DROPOUTS="${DROPOUTS:0.1,0.1,0.1}"
 EPOCHS="${EPOCHS:-10}"
-SEED="${SEED:-42}"
+BEST_MODEL_METRIC="${BEST_MODEL_METRIC:-pr_auc}"
+SPLIT_SEEDS="${SPLIT_SEEDS:-11,22,33,44,55}"
+TRAIN_SEEDS="${TRAIN_SEEDS:-101,202,303,404,505}"
 BATCH_SIZE="${BATCH_SIZE:-256}" # ensure batch size is 4 times what you would do for one GPU (for example. 256 = 64 * 4)
 LR="${LR:-0.001}"
 WD="${WD:-0.0}"
 VAL_FRAC="${VAL_FRAC:-0.2}"
 POS_WEIGHT="${POS_WEIGHT:-13.18999647945325}" # calculated from previous script
-SAVE_PATH="/scratch/$USER/models/ffnn_v1.0"
+SAVE_PATH="/scratch/$USER/models/${SLURM_JOB_NAME:-ffnn_job}"
+RESULTS_CSV="${SAVE_PATH}/runs.csv"
 NUM_WORKERS="${NUM_WORKERS:-1}"
 WINDOW_SIZE="${WINDOW_SIZE:-1000}"
 STRIDE="${STRIDE:-900}"
@@ -69,7 +74,7 @@ mkdir -p "${SAVE_PATH}"
 module purge
 module load anaconda3
 module load cuda
-source $CONDA_PREFIX/etc/profile.d/conda.sh
+source $(conda info --base)/etc/profile.d/conda.sh
 conda activate pepseqpred
 
 # turn off srun for testing
@@ -82,15 +87,20 @@ fi
 ${LAUNCHER} torchrun --nproc_per_node=4 train_ffnn.pyz \
     --embedding-dirs "${EMBEDDING_DIRS[@]}" \
     --label-shards "${LABEL_SHARDS[@]}" \
+    --hidden-sizes "$HIDDEN_SIZES" \
+    --dropouts "$DROPOUTS" \
     --epochs "$EPOCHS" \
-    --seed "$SEED" \
+    --split-seeds "$SPLIT_SEEDS" \
+    --train-seeds "$TRAIN_SEEDS" \
     --batch-size "$BATCH_SIZE" \
     --lr "$LR" \
     --wd "$WD" \
     --pos-weight "$POS_WEIGHT" \
+    --best-model-metric "$BEST_MODEL_METRIC" \
     --val-frac "$VAL_FRAC" \
     --split-type "$SPLIT_TYPE" \
     --save-path "$SAVE_PATH" \
+    --results-csv "$RESULTS_CSV" \
     --num-workers "$NUM_WORKERS" \
     --window-size "$WINDOW_SIZE" \
     --stride "$STRIDE"

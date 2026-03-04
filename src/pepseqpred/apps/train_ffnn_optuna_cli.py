@@ -36,6 +36,7 @@ from torch.utils.data import DataLoader
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from pepseqpred.core.io.logger import setup_logger
+from pepseqpred.core.io.write import append_csv_row
 from pepseqpred.core.data.proteindataset import ProteinDataset, pad_collate
 from pepseqpred.core.models.ffnn import PepSeqFFNN
 from pepseqpred.core.train.trainer import Trainer, TrainerConfig
@@ -118,27 +119,6 @@ def build_hidden_sizes(trial: optuna.trial.Trial,
     dropouts = [dropout] * depth
 
     return tuple(sizes), tuple(dropouts), depth, base
-
-
-def append_csv_row(csv_path: Path | str, row: Dict[str, Any]) -> None:
-    """
-    Appends a single row to a CSV runs file, creating the file and header if needed.
-
-    Parameters
-    ----------
-        csv_path : Path | str
-            Path to the CSV runs file.
-        row : Dict[str, Any]
-            Row data to append as a single record.
-    """
-    csv_path = Path(csv_path)
-    csv_path.parent.mkdir(parents=True, exist_ok=True)
-
-    df_new = pd.DataFrame([row])
-    df_new.to_csv(csv_path,
-                  mode="a",
-                  header=(not csv_path.exists()),
-                  index=False)
 
 
 def main() -> None:

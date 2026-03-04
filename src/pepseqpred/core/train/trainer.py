@@ -424,12 +424,21 @@ class Trainer:
                         is_better = metric_loss < best_val_loss
                     elif np.isfinite(metric_score):
                         # better if score higher or score same but loss is lower
-                        is_better = (metric_score > best_score) or (
-                            metric_score == best_score and metric_loss < best_val_loss
+                        is_better = (
+                            (not np.isfinite(best_score))
+                            or (metric_score > best_score)
+                            or (metric_score == best_score and metric_loss < best_val_loss)
                         )
+                    elif best_epoch < 0:
+                        # before first finite score
+                        is_better = metric_loss < best_val_loss
+                    else:
+                        is_better = False
 
                     if is_better:
                         best_val_loss = metric_loss
+                        if np.isfinite(metric_score):
+                            best_score = metric_score
                         best_score = metric_score
                         best_epoch = int(epoch)
                         best_metrics = dict(metrics)
@@ -438,7 +447,7 @@ class Trainer:
                         best_metrics["best_val_loss"] = float(best_val_loss)
                         best_metrics["best_epoch"] = int(best_epoch)
                         self._save_checkpoint(
-                            save_dir / "best_model.pt",
+                            save_dir / "fully_connected.pt",
                             epoch,
                             best_val_loss,
                             metrics=best_metrics
@@ -446,7 +455,7 @@ class Trainer:
 
         # final check to save a model if no validation set
         if self.val_loader is None and save_dir is not None:
-            self._save_checkpoint(save_dir / "best_model_no_val.pt",
+            self._save_checkpoint(save_dir / "fully_connected_no_val.pt",
                                   self.config.epochs - 1, float(train_metrics["loss"]))
 
         summary = {
@@ -467,7 +476,7 @@ class Trainer:
         if ddp_rank() != 0:
             return
 
-        path.parent.mkdir(parents=True, exist_ok=True)
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
         state = {"model_state_dict": self.model.state_dict(),
                  "optim_state_dict": self.optimizer.state_dict(),
                  "epoch": epoch,
@@ -603,7 +612,7 @@ class Trainer:
                 # save by score metric (F1, MCC, AUC, etc.)
                 if save_dir is not None:
                     self._save_checkpoint(
-                        save_dir / "best_model_by_score.pt", epoch, best_val_loss_at_score, best_metrics)
+                        save_dir / "fully_connected_by_score.pt", epoch, best_val_loss_at_score, best_metrics)
 
         if ddp_rank() == 0:
             self.logger.info("training_done",

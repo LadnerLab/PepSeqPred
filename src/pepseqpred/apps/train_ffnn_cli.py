@@ -45,36 +45,72 @@ from pepseqpred.core.train.embedding import infer_emb_dim
 from pepseqpred.core.train.seed import set_all_seeds
 
 
-def parse_seed_csv(raw: str, arg_name: str) -> List[int]:
+def _split_csv_tokens(raw: str, arg_name: str) -> List[str]:
+    """Splits CSVs by tokens as list of strings."""
+    tokens = [tok.strip() for tok in raw.split(",") if tok.strip()]
+    if not tokens:
+        raise ValueError(f"{arg_name} cannot be empty")
+    return tokens
+
+
+def parse_int_csv(raw: str, arg_name: str) -> List[int]:
     """
-    Parses comma-separated seed values into a list.
+    Parses comma-separated values into a list of integers.
 
     For example, `"11,22,33,44,55"` becomes `[11, 22, 33, 44, 55]`.
 
     Parameters
     ----------
         raw : str
-            The CSV string of seed values.
+            The CSV string of values.
         arg_name : str
-            Either `"--split-seeds"` or `"--train-seeds"` for error handling.
+            Argument name for seed CSVs.
 
     Returns
     -------
         List[int]
-            The CSV seeds as a list of integers.
+            The CSV input as a list of integers.
 
     Raises
     ------
         ValueError
-            If the string is empty or if the numbers are not integers when parsed.
+            If the string is empty or if values are not integers.
     """
-    tokens = [tok.strip() for tok in raw.split(",") if tok.strip()]
-    if not tokens:
-        raise ValueError(f"{arg_name} cannot be empty")
+    tokens = _split_csv_tokens(raw, arg_name)
     try:
         return [int(tok) for tok in tokens]
     except ValueError as e:
         raise ValueError(f"{arg_name} must be a CSV list of integers") from e
+
+
+def parse_float_csv(raw: str, arg_name: str) -> List[float]:
+    """
+    Parses comma-separated values into a list of floats.
+
+    For example, `"0.1,0.2,0.3"` becomes `[0.1, 0.2, 0.3]`.
+
+    Parameters
+    ----------
+        raw : str
+            The CSV string of values.
+        arg_name : str
+            Argument name for model CSVs.
+
+    Returns
+    -------
+        List[float]
+            The CSV input as a list of floats.
+
+    Raises
+    ------
+        ValueError
+            If the string is empty or if values are not floats.
+    """
+    tokens = _split_csv_tokens(raw, arg_name)
+    try:
+        return [float(tok) for tok in tokens]
+    except ValueError as e:
+        raise ValueError(f"{arg_name} must be a CSV list of numbers") from e
 
 
 def summarize_numeric(series: pd.Series) -> Dict[str, Any]:
@@ -142,6 +178,26 @@ def main() -> None:
                         required=True,
                         type=Path,
                         help="One or more label shard .pt files containing a 'labels' dictionary")
+    parser.add_argument("--hidden-sizes",
+                        action="store",
+                        dest="hidden_sizes",
+                        type=str,
+                        default="150,120,45",
+                        help="The hidden layer sizes")
+    parser.add_argument("--dropouts",
+                        action="store",
+                        dest="dropouts",
+                        type=str,
+                        default="0.1,0.1,0.1",
+                        help="The dropout rates, count must match number of hidden layers")
+    parser.add_argument("--use-layer-norm",
+                        action="store_true",
+                        dest="use_layer_norm",
+                        help="If set, layer normalization is applied")
+    parser.add_argument("--use-residual",
+                        action="store_true",
+                        dest="use_residual",
+                        help="If set, residuals are used in feed-forward calculation")
     parser.add_argument("--epochs",
                         action="store",
                         dest="epochs",
@@ -249,7 +305,7 @@ def main() -> None:
                         help="CSV train seeds (e.g., 44,55,66)")
     parser.add_argument("--best-model-metric",
                         type=str,
-                        default="pr_auc",
+                        default="loss",
                         choices=["loss", "precision", "recall",
                                  "f1", "mcc", "auc", "auc10", "pr_auc", "res_balanced_acc"],
                         help="Metric used to choose the best model checkpoint per run")
@@ -289,8 +345,8 @@ def main() -> None:
             "Provide both --split-seeds and --train-seeds together"
         )
     else:
-        split_seeds = parse_seed_csv(args.split_seeds, "--split-seeds")
-        train_seeds = parse_seed_csv(args.train_seeds, "--train-seeds")
+        split_seeds = parse_int_csv(args.split_seeds, "--split-seeds")
+        train_seeds = parse_int_csv(args.train_seeds, "--train-seeds")
 
     if len(split_seeds) != len(train_seeds):
         raise ValueError(
@@ -350,6 +406,17 @@ def main() -> None:
         protein_id: str(base_dataset.label_index.get(protein_id, ""))
         for protein_id in protein_ids
     }
+
+    # parse hidden sizes and dropouts from CSV inputs
+    if (not args.hidden_sizes) or (not args.dropouts):
+        raise ValueError("--hidden-sizes and --dropouts cannot be empty")
+    hidden_sizes = tuple(parse_int_csv(
+        args.hidden_sizes, "--hidden-sizes"))
+    dropouts = tuple(parse_float_csv(args.dropouts, "--dropouts"))
+    if len(hidden_sizes) != len(dropouts):
+        raise ValueError(
+            "--hidden-sizes and --dropouts must be the same length"
+        )
 
     # per-run loop
     for run_index, (split_seed, train_seed) in enumerate(zip(split_seeds, train_seeds), start=1):
@@ -486,10 +553,10 @@ def main() -> None:
         # build our FFNN model
         emb_dim = infer_emb_dim(base_dataset.embedding_index)
         model = PepSeqFFNN(emb_dim=emb_dim,
-                           hidden_sizes=(150, 120, 45),
-                           dropouts=(0.1, 0.1, 0.1),
-                           use_layer_norm=False,
-                           use_residual=False,
+                           hidden_sizes=hidden_sizes,
+                           dropouts=dropouts,
+                           use_layer_norm=args.use_layer_norm,
+                           use_residual=args.use_residual,
                            num_classes=1)
 
         if ddp is not None:
@@ -539,6 +606,8 @@ def main() -> None:
                 if args.best_model_metric == "loss"
                 else best_score_value
             )
+            threshold = _finite_or_none(
+                best_metrics.get("threshold", float("nan")))
             run_valid = (
                 best_epoch >= 0
                 and (
@@ -566,6 +635,7 @@ def main() -> None:
                 "BestMetricValue": display_metric_value,
                 "BestEpoch": best_epoch,
                 "BestValLoss": best_val_loss,
+                "Threshold": threshold,
                 "PR_AUC": _finite_or_none(best_metrics.get("pr_auc", float("nan"))),
                 "F1": _finite_or_none(best_metrics.get("f1", float("nan"))),
                 "MCC": _finite_or_none(best_metrics.get("mcc", float("nan"))),

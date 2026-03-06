@@ -40,7 +40,7 @@ from pepseqpred.core.train.split import (
     partition_ids_weighted,
     sort_ids_for_locality
 )
-from pepseqpred.core.train.weights import compute_pos_neg_counts, global_pos_weight
+from pepseqpred.core.train.weights import pos_weight_from_label_shards
 from pepseqpred.core.train.embedding import infer_emb_dim
 from pepseqpred.core.train.seed import set_all_seeds
 
@@ -228,10 +228,6 @@ def main() -> None:
                         type=float,
                         default=0.0,
                         help="Model training weight decay to prevent overfitting by shrinking model weights during training")
-    parser.add_argument("--calc-pos-weight",
-                        dest="calc_pos_weight",
-                        action="store_true",
-                        help="Calculate positive weight to handle positive vs. negative class imbalances, note this may take a long time to run")
     parser.add_argument("--pos-weight",
                         dest="pos_weight",
                         action="store",
@@ -542,13 +538,12 @@ def main() -> None:
         val_loader = DataLoader(
             val_data, **loader_kwargs) if val_data is not None else None
 
-        # compute or store positive weight (like class weight)
+        # compute or store positive weight
         pos_weight = None
         if args.pos_weight is not None:
             pos_weight = float(args.pos_weight)
-        elif args.calc_pos_weight:
-            pos, neg = compute_pos_neg_counts(train_loader)
-            pos_weight = global_pos_weight(pos, neg, ddp)
+        else:
+            pos_weight = pos_weight_from_label_shards(label_shards)
 
         # build our FFNN model
         emb_dim = infer_emb_dim(base_dataset.embedding_index)

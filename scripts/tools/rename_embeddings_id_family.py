@@ -20,7 +20,7 @@ import csv
 import re
 import sys
 from pathlib import Path
-from typing import Dict, Iterable, List, Tuple
+from typing import Dict, Iterable, List, Set, Tuple
 
 
 NAME_RE = re.compile(r"^ID=([^\s]+)\s+AC=([^\s]+)\s+OXX=([^\s]+)\s*$")
@@ -157,6 +157,43 @@ def collect_shard_dirs(emb_root: Path | None, shard_dirs: Iterable[Path]) -> Lis
     return deduped
 
 
+def parse_protein_id_from_stem(stem: str, delimiter: str) -> str:
+    """
+    Parse protein ID from filename stem.
+
+    Supports both:
+    - ID
+    - ID-family (numeric family token)
+    """
+    if delimiter and delimiter in stem:
+        maybe_id, maybe_family = stem.rsplit(delimiter, 1)
+        if maybe_id and maybe_family.isdigit():
+            return maybe_id
+    return stem
+
+
+def find_cross_shard_duplicate_ids(
+    shard_dirs: List[Path],
+    delimiter: str,
+) -> Dict[str, List[Path]]:
+    """
+    Find duplicate protein IDs that appear in more than one shard directory.
+    """
+    id_to_paths: Dict[str, List[Path]] = {}
+    for shard_dir in shard_dirs:
+        for pt_path in sorted(shard_dir.glob("*.pt")):
+            protein_id = parse_protein_id_from_stem(pt_path.stem, delimiter)
+            paths = id_to_paths.setdefault(protein_id, [])
+            paths.append(pt_path)
+
+    duplicates: Dict[str, List[Path]] = {}
+    for protein_id, paths in id_to_paths.items():
+        shard_set: Set[Path] = {path.parent for path in paths}
+        if len(shard_set) > 1:
+            duplicates[protein_id] = paths
+    return duplicates
+
+
 def rename_shard(
     shard_dir: Path,
     id_to_family: Dict[str, str],
@@ -282,6 +319,12 @@ def main() -> None:
         action="store_true",
         help="Fail if any embedding stem cannot be mapped from metadata.",
     )
+    parser.add_argument(
+        "--duplicate-report",
+        type=Path,
+        default=None,
+        help="Optional TSV path to write all cross-shard duplicate protein IDs and file paths.",
+    )
     args = parser.parse_args()
 
     if args.delimiter == "":
@@ -301,6 +344,37 @@ def main() -> None:
     print(f"[info] Metadata rows with missing family: {missing_family_rows}")
     print(f"[info] Shards: {len(shard_dirs)}")
     print(f"[info] Mode: {'apply' if args.apply else 'dry-run'}")
+
+
+    cross_shard_duplicates = find_cross_shard_duplicate_ids(
+        shard_dirs=shard_dirs,
+        delimiter=args.delimiter,
+    )
+    if len(cross_shard_duplicates) > 0:
+        total_dupe_files = sum(
+            len(paths) for paths in cross_shard_duplicates.values())
+        print(
+            f"[warn] Cross-shard duplicate protein IDs: {len(cross_shard_duplicates)} "
+            f"(files involved={total_dupe_files})",
+            file=sys.stderr,
+        )
+        if args.duplicate_report is not None:
+            args.duplicate_report.parent.mkdir(parents=True, exist_ok=True)
+            with args.duplicate_report.open("w", encoding="utf-8", newline="") as out_f:
+                writer = csv.writer(out_f, delimiter="\t")
+                writer.writerow(["protein_id", "n_files", "path"])
+                for protein_id, paths in sorted(cross_shard_duplicates.items()):
+                    n_files = len(paths)
+                    for path in sorted(paths):
+                        writer.writerow([protein_id, n_files, str(path)])
+            print(f"[info] Wrote duplicate report: {args.duplicate_report}")
+        else:
+            for protein_id, paths in sorted(cross_shard_duplicates.items())[:10]:
+                print(f"       protein_id={protein_id}", file=sys.stderr)
+                for path in paths:
+                    print(f"         {path}", file=sys.stderr)
+    else:
+        print("[info] Cross-shard duplicate protein IDs: 0")
 
     totals = {
         "total_pt": 0,

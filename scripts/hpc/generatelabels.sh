@@ -71,6 +71,8 @@ fi
 
 srun python -u labels.pyz "$META_PATH" "$OUT_PATH" \
   --emb-dir "$EMB_DIR" \
-  --restrict-to-embeddings
+  --restrict-to-embeddings \
+  --calc-pos-weight \
+  --embedding-key-delim -
 
 # command: sbatch generatelabels.sh path/to/meta.tsv path/to/out_dir /scratch/$USER/esm2/artifacts/pts

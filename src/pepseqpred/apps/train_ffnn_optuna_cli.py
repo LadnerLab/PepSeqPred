@@ -47,7 +47,7 @@ from pepseqpred.core.train.split import (
     partition_ids_weighted,
     sort_ids_for_locality
 )
-from pepseqpred.core.train.weights import compute_pos_neg_counts, global_pos_weight
+from pepseqpred.core.train.weights import pos_weight_from_label_shards
 from pepseqpred.core.train.embedding import infer_emb_dim
 from pepseqpred.core.train.seed import set_all_seeds
 
@@ -178,10 +178,6 @@ def main() -> None:
                         type=int,
                         default=4,
                         help="DataLoader workers")
-    parser.add_argument("--calc-pos-weight",
-                        dest="calc_pos_weight",
-                        action="store_true",
-                        help="Calculate positive weight to handle positive vs. negative class imbalances, note this may take a long time to run")
     parser.add_argument("--pos-weight",
                         dest="pos_weight",
                         action="store",
@@ -432,7 +428,7 @@ def main() -> None:
                 "per_rank": per_rank
             }})
 
-        if any(int(x["train_ids"]) == 0 for x in per_rank):
+        if any(int(x["train_ids"]) == 0 for x in per_rank if x is not None):
             raise RuntimeError(
                 "At least one rank received 0 train IDs after weighted partitioning")
 
@@ -579,9 +575,8 @@ def main() -> None:
         pos_weight = None
         if args.pos_weight is not None:
             pos_weight = float(args.pos_weight)
-        elif args.calc_pos_weight:
-            pos, neg = compute_pos_neg_counts(train_loader)
-            pos_weight = global_pos_weight(pos, neg, ddp)
+        else:
+            pos_weight = pos_weight_from_label_shards(label_shards)
 
         # setup config and trainer class
         config = TrainerConfig(epochs=args.epochs,

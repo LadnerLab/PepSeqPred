@@ -40,7 +40,23 @@ def main() -> None:
                         dest="restrict_to_embeddings",
                         default=False,
                         help="Only build labels for proteins with embeddings in emb dirs.")
+    parser.add_argument("--calc-pos-weight",
+                        action="store_true",
+                        dest="calc_pos_weight",
+                        default=False,
+                        help="Automatically calculate the weight of the positive class for downstream training. Recommended for heavily imbalanced classes where positive cases are rare.")
+    parser.add_argument("--embedding-key-delim",
+                        action="store",
+                        dest="embedding_key_delim",
+                        type=str,
+                        default="",
+                        help="Set '-' for ID-family.pt embedding filenames, leave empty for ID.pt embedding filenames.")
     args = parser.parse_args()
+
+    if args.embedding_key_delim not in {"", "-"}:
+        parser.error(
+            "--embedding-key-delim must be '' (ID.pt) or '-' (ID-family.pt)"
+        )
 
     logger = setup_logger(json_lines=True, json_indent=2, name="labels_cli")
     logger.info("run_start", extra={
@@ -49,7 +65,9 @@ def main() -> None:
     builder = ProteinLabelBuilder(meta_path=args.meta_path,
                                   emb_dirs=args.emb_dirs,
                                   logger=logger,
-                                  restrict_to_embeddings=args.restrict_to_embeddings)
+                                  restrict_to_embeddings=args.restrict_to_embeddings,
+                                  calc_pos_weight=args.calc_pos_weight,
+                                  embedding_key_delim=args.embedding_key_delim)
     builder.build(save_path=args.save_path)
 
     logger.info("run_done", extra={"extra": {

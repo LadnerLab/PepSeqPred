@@ -43,74 +43,7 @@ from pepseqpred.core.train.split import (
 from pepseqpred.core.train.weights import pos_weight_from_label_shards
 from pepseqpred.core.train.embedding import infer_emb_dim
 from pepseqpred.core.train.seed import set_all_seeds
-
-
-def _split_csv_tokens(raw: str, arg_name: str) -> List[str]:
-    """Splits CSVs by tokens as list of strings."""
-    tokens = [tok.strip() for tok in raw.split(",") if tok.strip()]
-    if not tokens:
-        raise ValueError(f"{arg_name} cannot be empty")
-    return tokens
-
-
-def parse_int_csv(raw: str, arg_name: str) -> List[int]:
-    """
-    Parses comma-separated values into a list of integers.
-
-    For example, `"11,22,33,44,55"` becomes `[11, 22, 33, 44, 55]`.
-
-    Parameters
-    ----------
-        raw : str
-            The CSV string of values.
-        arg_name : str
-            Argument name for seed CSVs.
-
-    Returns
-    -------
-        List[int]
-            The CSV input as a list of integers.
-
-    Raises
-    ------
-        ValueError
-            If the string is empty or if values are not integers.
-    """
-    tokens = _split_csv_tokens(raw, arg_name)
-    try:
-        return [int(tok) for tok in tokens]
-    except ValueError as e:
-        raise ValueError(f"{arg_name} must be a CSV list of integers") from e
-
-
-def parse_float_csv(raw: str, arg_name: str) -> List[float]:
-    """
-    Parses comma-separated values into a list of floats.
-
-    For example, `"0.1,0.2,0.3"` becomes `[0.1, 0.2, 0.3]`.
-
-    Parameters
-    ----------
-        raw : str
-            The CSV string of values.
-        arg_name : str
-            Argument name for model CSVs.
-
-    Returns
-    -------
-        List[float]
-            The CSV input as a list of floats.
-
-    Raises
-    ------
-        ValueError
-            If the string is empty or if values are not floats.
-    """
-    tokens = _split_csv_tokens(raw, arg_name)
-    try:
-        return [float(tok) for tok in tokens]
-    except ValueError as e:
-        raise ValueError(f"{arg_name} must be a CSV list of numbers") from e
+from pepseqpred.core.io.read import parse_int_csv, parse_float_csv
 
 
 def summarize_numeric(series: pd.Series) -> Dict[str, Any]:

@@ -1,7 +1,7 @@
 from dataclasses import dataclass
 import math
 import re
-from typing import Tuple, Dict, Any, Mapping, List
+from typing import Tuple, Dict, Any, Mapping, List, Optional
 import esm
 import torch
 import numpy as np
@@ -25,7 +25,19 @@ class FFNNModelConfig:
 
 
 def normalize_state_dict_keys(state: Mapping[str, Any]) -> Dict[str, Any]:
-    """Strips DDP `module.` prefix so checkpoints load in non-DDP inference."""
+    """
+    Strips DDP `module.` prefix so checkpoints load in non-DDP inference.
+
+    Parameters
+    ----------
+        state : Mapping[str, Any]
+            State dictionary obtained from saved trained model checkpoint.
+
+    Returns
+    -------
+        Dict[str, Any]
+            The normalized state dictionary with the `module.` prefix removed.
+    """
     out_dict: Dict[str, Any] = {}
     for k, v in state.items():
         key = str(k)
@@ -36,7 +48,24 @@ def normalize_state_dict_keys(state: Mapping[str, Any]) -> Dict[str, Any]:
 
 
 def infer_model_config_from_state(state: Mapping[str, Any]) -> FFNNModelConfig:
-    """Infer PepSeqFFNN architecture directly from checkpoint `model_state_dict`."""
+    """
+    Infer PepSeqFFNN architecture directly from checkpoint `model_state_dict`.
+
+    Parameters
+    ----------
+        state : Mapping[str, Any]
+            State dictionary obtained from saved trained model checkpoint.
+
+    Returns
+    -------
+        FFNNModelConfig
+            A fully populated model configuration dataclass to be used in model building.
+
+    Raises
+    ------
+        ValueError
+            When value in the itemized state is not a tensor or not a 2D tensor. When the output layer could not be inferred from the `state_dict`. When there is a hidden layer mismatch (prev != curr). When output `in_features` does not match the last hidden layer size. When all hidden sizes are the same, you cannot infer if residuals were used.
+    """
     state = normalize_state_dict_keys(state)
 
     # get hidden layers and sizes
@@ -118,8 +147,37 @@ def infer_model_config_from_state(state: Mapping[str, Any]) -> FFNNModelConfig:
     )
 
 
-def build_model_from_checkpoint(checkpoint: Mapping[str, Any], device: str = "cpu") -> Tuple[PepSeqFFNN, FFNNModelConfig]:
-    """Builds and loads model exactly from training checkpoint."""
+def build_model_from_checkpoint(
+    checkpoint: Mapping[str, Any],
+    device: str = "cpu",
+    model_config: Optional[FFNNModelConfig] = None
+) -> Tuple[PepSeqFFNN, FFNNModelConfig, str]:
+    """
+    Builds and loads model exactly from training checkpoint.
+
+    Parameters
+    ----------
+        checkpoint : Mapping[str, Any]
+            State dictionary obtained from saved trained model checkpoint.
+        device : str
+            Device type to use for building model checkpoint, default is `"cpu"`, `"cuda"` if accepted if GPUs are available.
+        model_config : FFNNModelConfig or None
+            A fully populated model configuration dataclass to be used in model building.
+
+    Returns
+    -------
+        PepSeqFFNN
+            Fully populated PepSeqPred model ready to use in inference.
+        FFNNModelConfig
+            Model configuration dataclass returned for logging/tracking purposes.
+        str
+            The model configuration source, either `"cli"` if passed explicitly or `"state_dict"` if inferred from the state dictionary.
+
+    Raises
+    ------
+        ValueError
+            If `checkpoint` is not of type `Mapping` or `"model_state_dict"` is not a key in `checkpoint`. If `state` is not of type `Mapping`. If the number of output classes is not 1 (binary), if the embedding dimension is <= 0, or if the number hidden layer sizes is not the same as the number of dropouts. If the checkpoint weights are incompatible with the model architecture provided. 
+    """
     if not isinstance(checkpoint, Mapping) or "model_state_dict" not in checkpoint:
         raise ValueError(
             "Expected checkpoint dict containing 'model_state_dict'")
@@ -127,13 +185,24 @@ def build_model_from_checkpoint(checkpoint: Mapping[str, Any], device: str = "cp
     state = checkpoint["model_state_dict"]
     if not isinstance(state, Mapping):
         raise ValueError("'model_state_dict' must be a mapping")
-
     state = normalize_state_dict_keys(state)
-    config = infer_model_config_from_state(state)
 
+    # can either pass config directly or infer from the state dict
+    if model_config is not None:
+        config = model_config
+        config_src = "cli"
+    else:
+        config = infer_model_config_from_state(state)
+        config_src = "state_dict"
+
+    # validate config
     if config.num_classes != 1:
         raise ValueError(
             f"Inference expects binary residue model (num_classes=1), got {config.num_classes}")
+    if config.emb_dim <= 0:
+        raise ValueError("emb_dim must be > 0")
+    if len(config.hidden_sizes) != len(config.dropouts):
+        raise ValueError("hidden_sizes and dropouts must have the same length")
 
     model = PepSeqFFNN(
         emb_dim=config.emb_dim,
@@ -143,14 +212,33 @@ def build_model_from_checkpoint(checkpoint: Mapping[str, Any], device: str = "cp
         use_layer_norm=config.use_layer_norm,
         use_residual=config.use_residual
     )
-    model.load_state_dict(state, strict=True)
+    try:
+        model.load_state_dict(state, strict=True)
+    except RuntimeError as e:
+        raise ValueError(
+            "Checkpoint weights are incompatible with the provided model architecture. "
+            "Check --emb-dim/--hidden-sizes/--dropouts/--use-layer-norm/--use-residual"
+        ) from e
     model.eval().to(device)
-
-    return model, config
+    return model, config, config_src
 
 
 def infer_decision_threshold(checkpoint: Mapping[str, Any], default: float = 0.5) -> float:
-    """Use validation threshold saved by training if applicable."""
+    """
+    Use validation threshold saved by training if applicable.
+
+    Parameters
+    ----------
+        checkpoint : Mapping[str, Any]
+            State dictionary obtained from saved trained model checkpoint.
+        default : float
+            Default threshold to use in the event threshold cannot be inferred from the checkpoint. Default threshold is `0.5`.
+
+    Returns
+    -------
+        float
+            Either inferred or default threshold value.
+    """
     metrics = checkpoint.get("metrics", None) if isinstance(
         checkpoint, Mapping) else None
     if not isinstance(metrics, Mapping):

@@ -3,11 +3,11 @@
 Input parsing utilities for PepSeqPred tabular and FASTA data.
 
 Provides helpers to read PV1-style FASTA files, metadata TSVs, and z-score
-reactivity tables into normalized pandas DataFrames.
+reactivity tables into normalized pandas DataFrames. Also includes CLI CSV arguments parsers for downstream training and predictions.
 """
 
 import re
-from typing import Optional, Iterable
+from typing import Optional, Iterable, List
 from pathlib import Path
 import pandas as pd
 
@@ -173,3 +173,71 @@ def read_zscores(z_path: Path | str,
     z_df.rename(columns={z_id_col: meta_id_col}, inplace=True)
 
     return z_df
+
+
+def _split_csv_tokens(raw: str, arg_name: str) -> List[str]:
+    """Splits CSVs by tokens as list of strings."""
+    tokens = [tok.strip() for tok in raw.split(",") if tok.strip()]
+    if not tokens:
+        raise ValueError(f"{arg_name} cannot be empty")
+    return tokens
+
+
+def parse_int_csv(raw: str, arg_name: str) -> List[int]:
+    """
+    Parses comma-separated values into a list of integers.
+
+    For example, `"11,22,33,44,55"` becomes `[11, 22, 33, 44, 55]`.
+
+    Parameters
+    ----------
+        raw : str
+            The CSV string of values.
+        arg_name : str
+            Argument name for seed CSVs.
+
+    Returns
+    -------
+        List[int]
+            The CSV input as a list of integers.
+
+    Raises
+    ------
+        ValueError
+            If the string is empty or if values are not integers.
+    """
+    tokens = _split_csv_tokens(raw, arg_name)
+    try:
+        return [int(tok) for tok in tokens]
+    except ValueError as e:
+        raise ValueError(f"{arg_name} must be a CSV list of integers") from e
+
+
+def parse_float_csv(raw: str, arg_name: str) -> List[float]:
+    """
+    Parses comma-separated values into a list of floats.
+
+    For example, `"0.1,0.2,0.3"` becomes `[0.1, 0.2, 0.3]`.
+
+    Parameters
+    ----------
+        raw : str
+            The CSV string of values.
+        arg_name : str
+            Argument name for model CSVs.
+
+    Returns
+    -------
+        List[float]
+            The CSV input as a list of floats.
+
+    Raises
+    ------
+        ValueError
+            If the string is empty or if values are not floats.
+    """
+    tokens = _split_csv_tokens(raw, arg_name)
+    try:
+        return [float(tok) for tok in tokens]
+    except ValueError as e:
+        raise ValueError(f"{arg_name} must be a CSV list of numbers") from e

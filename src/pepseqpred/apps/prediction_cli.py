@@ -16,8 +16,10 @@ from typing import Tuple, Iterator
 import torch
 import esm
 from pepseqpred.core.io.logger import setup_logger
+from pepseqpred.core.io.read import parse_int_csv, parse_float_csv
 from pepseqpred.core.embeddings.esm2 import clean_seq
 from pepseqpred.core.predict.inference import (
+    FFNNModelConfig,
     build_model_from_checkpoint,
     infer_decision_threshold,
     predict_protein
@@ -46,6 +48,57 @@ def read_fasta_records(fasta_path: Path | str) -> Iterator[Tuple[str, str]]:
 
         if header is not None:
             yield header, clean_seq("".join(seq_lines))
+
+
+def _build_cli_model_config(args: argparse.Namespace) -> FFNNModelConfig | None:
+    """Builds the model configuration using CLI arguments."""
+    any_explicit = any(
+        arg is not None
+        for arg in (
+            args.emb_dim,
+            args.hidden_sizes,
+            args.dropouts,
+            args.use_layer_norm,
+            args.use_residual,
+            args.num_classes
+        )
+    )
+    if not any_explicit:
+        return None
+
+    missing = []
+    if args.emb_dim is None:
+        missing.append("--emb-dim")
+    if args.hidden_sizes is None:
+        missing.append("--hidden-sizes")
+    if args.dropouts is None:
+        missing.append("--dropouts")
+    if args.use_layer_norm is None:
+        missing.append("--use-layer-norm/--no-use-layer-norm")
+    if args.use_residual is None:
+        missing.append("--use-residual/--no-use-residual")
+    if missing:
+        raise ValueError(
+            "When using explicit architecture flags, provide all required values: "
+            + ", ".join(missing)
+        )
+
+    hidden_sizes = parse_int_csv(args.hidden_sizes, "--hidden-sizes")
+    dropouts = parse_float_csv(args.dropouts, "--dropouts")
+    if len(hidden_sizes) != len(dropouts):
+        raise ValueError(
+            "--hidden-sizes and --dropouts must be the same length"
+        )
+    num_classes = int(args.num_classes) if args.num_classes is not None else 1
+
+    return FFNNModelConfig(
+        emb_dim=int(args.emb_dim),
+        hidden_sizes=tuple(hidden_sizes),
+        dropouts=tuple(dropouts),
+        num_classes=num_classes,
+        use_layer_norm=bool(args.use_layer_norm),
+        use_residual=bool(args.use_residual)
+    )
 
 
 def main() -> None:
@@ -101,6 +154,47 @@ def main() -> None:
                         dest="log_json",
                         default=False,
                         help="Emit logs as JSON lines for simple parsing.")
+    parser.add_argument("--emb-dim",
+                        action="store",
+                        dest="emb_dim",
+                        type=int,
+                        default=None,
+                        help="Explicit model embedding dimension used in training.")
+    parser.add_argument("--hidden-sizes",
+                        action="store",
+                        dest="hidden_sizes",
+                        type=str,
+                        default=None,
+                        help="Explicit hidden sizes CSV (e.g. 150,120,45).")
+    parser.add_argument("--dropouts",
+                        action="store",
+                        dest="dropouts",
+                        type=str,
+                        default=None,
+                        help="Explicit dropouts CSV (e.g. 0.1,0.1,0.1).")
+    parser.add_argument("--num-classes",
+                        action="store",
+                        dest="num_classes",
+                        type=int,
+                        default=None,
+                        help="Explicit output classes (binary=1).")
+    parser.add_argument("--use-layer-norm",
+                        action="store_true",
+                        dest="use_layer_norm",
+                        help="Explicit use layer normalization.")
+    parser.add_argument("--use-residual",
+                        action="store_true",
+                        dest="use_residual",
+                        help="Explicit use resdiuals.")
+    parser.add_argument("--no-use-layer-norm",
+                        action="store_false",
+                        dest="use_layer_norm",
+                        help="Explicit DO NOT use layer normalization.")
+    parser.add_argument("--no-use-residual",
+                        action="store_false",
+                        dest="use_residual",
+                        help="Explicit DO NOT use resdiuals.")
+    parser.set_defaults(use_layer_norm=None, use_residual=None)
     args = parser.parse_args()
 
     json_indent = 2 if args.log_json else None
@@ -120,15 +214,22 @@ def main() -> None:
 
     # load model from disk
     checkpoint = torch.load(args.checkpoint, map_location="cpu")
-    psp_model, model_cfg = build_model_from_checkpoint(
-        checkpoint, device=device)
+    cli_model_cfg = _build_cli_model_config(args)
+    psp_model, model_cfg, model_cfg_src = build_model_from_checkpoint(
+        checkpoint,
+        device=device,
+        model_config=cli_model_cfg
+    )
     if model_cfg.num_classes > 1:
         raise ValueError(
             f"Expected binary residue model with num_classes=1, got {model_cfg.num_classes}")
 
     # handle decision threshold determination
-    threshold = float(
-        args.threshold) if args.threshold is not None else infer_decision_threshold(checkpoint)
+    threshold = (
+        float(args.threshold)
+        if args.threshold is not None
+        else infer_decision_threshold(checkpoint)
+    )
     if threshold <= 0.0 or threshold >= 1.0:
         raise ValueError("--threshold must be between (0.0, 1.0)")
 
@@ -136,6 +237,7 @@ def main() -> None:
                 extra={"extra": {
                     "checkpoint": str(args.checkpoint),
                     "device": device,
+                    "model_cfg_src": model_cfg_src,
                     "emb_dim": model_cfg.emb_dim,
                     "hidden_sizes": model_cfg.hidden_sizes,
                     "use_layer_norm": model_cfg.use_layer_norm,

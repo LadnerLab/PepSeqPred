@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pepseqpred"
-version = "0.1.0"
+version = "1.0.0rc1"
 description = "Residue-level epitope prediction pipeline for peptide/protein workflows."
 readme = "README.md"
 requires-python = ">=3.12"
@@ -14,15 +14,40 @@ dependencies = [
   "torch>=2.4,<3",
   "fair-esm==2.0.0",
   "scikit-learn>=1.5,<2",
-  "optuna>=3.5,<5",
+  "optuna>=3.5,<5"
 ]
 
 [project.optional-dependencies]
 dev = [
   "pytest>=8.0",
   "pytest-cov>=5.0",
-  "ruff>=0.6",
+  "pytest-mock>=3.14",
+  "ruff>=0.6"
 ]
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+addopts = "-ra --strict-markers --cov=pepseqpred --cov-report=term-missing --cov-report=xml --cov-fail-under=75"
+testpaths = ["tests"]
+pythonpath = ["src"]
+markers = [
+  "unit: fast isolated tests",
+  "integration: component interaction tests",
+  "e2e: end-to-end pipeline tests",
+  "slow: longer-running tests"
+]
+
+[tool.coverage.run]
+branch = true
+source = ["pepseqpred"]
+omit = [
+  "tests/*"
+]
+
+[tool.coverage.report]
+show_missing = true
+skip_empty = true
+precision = 2
 
 [project.scripts]
 pepseqpred-esm = "pepseqpred.apps.esm_cli:main"

@@ -75,7 +75,7 @@ def main() -> None:
                         help="Prefix for subject column labels in z-score reactivity data.")
     parser.add_argument("--save",
                         action="store_true",
-                        dest="save_path",
+                        dest="save",
                         default=False,
                         help="Store results in a .tsv output file to be used in model training.")
 

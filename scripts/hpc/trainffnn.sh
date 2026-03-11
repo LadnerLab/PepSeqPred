@@ -67,6 +67,7 @@ NUM_WORKERS="${NUM_WORKERS:-1}"
 WINDOW_SIZE="${WINDOW_SIZE:-1000}"
 STRIDE="${STRIDE:-900}"
 SPLIT_TYPE="${SPLIT_TYPE:-id-family}" # id-family or id
+LABEL_CACHE_MODE="${LABEL_CACHE_MODE:-current}" # current or all
 
 mkdir -p "${SAVE_PATH}"
 
@@ -87,6 +88,7 @@ fi
 ${LAUNCHER} torchrun --nproc_per_node=4 train_ffnn.pyz \
     --embedding-dirs "${EMBEDDING_DIRS[@]}" \
     --label-shards "${LABEL_SHARDS[@]}" \
+    --label-cache-mode "$LABEL_CACHE_MODE" \
     --hidden-sizes "$HIDDEN_SIZES" \
     --dropouts "$DROPOUTS" \
     --epochs "$EPOCHS" \

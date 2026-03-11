@@ -22,7 +22,6 @@ import math
 import time
 from pathlib import Path
 from typing import Dict, List, Any
-import random
 import torch
 from torch.utils.data import DataLoader
 import torch.distributed as dist
@@ -38,7 +37,8 @@ from pepseqpred.core.train.split import (
     split_ids,
     split_ids_grouped,
     partition_ids_weighted,
-    sort_ids_for_locality
+    sort_ids_for_locality,
+    shuffle_ids_by_group
 )
 from pepseqpred.core.train.weights import pos_weight_from_label_shards
 from pepseqpred.core.train.embedding import infer_emb_dim
@@ -224,6 +224,13 @@ def main() -> None:
                         dest="drop_label_after_use",
                         action="store_false",
                         help="Keep labels in memory after each protein is processed")
+    parser.add_argument("--label-cache-mode",
+                        dest="label_cache_mode",
+                        action="store",
+                        type=str,
+                        default="current",
+                        choices=["current", "all"],
+                        help="Caching policy for label shard per worker")
     parser.add_argument("--split-seeds",
                         type=str,
                         default=None,
@@ -300,7 +307,8 @@ def main() -> None:
         pad_last_window=args.pad_last_window,
         return_meta=False,
         cache_current_label_shard=args.cache_current_label_shard,
-        drop_label_after_use=args.drop_label_after_use
+        drop_label_after_use=args.drop_label_after_use,
+        label_cache_mode=args.label_cache_mode
     )
     protein_ids = list(base_dataset.protein_ids)
     if args.subset > 0:
@@ -418,9 +426,10 @@ def main() -> None:
                 raise RuntimeError(
                     "At least one rank received 0 train IDs after weighted partitioning")
 
-        # shuffle train IDs per best deep learning practces
-        rng = random.Random(train_seed)
-        rng.shuffle(train_ids)
+        # randomize while preserving label-shard locality
+        train_ids = shuffle_ids_by_group(
+            train_ids, seed=train_seed, groups=id_groups
+        )
 
         train_data = ProteinDataset(
             embedding_dirs=embedding_dirs,
@@ -434,7 +443,8 @@ def main() -> None:
             pad_last_window=args.pad_last_window,
             return_meta=False,
             cache_current_label_shard=args.cache_current_label_shard,
-            drop_label_after_use=args.drop_label_after_use
+            drop_label_after_use=args.drop_label_after_use,
+            label_cache_mode=args.label_cache_mode
         )
         val_data = None
         if len(val_ids) > 0 or ddp is not None:
@@ -450,7 +460,8 @@ def main() -> None:
                 pad_last_window=args.pad_last_window,
                 return_meta=False,
                 cache_current_label_shard=args.cache_current_label_shard,
-                drop_label_after_use=args.drop_label_after_use
+                drop_label_after_use=args.drop_label_after_use,
+                label_cache_mode=args.label_cache_mode
             )
 
         # set up data loaders

@@ -100,5 +100,15 @@ def pos_weight_from_label_shards(label_shards: List[Path]) -> float:
                 f"{shard} missing class_stats (rebuild labels with --calc-pos-weight)"
             )
         total_pos += int(stats["pos_count"])
-        total_neg += int(stats["neg_counts"])
+        # Prefer the canonical key written by labels.builder, but support
+        # legacy/pluralized payloads for backwards compatibility.
+        if "neg_count" in stats:
+            total_neg += int(stats["neg_count"])
+        elif "neg_counts" in stats:
+            total_neg += int(stats["neg_counts"])
+        else:
+            raise ValueError(
+                f"{shard} class_stats missing negative count key "
+                "(expected 'neg_count' or 'neg_counts')"
+            )
     return float(total_neg / max(1, total_pos))

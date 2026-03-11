@@ -187,7 +187,7 @@ class ProteinLabelBuilder:
     def _load_embedding_length(self, protein_id: str) -> int:
         """Finds .pt path, loads embedding as tensor, and returns the length (number of amino acids)."""
         pt_path = self._find_pt_path(protein_id)
-        embedding = torch.load(pt_path, map_location="cpu")
+        embedding = torch.load(pt_path, map_location="cpu", weights_only=True)
         if not isinstance(embedding, torch.Tensor) or embedding.dim() != 2:
             raise ValueError(
                 f"Expected 2D tensor embedding for '{protein_id}', got {type(embedding)}")

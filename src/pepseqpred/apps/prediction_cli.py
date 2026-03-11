@@ -213,7 +213,8 @@ def main() -> None:
     layer = esm_model.num_layers
 
     # load model from disk
-    checkpoint = torch.load(args.checkpoint, map_location="cpu")
+    checkpoint = torch.load(
+        args.checkpoint, map_location="cpu", weights_only=True)
     cli_model_cfg = _build_cli_model_config(args)
     psp_model, model_cfg, model_cfg_src = build_model_from_checkpoint(
         checkpoint,

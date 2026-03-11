@@ -1,14 +1,35 @@
+# Python cache and local environments
 __pycache__/
-.ipynb_checkpoints
+.ipynb_checkpoints/
 .env
 .envrc
 .venv
 env/
 venv/
 ENV/
+
+# Editor settings
 .vscode/
+
+# Local build and smoke-test output
 smoketest/
 .build_pyz/
+build/
+dist/
+pip-wheel-metadata/
+
+# Test runner and coverage artifacts
+.pytest_cache/
+.pytest_tmp*/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+pytest-*.xml
+
+# Project-generated local data/artifacts
+*.egg-info/
+.eggs/
 *.fasta
 *.csv
 *.xlsx
@@ -19,3 +40,4 @@ smoketest/
 *.pyz
 *.png
 *.metadata
+*.json

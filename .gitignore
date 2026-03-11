@@ -19,3 +19,4 @@ smoketest/
 *.pyz
 *.png
 *.metadata
+*.json

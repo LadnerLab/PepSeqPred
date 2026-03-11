@@ -291,7 +291,7 @@ class Trainer:
                 else:
                     # compute predictions at most optimal threshold calculated
                     thresh_out = find_threshold_max_recall_min_precision(
-                        y_true, y_prob, min_precision=0.25, num_thresholds=999)
+                        y_true, y_prob, min_precision=0.25)
                     best_thresh = float(thresh_out["threshold"])
                     y_pred = (y_prob >= best_thresh).astype(np.int64)
 

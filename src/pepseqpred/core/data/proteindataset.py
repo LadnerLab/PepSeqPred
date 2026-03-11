@@ -101,6 +101,25 @@ def _iter_windows(length: int, window_size: Optional[int] = 1000, stride: Option
         start += stride
 
 
+def _slice_ids_contiguous(
+    ids: Sequence[str],
+    worker_id: int,
+    num_workers: int
+) -> List[str]:
+    """Splits IDs into contiguous chunks to preserve shard locality."""
+    total = len(ids)
+    if total == 0:
+        return []
+
+    # chunking based on number of workers
+    base = total // num_workers
+    remainder = total % num_workers
+    start = worker_id * base + min(worker_id, remainder)
+    size = base + (1 if worker_id < remainder else 0)
+    end = start + size
+    return list(ids[start:end])
+
+
 def pad_collate(batch: List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Pads the embeddings, labels, and masks with default values to meet minimum Tensor size requirement.
@@ -214,6 +233,7 @@ class ProteinDataset(IterableDataset):
         delete_embedding_files: bool = False,
         cache_current_label_shard: bool = True,
         drop_label_after_use: bool = True,
+        label_cache_mode: Literal["current", "all"] = "current"
     ) -> None:
         super().__init__()
         self.embedding_dirs = [Path(p) for p in embedding_dirs]
@@ -226,6 +246,10 @@ class ProteinDataset(IterableDataset):
         self.delete_embedding_files = delete_embedding_files
         self.cache_current_label_shard = cache_current_label_shard
         self.drop_label_after_use = drop_label_after_use
+        self.label_cache_mode = label_cache_mode
+        self._all_labels_cache: Optional[
+            Dict[Path, Dict[str, torch.Tensor]]
+        ] = None
         self.embedding_key_delimiter = embedding_key_delimiter
 
         # ensure embedding index exists for fast lookup
@@ -270,18 +294,48 @@ class ProteinDataset(IterableDataset):
         else:
             self.protein_ids = protein_ids
 
+        if self.label_cache_mode not in {"current", "all"}:
+            raise ValueError(
+                "label_cache_mode must be either 'current' or 'all'"
+            )
+        if self.label_cache_mode == "all":
+            self.drop_label_after_use = False
+
     def __iter__(self) -> Iterator:
         # shard protein IDs across DataLoader workers to avoid duplication
         worker_info = get_worker_info()
+        ids = list(self.protein_ids)
         if worker_info is None:
-            protein_ids = self.protein_ids
+            protein_ids = ids
         else:
-            protein_ids = list(self.protein_ids)[
-                worker_info.id::worker_info.num_workers]
+            protein_ids = _slice_ids_contiguous(
+                ids, worker_info.id, worker_info.num_workers
+            )
 
         current_shard_path: Optional[Path] = None
         current_payload: Optional[Dict[str, torch.Tensor]] = None
         current_labels: Optional[Dict[str, torch.Tensor]] = None
+        all_labels_cache: Dict[Path, Dict[str, torch.Tensor]] = {}
+
+        if self.label_cache_mode == "all":
+            if self._all_labels_cache is None:
+                cache: Dict[Path, Dict[str, torch.Tensor]] = {}
+                shard_paths = sorted(
+                    {self.label_index[pid]
+                     for pid in protein_ids
+                     if pid in self.label_index}
+                )
+                for shard_path in shard_paths:
+                    payload = torch.load(
+                        shard_path, map_location="cpu", weights_only=False)
+                    labels = payload.get("labels")
+                    if not isinstance(labels, dict):
+                        raise TypeError(
+                            f"'labels' in {shard_path} must be of type 'dict'"
+                        )
+                    cache[Path(shard_path)] = labels
+                self._all_labels_cache = cache
+            all_labels_cache = self._all_labels_cache
 
         for protein_id in protein_ids:
             emb_path = self.embedding_index.get(protein_id)
@@ -289,16 +343,22 @@ class ProteinDataset(IterableDataset):
             if emb_path is None or shard_path is None:
                 continue
 
-            if not self.cache_current_label_shard or (shard_path != current_shard_path):
-                current_payload = torch.load(
-                    shard_path, map_location="cpu", weights_only=False)
-                if not isinstance(current_payload, dict) or "labels" not in current_payload:
-                    raise TypeError(
-                        f"Label shard {shard_path} must be a dict with 'labels' key")
-                current_labels = current_payload["labels"]
-                if not isinstance(current_labels, dict):
-                    raise TypeError(
-                        f"'labels' in {shard_path} must be a dict, not type {type(current_labels)}")
+            if self.label_cache_mode == "all":
+                current_labels = all_labels_cache.get(Path(shard_path))
+            else:
+                if (not self.cache_current_label_shard) or (shard_path != current_shard_path):
+                    current_payload = torch.load(
+                        shard_path, map_location="cpu", weights_only=False
+                    )
+                    if not isinstance(current_payload, dict) or "labels" not in current_payload:
+                        raise TypeError(
+                            f"Label shard {shard_path} must be of type 'dict' with 'labels' key"
+                        )
+                    current_labels = current_payload["labels"]
+                    if not isinstance(current_labels, dict):
+                        raise TypeError(
+                            f"'labels' in {shard_path} must be a 'dict', not type {type(current_labels)}"
+                        )
                 current_shard_path = shard_path
 
             if current_labels is None or str(protein_id) not in current_labels:
@@ -367,7 +427,9 @@ class ProteinDataset(IterableDataset):
             del y
             del mask_valid
 
-            if self.drop_label_after_use and current_labels is not None:
+            if (self.drop_label_after_use
+                    and self.label_cache_mode == "current"
+                    and current_labels is not None):
                 current_labels.pop(str(protein_id), None)
 
             if self.delete_embedding_files:

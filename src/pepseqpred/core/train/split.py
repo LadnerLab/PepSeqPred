@@ -151,6 +151,49 @@ def sort_ids_for_locality(ids: List[str],
     return sorted(list(ids), key=lambda protein_id: (groups.get(protein_id, ""), protein_id))
 
 
+def shuffle_ids_by_group(
+    ids: List[str],
+    seed: int,
+    groups: Optional[Dict[str, str]] = None
+) -> List[str]:
+    """
+    Shuffle group order while keeping IDs within each group contiguous.
+
+
+    Parameters
+    ----------
+        ids : List[str]
+            Protein IDs to sort.
+        seed : int
+            Number used to seed the random number generator for shuffling.
+        groups : Optional[Dict[str, str]]
+            Optional group dictionary mapping how to group protein IDs to keep them contiguous.
+
+    Returns
+    -------
+        List[str]
+        Sorted list of protein IDs optionally grouped together in contiguous manner.
+    """
+    ids = list(ids)
+    if len(ids) <= 1:
+        return ids
+
+    groups = groups or {}
+    groups_to_ids: Dict[str, List[str]] = {}
+    for protein_id in ids:
+        group_id = str(groups.get(protein_id, ""))
+        groups_to_ids.setdefault(group_id, []).append(protein_id)
+
+    rng = random.Random(seed)
+    group_ids = sorted(groups_to_ids.keys())
+    rng.shuffle(group_ids)
+
+    out: List[str] = []
+    for group_id in group_ids:
+        out.extend(groups_to_ids[group_id])
+    return out
+
+
 def partition_ids_weighted(ids: List[str],
                            world_size: int,
                            weights: Optional[Dict[str, float]] = None,

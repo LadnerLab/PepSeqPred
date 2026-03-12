@@ -63,6 +63,12 @@ This repository supports both:
 - local development and validation of pipeline logic, and
 - production-scale HPC execution for embedding generation, training, and tuning.
 
+## Maintainer Contact
+
+- Use GitHub issues for normal development questions, bug reports, and feature requests.
+- Use email for private or sensitive matters that should not be posted publicly.
+- Maintainer contact: [Jeffrey Hoelzel](mailto:jmh2338@nau.edu) or [Jason Ladner](mailto:jason.ladner@nau.edu).
+
 ## Prerequisites
 
 Software:

@@ -4,7 +4,7 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=1
 #SBATCH --mem=16G
-#SBATCH --time=1:30:00
+#SBATCH --time=1:00:00
 #SBATCH --output=/scratch/%u/labels_slurm/%A_%a/%x.out
 #SBATCH --error=/scratch/%u/labels_slurm/%A_%a/%x.err
 

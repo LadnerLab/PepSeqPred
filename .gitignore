@@ -38,6 +38,5 @@ pytest-*.xml
 *.log
 *.txt
 *.pyz
-*.png
 *.metadata
 *.json

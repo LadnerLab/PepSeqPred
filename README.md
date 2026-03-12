@@ -1,9 +1,17 @@
-# PepSeqPred
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="PepSeqPred_logo_white.png">
+    <source media="(prefers-color-scheme: light)" srcset="PepSeqPred_logo_black.png">
+    <img src="PepSeqPred_logo_black.png" alt="PepSeqPred logo">
+  </picture>
+</p>
+
+# Overview
 
 PepSeqPred is a residue-level epitope prediction pipeline for protein workflows.  
 It converts upstream assay and sequence data into training-ready artifacts, trains feed-forward neural network models on ESM-2 embeddings, and produces binary residue masks for downstream inference.
 
-## About PepSeqPred
+## About
 
 PepSeqPred is designed for research workflows where you need to:
 - map peptide-level signals to residue-level supervision,

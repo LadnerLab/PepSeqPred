@@ -2,7 +2,7 @@
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="PepSeqPred_logo_white.png">
     <source media="(prefers-color-scheme: light)" srcset="PepSeqPred_logo_black.png">
-    <img src="PepSeqPred_logo_black.png" alt="PepSeqPred logo">
+    <img src="PepSeqPred_logo_black.png" alt="PepSeqPred logo" width="320">
   </picture>
 </p>
 

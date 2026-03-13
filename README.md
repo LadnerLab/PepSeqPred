@@ -148,6 +148,88 @@ pytest -m "unit or integration or e2e"
 
 This repository expects all of the checks above to pass before you start development work or run pipeline stages.
 
+## Build and Transfer HPC Runtime Artifacts (`.pyz` + SLURM Scripts)
+
+The HPC shell scripts in `scripts/hpc/` execute zipapp files such as `esm.pyz`, `labels.pyz`, `train_ffnn.pyz`, and `predict.pyz`.
+
+Build only the app(s) you need for your current stage, then copy those `.pyz` files plus the matching SLURM script(s) to HPC.
+
+### 1. Build `.pyz` artifacts locally
+
+List available zipapp targets:
+
+```bash
+python scripts/tools/buildpyz.py --list
+```
+
+Build one runtime app (recommended default):
+
+```bash
+python scripts/tools/buildpyz.py <app_name>
+```
+
+Examples:
+
+```bash
+python scripts/tools/buildpyz.py esm
+python scripts/tools/buildpyz.py train_ffnn
+```
+
+Optional: build all apps:
+
+```bash
+python scripts/tools/buildpyz.py all
+```
+
+By default this writes artifacts to `dist/` as:
+- versioned files: `<name>_<gitrev>.pyz`
+- convenience copies: `<name>_latest.pyz`
+
+### 2. Transfer required `.pyz` file(s) and shell script(s) to HPC
+
+Each HPC script expects a plain `.pyz` filename in the same working directory:
+- `generateembeddings.sh` -> `esm.pyz`
+- `generatelabels.sh` -> `labels.pyz`
+- `trainffnn.sh` -> `train_ffnn.pyz`
+- `trainffnnoptuna.sh` -> `train_ffnn_optuna.pyz`
+- `predictepitope.sh` -> `predict.pyz`
+- `preprocessdata.sh` -> `preprocess.pyz` (optional)
+
+Example: transfer only embedding stage artifacts:
+
+```bash
+scp dist/esm_latest.pyz <user>@<cluster-host>:/home/<user>/pepseqpred_hpc/esm.pyz
+scp scripts/hpc/generateembeddings.sh <user>@<cluster-host>:/home/<user>/pepseqpred_hpc/
+```
+
+Example: transfer multiple stage artifacts:
+
+```bash
+scp dist/labels_latest.pyz <user>@<cluster-host>:/home/<user>/pepseqpred_hpc/labels.pyz
+scp dist/train_ffnn_latest.pyz <user>@<cluster-host>:/home/<user>/pepseqpred_hpc/train_ffnn.pyz
+scp scripts/hpc/generatelabels.sh scripts/hpc/trainffnn.sh <user>@<cluster-host>:/home/<user>/pepseqpred_hpc/
+```
+
+### 3. Prepare on cluster and smoke-check artifacts
+
+```bash
+cd /home/<user>/pepseqpred_hpc
+chmod +x *.sh
+ls -lh *.pyz *.sh
+
+# Run help checks for the app(s) you uploaded
+python3 esm.pyz --help
+```
+
+Run SLURM jobs from this directory so relative `.pyz` filenames resolve correctly.
+
+### 4. Update cycle after code changes
+
+Any CLI code change requires rebuilding and redeploying corresponding `.pyz` files:
+1. Re-run `python scripts/tools/buildpyz.py <app_name>`.
+2. Re-transfer updated `dist/<app>_latest.pyz` to HPC as `<app>.pyz`.
+3. Re-run jobs using the updated artifact.
+
 ## Pipeline Stages and Hardware Expectations
 
 Run the main pipeline in this order:

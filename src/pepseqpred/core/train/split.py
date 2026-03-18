@@ -108,6 +108,120 @@ def split_ids_grouped(
     return train_ids, val_ids
 
 
+def build_kfold_splits(ids: List[str], n_folds: int, seed: int) -> List[Tuple[List[str], List[str]]]:
+    """
+    Build deterministic K-fold train/validation splits over IDs.
+
+    Parameters
+    ----------
+        ids : List[str]
+            IDs to partition.
+        n_folds : int
+            Number of folds, must be >= 2 and <= len(ids).
+        seed : int
+            Seed used to shuffle IDs before assignment.
+
+    Returns
+    -------
+        List[Tuple[List[str], List[str]]]
+            A list of `(train_ids, val_ids)` pairs for each fold.
+    """
+    ids = list(ids)
+    if n_folds < 2:
+        raise ValueError("n_folds must be >= 2")
+    if len(ids) < n_folds:
+        raise ValueError(
+            f"n_folds={n_folds} cannot exceed number of IDs={len(ids)}"
+        )
+
+    rng = random.Random(seed)
+    rng.shuffle(ids)
+
+    fold_bins: List[List[str]] = [[] for _ in range(n_folds)]
+    for idx, protein_id in enumerate(ids):
+        fold_bins[idx % n_folds].append(protein_id)
+
+    out: List[Tuple[List[str], List[str]]] = []
+    for fold_idx in range(n_folds):
+        val_ids = list(fold_bins[fold_idx])
+        train_ids = [
+            protein_id
+            for idx, members in enumerate(fold_bins)
+            if idx != fold_idx
+            for protein_id in members
+        ]
+        out.append((train_ids, val_ids))
+    return out
+
+
+def build_grouped_kfold_splits(
+    ids: List[str],
+    n_folds: int,
+    seed: int,
+    groups: Dict[str, str]
+) -> List[Tuple[List[str], List[str]]]:
+    """
+    Build deterministic K-fold splits while keeping groups intact.
+
+    Any ID missing in `groups` is treated as a singleton group keyed by the ID.
+    """
+    ids = list(ids)
+    if n_folds < 2:
+        raise ValueError("n_folds must be >= 2")
+    if len(ids) == 0:
+        raise ValueError("ids cannot be empty")
+
+    # build group -> member IDs while preserving the order seen in `ids`
+    group_to_ids: Dict[str, List[str]] = {}
+    for protein_id in ids:
+        group_id = str(groups.get(protein_id, protein_id))
+        group_to_ids.setdefault(group_id, []).append(protein_id)
+
+    if len(group_to_ids) < n_folds:
+        raise ValueError(
+            f"n_folds={n_folds} cannot exceed number of groups={len(group_to_ids)}"
+        )
+
+    rng = random.Random(seed)
+    group_items = list(group_to_ids.items())
+    rng.shuffle(group_items)
+    # assign larger groups first for better fold balance
+    group_items.sort(key=lambda item: -len(item[1]))
+
+    fold_groups: List[Set[str]] = [set() for _ in range(n_folds)]
+    fold_sizes = [0 for _ in range(n_folds)]
+    for group_id, members in group_items:
+        fold_idx = min(
+            range(n_folds),
+            key=lambda k: (fold_sizes[k], len(fold_groups[k]), k)
+        )
+        fold_groups[fold_idx].add(group_id)
+        fold_sizes[fold_idx] += len(members)
+
+    if any(len(member_groups) == 0 for member_groups in fold_groups):
+        raise RuntimeError("Grouped K-fold assignment produced an empty fold")
+
+    out: List[Tuple[List[str], List[str]]] = []
+    for fold_idx in range(n_folds):
+        val_group_ids = fold_groups[fold_idx]
+        val_ids = [
+            protein_id
+            for protein_id in ids
+            if str(groups.get(protein_id, protein_id)) in val_group_ids
+        ]
+        train_ids = [
+            protein_id
+            for protein_id in ids
+            if str(groups.get(protein_id, protein_id)) not in val_group_ids
+        ]
+        if len(val_ids) == 0 or len(train_ids) == 0:
+            raise RuntimeError(
+                f"Fold {fold_idx + 1} has empty split (train={len(train_ids)}, val={len(val_ids)})"
+            )
+        out.append((train_ids, val_ids))
+    return out
+
+
 def shard_ids_by_rank(ids: List[str], ddp: Dict[str, Any] | None) -> List[str]:
     """
     Shard an ID list across ranks for DDP hyperparameter optimization.

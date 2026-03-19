@@ -14,8 +14,8 @@
 USE_SRUN="${USE_SRUN:-1}"
 
 usage() {
-    echo "Usage: $0 <checkpoint> <fasta_input> <output_fasta>"
-    echo "  checkpoint: Path to trained checkpoint .pt file."
+    echo "Usage: $0 <model_artifact> <fasta_input> <output_fasta>"
+    echo "  model_artifact: Path to trained checkpoint .pt file OR ensemble manifest .json."
     echo "  fasta_input: Input FASTA file."
     echo "  output_fasta: Output FASTA file for predicted binary masks."
     echo ""
@@ -24,6 +24,8 @@ usage() {
     echo "  MODEL_NAME         default: esm2_t33_650M_UR50D"
     echo "  MAX_TOKENS         default: 1022"
     echo "  THRESHOLD          default: unset (use checkpoint threshold)"
+    echo "  ENSEMBLE_SET_INDEX default: 1 (schema v2 manifest only)"
+    echo "  K_FOLDS            default: unset (use all valid members)"
     echo "  LOG_DIR            default: logs"
     echo "  LOG_LEVEL          default: INFO"
     echo "  PREDICT_EXTRA_ARGS default: unset (raw extra prediction CLI args)"
@@ -50,13 +52,15 @@ if [ "$#" -lt 3 ]; then
     exit 1
 fi
 
-CHECKPOINT="$1"
+MODEL_ARTIFACT="$1"
 FASTA_INPUT="$2"
 OUTPUT_FASTA="$3"
 
 MODEL_NAME="${MODEL_NAME:-esm2_t33_650M_UR50D}"
 MAX_TOKENS="${MAX_TOKENS:-1022}"
 THRESHOLD="${THRESHOLD:-}"
+ENSEMBLE_SET_INDEX="${ENSEMBLE_SET_INDEX:-1}"
+K_FOLDS="${K_FOLDS:-}"
 LOG_DIR="${LOG_DIR:-logs}"
 LOG_LEVEL="${LOG_LEVEL:-INFO}"
 
@@ -79,6 +83,8 @@ CLI_ARGS=(
 
 # optional decision threshold passes
 [ -n "${THRESHOLD}" ] && CLI_ARGS+=(--threshold "${THRESHOLD}")
+[ -n "${ENSEMBLE_SET_INDEX}" ] && CLI_ARGS+=(--ensemble-set-index "${ENSEMBLE_SET_INDEX}")
+[ -n "${K_FOLDS}" ] && CLI_ARGS+=(--k-folds "${K_FOLDS}")
 
 # optional environment-driven flags
 [ -n "${EMB_DIM}" ] && CLI_ARGS+=(--emb-dim "${EMB_DIM}")
@@ -108,6 +114,6 @@ else
 fi
 
 ${LAUNCHER} python -u predict.pyz \
-    "${CHECKPOINT}" \
+    "${MODEL_ARTIFACT}" \
     "${FASTA_INPUT}" \
     "${CLI_ARGS[@]}"

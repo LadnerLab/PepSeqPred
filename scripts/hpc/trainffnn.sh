@@ -21,6 +21,14 @@ usage() {
     echo ""
     echo "Example:"
     echo "  $0 /scratch/$USER/embeddings/shard1 /scratch/$USER/embeddings/shard2 -- /scratch/$USER/labels/labels_00.pt /scratch/$USER/labels/labels_01.pt"
+    echo ""
+    echo "Optional environment variables:"
+    echo "  TRAIN_MODE            default: seeded (seeded or ensemble-kfold)"
+    echo "  N_FOLDS               default: 5 (ensemble-kfold only)"
+    echo "  SPLIT_SEEDS           default: 11,22,33,44,55"
+    echo "  TRAIN_SEEDS           default: 101,202,303,404,505"
+    echo "  FOLD_SEED             default: unset (legacy single-set fallback)"
+    echo "  ENSEMBLE_MEMBER_TRAIN_SEEDS  default: unset (legacy per-fold train seeds CSV)"
 }
 
 # require at least one embedding dir, separator (--), one label shard
@@ -56,6 +64,10 @@ EPOCHS="${EPOCHS:-10}"
 BEST_MODEL_METRIC="${BEST_MODEL_METRIC:-pr_auc}"
 SPLIT_SEEDS="${SPLIT_SEEDS:-11,22,33,44,55}"
 TRAIN_SEEDS="${TRAIN_SEEDS:-101,202,303,404,505}"
+TRAIN_MODE="${TRAIN_MODE:-seeded}" # seeded or ensemble-kfold
+N_FOLDS="${N_FOLDS:-5}"
+FOLD_SEED="${FOLD_SEED:-}"
+ENSEMBLE_MEMBER_TRAIN_SEEDS="${ENSEMBLE_MEMBER_TRAIN_SEEDS:-}"
 BATCH_SIZE="${BATCH_SIZE:-256}" # ensure batch size is 4 times what you would do for one GPU (for example. 256 = 64 * 4)
 LR="${LR:-0.001}"
 WD="${WD:-0.0}"
@@ -63,6 +75,7 @@ VAL_FRAC="${VAL_FRAC:-0.2}"
 POS_WEIGHT="${POS_WEIGHT:-13.18999647945325}" # calculated from previous script
 SAVE_PATH="/scratch/$USER/models/${SLURM_JOB_NAME:-ffnn_job}"
 RESULTS_CSV="${SAVE_PATH}/runs.csv"
+ENSEMBLE_MANIFEST="${ENSEMBLE_MANIFEST:-${SAVE_PATH}/ensemble_manifest.json}"
 NUM_WORKERS="${NUM_WORKERS:-1}"
 WINDOW_SIZE="${WINDOW_SIZE:-1000}"
 STRIDE="${STRIDE:-900}"
@@ -85,6 +98,22 @@ else
     LAUNCHER=""
 fi
 
+TRAIN_MODE_ARGS=(--train-mode "$TRAIN_MODE")
+if [ "$TRAIN_MODE" = "ensemble-kfold" ]; then
+    TRAIN_MODE_ARGS+=(--n-folds "$N_FOLDS")
+    TRAIN_MODE_ARGS+=(--ensemble-manifest "$ENSEMBLE_MANIFEST")
+    if [ -n "$SPLIT_SEEDS" ] && [ -n "$TRAIN_SEEDS" ]; then
+        TRAIN_MODE_ARGS+=(--split-seeds "$SPLIT_SEEDS")
+        TRAIN_MODE_ARGS+=(--train-seeds "$TRAIN_SEEDS")
+    else
+        [ -n "$FOLD_SEED" ] && TRAIN_MODE_ARGS+=(--fold-seed "$FOLD_SEED")
+        [ -n "$ENSEMBLE_MEMBER_TRAIN_SEEDS" ] && TRAIN_MODE_ARGS+=(--ensemble-train-seeds "$ENSEMBLE_MEMBER_TRAIN_SEEDS")
+    fi
+else
+    TRAIN_MODE_ARGS+=(--split-seeds "$SPLIT_SEEDS")
+    TRAIN_MODE_ARGS+=(--train-seeds "$TRAIN_SEEDS")
+fi
+
 ${LAUNCHER} torchrun --nproc_per_node=4 train_ffnn.pyz \
     --embedding-dirs "${EMBEDDING_DIRS[@]}" \
     --label-shards "${LABEL_SHARDS[@]}" \
@@ -92,8 +121,7 @@ ${LAUNCHER} torchrun --nproc_per_node=4 train_ffnn.pyz \
     --hidden-sizes "$HIDDEN_SIZES" \
     --dropouts "$DROPOUTS" \
     --epochs "$EPOCHS" \
-    --split-seeds "$SPLIT_SEEDS" \
-    --train-seeds "$TRAIN_SEEDS" \
+    "${TRAIN_MODE_ARGS[@]}" \
     --batch-size "$BATCH_SIZE" \
     --lr "$LR" \
     --wd "$WD" \

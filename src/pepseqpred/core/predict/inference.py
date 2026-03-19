@@ -1,7 +1,7 @@
 from dataclasses import dataclass
 import math
 import re
-from typing import Tuple, Dict, Any, Mapping, List, Optional
+from typing import Tuple, Dict, Any, Mapping, List, Optional, Sequence
 import esm
 import torch
 import numpy as np
@@ -258,12 +258,41 @@ def infer_decision_threshold(checkpoint: Mapping[str, Any], default: float = 0.5
     return thresh
 
 
-def _embed_protein_seq(protein_seq: str,
-                       esm_model: torch.nn.Module,
-                       layer: int,
-                       batch_converter: esm.data.BatchConverter,
-                       device: str,
-                       max_tokens: int = 1022) -> torch.Tensor:
+def _build_prediction_payload(
+    probs: torch.Tensor,
+    mask: torch.Tensor,
+    threshold: float
+) -> Dict[str, Any]:
+    """Builds prediction payload from already computed probabilities and mask."""
+    if probs.dim() != 1:
+        raise ValueError(
+            f"Expected probs shape (L,), got {tuple(probs.shape)}")
+    if mask.dim() != 1:
+        raise ValueError(f"Expected mask shape (L,), got {tuple(mask.shape)}")
+    if probs.numel() != mask.numel():
+        raise ValueError(
+            f"Expected matching probs/mask lengths, got probs={probs.numel()} mask={mask.numel()}"
+        )
+
+    # build binary string
+    binary_mask = "".join("1" if int(x) == 1 else "0" for x in mask.tolist())
+    return {
+        "binary_mask": binary_mask,
+        "length": int(mask.numel()),
+        "n_epitopes": int(mask.sum().item()),
+        "frac_epitope": float(mask.float().mean().item()),
+        "p_epitope_mean": float(probs.mean().item()),
+        "p_epitope_max": float(probs.max().item()),
+        "threshold": float(threshold)
+    }
+
+
+def embed_protein_seq(protein_seq: str,
+                      esm_model: torch.nn.Module,
+                      layer: int,
+                      batch_converter: esm.data.BatchConverter,
+                      device: str,
+                      max_tokens: int = 1022) -> torch.Tensor:
     """
     Generates the embedding for an entire protein sequence.
 
@@ -287,7 +316,16 @@ def _embed_protein_seq(protein_seq: str,
     -------
         Tensor
             The entire protein sequence's embeddings as a tensor of shape (seq_len, emb_dim).
+
+    Raises
+    ------
+        ValueError
+            If the cleaned protein sequence is empty.
     """
+    protein_seq = clean_seq(protein_seq)
+    if not protein_seq:
+        raise ValueError("Protein sequence is empty after cleaning")
+
     # get batched tokens using one sequence passed
     pairs = [("query", protein_seq)]
     _, _, batch_tokens = batch_converter(pairs)
@@ -313,6 +351,168 @@ def _embed_protein_seq(protein_seq: str,
     return torch.from_numpy(rep_np)
 
 
+def predict_member_probabilities_from_embedding(
+    psp_model: PepSeqFFNN,
+    protein_emb: torch.Tensor,
+    device: str
+) -> torch.Tensor:
+    """
+    Predicts residue-level epitope probabilities from a precomputed protein embedding.
+
+    Parameters
+    ----------
+        psp_model : PepSeqFFNN
+            The PepSeqPred model to use for predicting member probabilities.
+        protein_emb : torch.Tensor
+            Protein embedding to pass through model.
+        device : str
+            Device type: `"cuda"` for GPUs, otherwise `"cpu"`.
+    Returns
+    -------
+        torch.Tensor
+            The predicted probabilities of each residue being an epitope.
+
+    Raises
+    ------
+        ValueError
+            If the protein embedding does not have shape `(L, E)` or the model
+            logits are not returned as shape `(1, L)`.
+    """
+    if protein_emb.dim() != 2:
+        raise ValueError(
+            f"Expected protein embedding shape (L, E), got {tuple(protein_emb.shape)}"
+        )
+    non_blocking = device.startswith("cuda") and torch.cuda.is_available()
+    X = protein_emb.unsqueeze(0).to(device, non_blocking=non_blocking)
+
+    # start inference
+    with torch.inference_mode():
+        logits = psp_model(X)  # (1, L)
+        if logits.dim() != 2 or logits.size(0) != 1:
+            raise ValueError(
+                f"Expected logits shape (1, L), got {tuple(logits.shape)}")
+        return torch.sigmoid(logits)[0].detach().cpu()
+
+
+def predict_from_embedding(psp_model: PepSeqFFNN,
+                           protein_emb: torch.Tensor,
+                           device: str,
+                           threshold: float = 0.5) -> Dict[str, Any]:
+    """
+    Predict residue-level binary epitope mask from precomputed protein embedding.
+
+    Parameters
+    ----------
+        psp_model : PepSeqFFNN
+            The PepSeqPred model to use for predicting member probabilities.
+        protein_emb : torch.Tensor
+            Protein embedding to pass through model.
+        device : str
+            Device type: `"cuda"` for GPUs, otherwise `"cpu"`.
+        threshold : float
+            The threshold between `0.0` and `1.0`, that determine the cutoff for non-epitope vs definite epitope. Default is `0.5`.
+
+    Returns
+    -------
+        Dict[str, Any]
+            Prediction payload from computed probabilities and mask.
+
+    Raises
+    ------
+        ValueError
+            If `threshold` is outside `(0.0, 1.0)`, or if downstream probability
+            prediction/payload construction receives invalid tensor shapes.
+    """
+    if threshold <= 0.0 or threshold >= 1.0:
+        raise ValueError("threshold must be in (0.0, 1.0)")
+
+    probs = predict_member_probabilities_from_embedding(
+        psp_model=psp_model,
+        protein_emb=protein_emb,
+        device=device
+    )
+    mask = (probs >= threshold).to(torch.int64)
+    return _build_prediction_payload(probs=probs, mask=mask, threshold=threshold)
+
+
+def predict_ensemble_from_embedding(
+    psp_models: Sequence[PepSeqFFNN],
+    protein_emb: torch.Tensor,
+    device: str,
+    thresholds: Sequence[float]
+) -> Dict[str, Any]:
+    """
+    Predict residue-level mask using strict majority vote across model members.
+
+    Parameters
+    ----------
+        psp_models : Sequence[PepSeqFFNN]
+            A sequence of PepSeqPred models to use for majority vote prediction of member probabilities.
+        protein_emb : torch.Tensor
+            Protein embedding to pass through models.
+        device : str
+            Device type: `"cuda"` for GPUs, otherwise `"cpu"`.
+        thresholds : Sequence[float]
+            A sequence of thresholds between `0.0` and `1.0`, that determine the cutoff for non-epitope vs definite epitope. Default is `0.5`.
+
+    Returns
+    -------
+        Dict[str, Any]
+            Complete prediction payload based on each model fold prediction.
+
+    Raises
+    ------
+        ValueError
+            If no models are provided, if number of models and thresholds differs,
+            if any threshold is outside `(0.0, 1.0)`, if member probability shapes
+            are invalid, or if member output lengths are inconsistent.
+    """
+    if len(psp_models) < 1:
+        raise ValueError(
+            "At least one model is required for ensemble prediction")
+    if len(psp_models) != len(thresholds):
+        raise ValueError(
+            f"Model/threshold length mismatch: models={len(psp_models)} thresholds={len(thresholds)}"
+        )
+
+    member_probs: List[torch.Tensor] = []
+    member_masks: List[torch.Tensor] = []
+    for model, threshold in zip(psp_models, thresholds):
+        if threshold <= 0.0 or threshold >= 1.0:
+            raise ValueError("each threshold must be in (0.0, 1.0)")
+        probs = predict_member_probabilities_from_embedding(
+            psp_model=model,
+            protein_emb=protein_emb,
+            device=device
+        )
+        if probs.dim() != 1:
+            raise ValueError(
+                f"Expected member probs shape (L,), got {tuple(probs.shape)}"
+            )
+        member_probs.append(probs)
+        member_masks.append((probs >= threshold).to(torch.int64))
+
+    seq_lengths = {int(mask.numel()) for mask in member_masks}
+    if len(seq_lengths) != 1:
+        raise ValueError(
+            "All ensemble members must produce the same sequence length")
+
+    vote_sum = torch.stack(member_masks, dim=0).sum(dim=0)
+    n_members = int(len(member_masks))
+    votes_needed = int((n_members // 2) + 1)
+    majority_mask = (vote_sum >= votes_needed).to(torch.int64)
+    mean_probs = torch.stack(member_probs, dim=0).mean(dim=0)
+    out = _build_prediction_payload(
+        probs=mean_probs,
+        mask=majority_mask,
+        threshold=float("nan")
+    )
+    out["n_members"] = n_members
+    out["votes_needed"] = votes_needed
+    out["member_thresholds"] = [float(x) for x in thresholds]
+    return out
+
+
 def predict_protein(psp_model: PepSeqFFNN,
                     esm_model: torch.nn.Module,
                     layer: int,
@@ -323,39 +523,50 @@ def predict_protein(psp_model: PepSeqFFNN,
                     threshold: float = 0.5) -> Dict[str, Any]:
     """
     Predict residue-level binary epitope mask for one protein sequence
+
+    Parameters
+    ----------
+        psp_model : PepSeqFFNN
+            The PepSeqPred model to use for predicting member probabilities.
+        esm_model : torch.nn.Module
+            The ESM-2 model to use for embedding generation.
+        layer : int
+            Which layer of the ESM-2 model to use for embedding generation.
+        batch_converter : esm.data.BatchConverter
+            ESM-2 batch converter for converting raw protein sequences to embeddings.
+        protein_seq : str
+            Protein sequence to embed then pass through PepSeqPred.
+        max_token : int
+            The maximum amount of tokens to account for per pass.
+        device : str
+            Device type: `"cuda"` for GPUs, otherwise `"cpu"`.
+        threshold : float
+            The threshold between `0.0` and `1.0`, that determine the cutoff for non-epitope vs definite epitope. Default is `0.5`.
+
+    Returns
+    -------
+        Dict[str, Any]
+            Prediction payload from computed probabilities and mask.
+
+    Raises
+    ------
+        ValueError
+            If the threshold is outside (`0.0, 1.0)`.
     """
     if threshold <= 0.0 or threshold >= 1.0:
         raise ValueError("threshold must be in (0.0, 1.0)")
 
-    protein_seq = clean_seq(protein_seq)
-    if not protein_seq:
-        raise ValueError("Protein sequence is empty after cleaning")
-
-    # generate protein sequence residue embeddings
-    protein_emb = _embed_protein_seq(
-        protein_seq, esm_model, layer, batch_converter, device, max_tokens)
-    non_blocking = device.startswith("cuda") and torch.cuda.is_available()
-    X = protein_emb.unsqueeze(0).to(device, non_blocking=non_blocking)
-
-    # start inference
-    with torch.inference_mode():
-        logits = psp_model(X)  # (1, L)
-        if logits.dim() != 2 or logits.size(0) != 1:
-            raise ValueError(
-                f"Expected logits shape (1, L), got {tuple(logits.shape)}")
-        # get probabiity scores then assign binary values (1=def epitope, 0=not epitope)
-        probs = torch.sigmoid(logits)[0].detach().cpu()
-        mask = (probs >= threshold).to(torch.int64)
-
-    # build binary string
-    binary_mask = "".join("1" if int(x) == 1 else "0" for x in mask.tolist())
-
-    return {
-        "binary_mask": binary_mask,
-        "length": int(mask.numel()),
-        "n_epitopes": int(mask.sum().item()),
-        "frac_epitope": float(mask.float().mean().item()),
-        "p_epitope_mean": float(probs.mean().item()),
-        "p_epitope_max": float(probs.max().item()),
-        "threshold": threshold
-    }
+    protein_emb = embed_protein_seq(
+        protein_seq=protein_seq,
+        esm_model=esm_model,
+        layer=layer,
+        batch_converter=batch_converter,
+        device=device,
+        max_tokens=max_tokens
+    )
+    return predict_from_embedding(
+        psp_model=psp_model,
+        protein_emb=protein_emb,
+        device=device,
+        threshold=threshold
+    )

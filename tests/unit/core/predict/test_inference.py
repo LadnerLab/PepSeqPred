@@ -6,7 +6,9 @@ from pepseqpred.core.predict.inference import (
     build_model_from_checkpoint,
     infer_decision_threshold,
     infer_model_config_from_state,
-    normalize_state_dict_keys
+    normalize_state_dict_keys,
+    predict_ensemble_from_embedding,
+    predict_from_embedding
 )
 
 pytestmark = pytest.mark.unit
@@ -94,3 +96,67 @@ def test_infer_decision_threshold_uses_default_on_invalid():
 def test_infer_decision_threshold_reads_checkpoint_metric():
     ckpt = {"metrics": {"threshold": 0.42}}
     assert infer_decision_threshold(ckpt, default=0.5) == pytest.approx(0.42)
+
+
+class _ConstantLogitModel(torch.nn.Module):
+    def __init__(self, logits_1d: list[float]):
+        super().__init__()
+        logits = torch.tensor(logits_1d, dtype=torch.float32).unsqueeze(0)
+        self.register_buffer("logits", logits)
+
+    def forward(self, X: torch.Tensor) -> torch.Tensor:
+        _ = X
+        return self.logits
+
+
+def test_predict_ensemble_from_embedding_uses_majority_vote():
+    emb = torch.zeros((4, 3), dtype=torch.float32)
+    models = [
+        _ConstantLogitModel([2.0, 2.0, -2.0, -2.0]),
+        _ConstantLogitModel([2.0, -2.0, 2.0, -2.0]),
+        _ConstantLogitModel([-2.0, 2.0, 2.0, -2.0]),
+    ]
+    out = predict_ensemble_from_embedding(
+        psp_models=models,
+        protein_emb=emb,
+        device="cpu",
+        thresholds=[0.5, 0.5, 0.5]
+    )
+    assert out["binary_mask"] == "1110"
+    assert out["n_members"] == 3
+    assert out["votes_needed"] == 2
+
+
+def test_predict_ensemble_from_embedding_even_tie_is_negative():
+    emb = torch.zeros((2, 3), dtype=torch.float32)
+    models = [
+        _ConstantLogitModel([2.0, -2.0]),
+        _ConstantLogitModel([-2.0, 2.0]),
+    ]
+    out = predict_ensemble_from_embedding(
+        psp_models=models,
+        protein_emb=emb,
+        device="cpu",
+        thresholds=[0.5, 0.5]
+    )
+    assert out["binary_mask"] == "00"
+    assert out["votes_needed"] == 2
+
+
+def test_predict_ensemble_from_embedding_k1_matches_single():
+    emb = torch.zeros((3, 3), dtype=torch.float32)
+    model = _ConstantLogitModel([2.0, -2.0, 2.0])
+    single = predict_from_embedding(
+        psp_model=model,
+        protein_emb=emb,
+        device="cpu",
+        threshold=0.5
+    )
+    ensemble = predict_ensemble_from_embedding(
+        psp_models=[model],
+        protein_emb=emb,
+        device="cpu",
+        thresholds=[0.5]
+    )
+    assert ensemble["binary_mask"] == single["binary_mask"]
+    assert ensemble["n_epitopes"] == single["n_epitopes"]

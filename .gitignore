@@ -26,11 +26,13 @@ pip-wheel-metadata/
 coverage.xml
 htmlcov/
 pytest-*.xml
+*.DS_Store
 
 # Project-generated local data/artifacts
 *.egg-info/
 .eggs/
 *.fasta
+*.faa
 *.csv
 *.xlsx
 *.tsv

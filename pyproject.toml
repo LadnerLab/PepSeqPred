@@ -54,6 +54,7 @@ pepseqpred-esm = "pepseqpred.apps.esm_cli:main"
 pepseqpred-labels = "pepseqpred.apps.labels_cli:main"
 pepseqpred-predict = "pepseqpred.apps.prediction_cli:main"
 pepseqpred-preprocess = "pepseqpred.apps.preprocess_cli:main"
+pepseqpred-eval-ffnn = "pepseqpred.apps.evaluate_ffnn_cli:main"
 pepseqpred-train-ffnn = "pepseqpred.apps.train_ffnn_cli:main"
 pepseqpred-train-ffnn-optuna = "pepseqpred.apps.train_ffnn_optuna_cli:main"
 

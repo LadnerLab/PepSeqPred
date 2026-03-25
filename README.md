@@ -9,7 +9,7 @@
 # Overview
 
 PepSeqPred is a residue-level epitope prediction pipeline for protein workflows.  
-It converts upstream assay and sequence data into training-ready artifacts, trains feed-forward neural network models on ESM-2 embeddings, and produces binary residue masks for downstream inference.
+It converts upstream assay and sequence data into training-ready artifacts, trains feed-forward neural network models on ESM-2 embeddings, produces binary residue masks for downstream inference, and supports post-training evaluation workflows on held-out datasets.
 
 ## About
 
@@ -17,7 +17,8 @@ PepSeqPred is designed for research workflows where you need to:
 - map peptide-level signals to residue-level supervision,
 - train reproducible epitope prediction models,
 - run large jobs on HPCs with DistributedDataParallel (DDP),
-- generate per-residue binary epitope predictions to develop new peptide libraries.
+- generate per-residue binary epitope predictions to develop new peptide libraries,
+- evaluate trained checkpoints or ensemble manifests with residue-level and peptide-level metrics.
 
 The pipeline is built around CLI entrypoints in `src/pepseqpred/apps/` and matching HPC scripts in `scripts/hpc/`.
 
@@ -34,6 +35,7 @@ Typical outputs:
 - Residue-level label shards (`.pt`) including epitope / uncertain / non-epitope supervision.
 - FFNN checkpoints and run summaries (for standard training or Optuna tuning).
 - Predicted binary epitope mask FASTA files for inference.
+- FFNN evaluation summary JSON and optional per-peptide comparison CSV/JSON artifacts.
 
 ## Pipeline Snapshot
 
@@ -52,6 +54,9 @@ Train FFNN (DDP)
 
 Predict epitopes
   -> output FASTA with binary residue mask predictions
+
+Evaluate trained FFNN
+  -> residue-level metrics JSON and optional peptide-level comparison outputs
 
 Optional: Optuna hyperparameter tuning
   -> study storage + trial CSV + best-model artifacts
@@ -137,6 +142,7 @@ pepseqpred-preprocess --help
 pepseqpred-esm --help
 pepseqpred-train-ffnn --help
 pepseqpred-predict --help
+pepseqpred-eval-ffnn --help
 ```
 
 Run required preflight checks before any development or pipeline usage:
@@ -150,7 +156,7 @@ This repository expects all of the checks above to pass before you start develop
 
 ## Build and Transfer HPC Runtime Artifacts (`.pyz` + SLURM Scripts)
 
-The HPC shell scripts in `scripts/hpc/` execute zipapp files such as `esm.pyz`, `labels.pyz`, `train_ffnn.pyz`, and `predict.pyz`.
+The HPC shell scripts in `scripts/hpc/` execute zipapp files such as `esm.pyz`, `labels.pyz`, `train_ffnn.pyz`, `predict.pyz`, and `evaluate_ffnn.pyz`.
 
 Build only the app(s) you need for your current stage, then copy those `.pyz` files plus the matching SLURM script(s) to HPC.
 
@@ -193,7 +199,11 @@ Each HPC script expects a plain `.pyz` filename in the same working directory:
 - `trainffnn.sh` -> `train_ffnn.pyz`
 - `trainffnnoptuna.sh` -> `train_ffnn_optuna.pyz`
 - `predictepitope.sh` -> `predict.pyz`
+- `evaluateffnn.sh` -> `evaluate_ffnn.pyz` (or fallback module import)
 - `preprocessdata.sh` -> `preprocess.pyz` (optional)
+
+For the Cocci evaluation workflow in `evaluateffnn.sh`, also transfer:
+- `scripts/tools/cocci_eval_pipeline.py` (called directly by the shell script for `prepare` and `compare` stages)
 
 Example: transfer only embedding stage artifacts:
 
@@ -208,6 +218,16 @@ Example: transfer multiple stage artifacts:
 scp dist/labels_latest.pyz <user>@<cluster-host>:/home/<user>/pepseqpred_hpc/labels.pyz
 scp dist/train_ffnn_latest.pyz <user>@<cluster-host>:/home/<user>/pepseqpred_hpc/train_ffnn.pyz
 scp scripts/hpc/generatelabels.sh scripts/hpc/trainffnn.sh <user>@<cluster-host>:/home/<user>/pepseqpred_hpc/
+```
+
+Example: transfer evaluation artifacts:
+
+```bash
+scp dist/esm_latest.pyz <user>@<cluster-host>:/home/<user>/pepseqpred_hpc/esm.pyz
+scp dist/labels_latest.pyz <user>@<cluster-host>:/home/<user>/pepseqpred_hpc/labels.pyz
+scp dist/predict_latest.pyz <user>@<cluster-host>:/home/<user>/pepseqpred_hpc/predict.pyz
+scp dist/evaluate_ffnn_latest.pyz <user>@<cluster-host>:/home/<user>/pepseqpred_hpc/evaluate_ffnn.pyz
+scp scripts/hpc/evaluateffnn.sh scripts/tools/cocci_eval_pipeline.py <user>@<cluster-host>:/home/<user>/pepseqpred_hpc/
 ```
 
 ### 3. Prepare on cluster and smoke-check artifacts
@@ -238,6 +258,7 @@ Run the main pipeline in this order:
 3. Generate residue-level labels.
 4. Train FFNN model.
 5. Predict epitopes on new FASTA input.
+6. Evaluate FFNN outputs on labeled embeddings and/or Cocci reduced subsets.
 
 Optional branch:
 1. Run Optuna tuning after label generation instead of fixed-parameter FFNN training.
@@ -252,6 +273,7 @@ Optional branch:
 | Train FFNN | Multi-GPU | `4x a100`, `20` CPU, `256G` RAM, `12:00:00` |
 | Train FFNN Optuna | Multi-GPU | `4x a100`, `20` CPU, `448G` RAM, `48:00:00` |
 | Predict | GPU | `a100` (1 GPU), `4` CPU, `32G` RAM, `00:30:00` |
+| Evaluate FFNN | GPU recommended | `a100` (1 GPU), `8` CPU, `64G` RAM, `08:00:00` |
 
 These are baseline defaults from the current HPC scripts, not strict requirements for every dataset size. You will need to increase or decrease SLURM requests depending on the hardware available to you.
 
@@ -443,11 +465,52 @@ Expected outputs:
 Expected hardware:
 - Single GPU is recommended for throughput; CPU inference is possible but much slower.
 
+### Stage 7: Evaluate FFNN on Labeled Embeddings / Cocci Subsets
+
+Purpose:
+- Evaluate trained checkpoints or ensemble manifests on residue-level labels.
+- Optionally run Cocci-specific reduced-dataset preparation and peptide-level 1-count comparison.
+
+Required inputs (minimum residue-level eval):
+- Trained checkpoint `.pt` or ensemble manifest `.json`.
+- One or more embedding directories.
+- One or more label shard `.pt` files.
+
+Local CLI example:
+
+```bash
+pepseqpred-eval-ffnn \
+  localdata/models/ffnn_smoke/run_001_split_11_train_101/fully_connected.pt \
+  --embedding-dirs localdata/esm2_run/artifacts/pts/shard_000 \
+  --label-shards localdata/labels/labels_shard_000.pt \
+  --output-json localdata/eval/ffnn_eval_summary.json \
+  --batch-size 64 \
+  --num-workers 0
+```
+
+HPC script example (Cocci workflow):
+
+```bash
+sbatch --export=ALL,EVAL_MODE=nonreactive,SKIP_IF_EXISTS=1,RUN_PREP=1,RUN_EMBED=1,RUN_LABELS=1,RUN_PREDICT=1,RUN_EVAL=1,RUN_COMPARE=1 \
+  scripts/hpc/evaluateffnn.sh \
+  /scratch/$USER/models/phaseA/ffnn_ens_1.0_xxxxxxxx/ensemble_manifest.json \
+  /scratch/$USER/evals/cocci_eval/nonreactive
+```
+
+Expected outputs:
+- `prepared/eval_metadata.tsv`, `prepared/eval_proteins.fasta`, `prepared/prepare_summary.json`.
+- `embeddings/artifacts/eval_embedding_index.csv`.
+- `labels/labels_eval.pt`.
+- `prediction/predictions.fasta`.
+- `evaluation/ffnn_eval_summary.json`.
+- `peptide_compare/peptide_comparison.csv` and `peptide_compare/peptide_comparison_summary.json`.
+
 ### Stage Compatibility Notes
 
 - Keep embedding key scheme consistent (`id` vs `id-family`) between embedding and label generation.
 - Keep shard alignment explicit: embedding shard directories should map cleanly to label shard files.
 - Use local smoke settings (`--subset`, low epochs, single shard) before submitting expensive HPC jobs.
+- For `evaluateffnn.sh`, ensure `esm.pyz`, `labels.pyz`, `predict.pyz`, `evaluate_ffnn.pyz`, and `cocci_eval_pipeline.py` are present in the submission working directory.
 
 ## Reproducibility and Output Conventions
 
@@ -487,6 +550,10 @@ Common issues and fixes:
   Ensure both CSV lists have one value per hidden layer.
 - Prediction threshold errors (`(0.0, 1.0)` required):
   Set `--threshold` strictly between `0` and `1`, or omit it to use checkpoint/default behavior.
+- `python: can't open file ... esm.pyz` (or `labels.pyz` / `predict.pyz`):
+  Transfer missing `.pyz` files to the same working directory as the HPC shell script, or run from an installed package environment using CLI entrypoints.
+- `labels_eval.pt` or `predictions.fasta` not found during evaluation:
+  Upstream stage failed or was skipped; rerun with stage flags set (`RUN_EMBED=1`, `RUN_LABELS=1`, `RUN_PREDICT=1`) or disable dependent downstream stages.
 - DDP or multi-GPU runs stall/hang:
   Confirm the requested GPU count matches `torchrun --nproc_per_node`, and validate with a small single-shard smoke test first.
 - CUDA OOM:

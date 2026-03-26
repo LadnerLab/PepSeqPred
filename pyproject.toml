@@ -4,10 +4,23 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pepseqpred"
-version = "1.0.0rc1"
+version = "0.1.2"
 description = "Residue-level epitope prediction pipeline for peptide/protein workflows."
 readme = "README.md"
 requires-python = ">=3.12"
+license = { file = "LICENSE" }
+authors = [
+  { name = "Jeffrey Hoelzel", email = "jmh2338@nau.edu" },
+  { name = "Jason Ladner", email = "jason.ladner@nau.edu" }
+]
+keywords = ["bioinformatics", "epitope", "protein", "esm2", "pytorch"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Science/Research",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Scientific/Engineering :: Bio-Informatics"
+]
 dependencies = [
   "numpy>=2.3,<3",
   "pandas>=2.3,<3",
@@ -16,6 +29,11 @@ dependencies = [
   "scikit-learn>=1.5,<2",
   "optuna>=3.5,<5"
 ]
+
+[project.urls]
+Homepage = "https://github.com/LadnerLab/PepSeqPred"
+Repository = "https://github.com/LadnerLab/PepSeqPred"
+Issues = "https://github.com/LadnerLab/PepSeqPred/issues"
 
 [project.optional-dependencies]
 dev = [

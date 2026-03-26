@@ -11,6 +11,27 @@
 PepSeqPred is a residue-level epitope prediction pipeline for protein workflows.  
 It converts upstream assay and sequence data into training-ready artifacts, trains feed-forward neural network models on ESM-2 embeddings, produces binary residue masks for downstream inference, and supports post-training evaluation workflows on held-out datasets.
 
+## Quickstart
+
+PepSeqPred can be installed via:
+```bash
+pip install pepseqpred
+```
+
+This API allows you to use any of the pretrained models in your own code, or load your own model(s) for downstream predictions.
+
+Example usage:
+```python
+from pepseqpred import load_predictor
+
+predictor = load_predictor("path/to/model.pt", device="cuda")
+result = predictor.predict_sequence("ACDEFGHIKLMNP")
+
+print(result.binary_mask, result.n_epitopes)
+```
+
+**Disclaimer:** The API is meant to be a simplified version of the overall codebase where you can build epitope inference into your existing/new workflows. To have more control over exactly how PepSeqPred works, feel free to fork this repository and ensure you adhere to the [GPL-3.0 license](LICENSE).
+
 ## About
 
 PepSeqPred is designed for research workflows where you need to:

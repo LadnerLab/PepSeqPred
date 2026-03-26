@@ -1,0 +1,18 @@
+include README.md
+include LICENSE
+include pyproject.toml
+
+graft src/pepseqpred
+
+prune .github
+prune dist
+prune envs
+prune localdata
+prune logs
+prune notebooks
+prune scripts
+prune tests
+
+global-exclude __pycache__/*
+global-exclude *.py[cod]
+global-exclude *.ipynb

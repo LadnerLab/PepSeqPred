@@ -262,6 +262,48 @@ def _sanitize_for_json(value: Any) -> Any:
     return value
 
 
+def _safe_ratio(numerator: int, denominator: int) -> float:
+    """Returns numerator/denominator or NaN when denominator is zero."""
+    if denominator <= 0:
+        return float("nan")
+    return float(numerator / denominator)
+
+
+def _augment_metrics_with_confusion_stats(
+    metrics: Dict[str, Any], cm: np.ndarray
+) -> Dict[str, Any]:
+    """Adds confusion-derived metrics and class coverage details."""
+    if cm.shape != (2, 2):
+        raise ValueError(f"Expected confusion matrix shape (2, 2), got {cm.shape}")
+
+    tn = int(cm[0, 0])
+    fp = int(cm[0, 1])
+    fn = int(cm[1, 0])
+    tp = int(cm[1, 1])
+
+    neg_support = int(tn + fp)
+    pos_support = int(fn + tp)
+
+    neg_acc = _safe_ratio(tn, neg_support)
+    pos_acc = _safe_ratio(tp, pos_support)
+    finite_accs = [x for x in (neg_acc, pos_acc) if math.isfinite(x)]
+    balanced_acc = (
+        float(sum(finite_accs) / len(finite_accs))
+        if len(finite_accs) > 0
+        else float("nan")
+    )
+
+    metrics["support_neg"] = neg_support
+    metrics["support_pos"] = pos_support
+    metrics["specificity"] = neg_acc
+    metrics["fpr"] = _safe_ratio(fp, neg_support)
+    metrics["npv"] = _safe_ratio(tn, int(tn + fn))
+    metrics["per_class_acc"] = [neg_acc, pos_acc]
+    metrics["res_balanced_acc"] = balanced_acc
+    metrics["has_both_classes"] = bool(neg_support > 0 and pos_support > 0)
+    return metrics
+
+
 def _evaluate_dataset(
     psp_models: Sequence[torch.nn.Module],
     thresholds: Sequence[float],
@@ -364,6 +406,7 @@ def _evaluate_dataset(
             "accuracy": float("nan"),
             "confusion_matrix": [[0, 0], [0, 0]],
             "votes_needed": votes_needed if n_members > 1 else None,
+            "has_both_classes": False,
             "metrics": {
                 "precision": float("nan"),
                 "recall": float("nan"),
@@ -372,6 +415,11 @@ def _evaluate_dataset(
                 "auc": float("nan"),
                 "auc10": float("nan"),
                 "pr_auc": float("nan"),
+                "support_neg": 0,
+                "support_pos": 0,
+                "specificity": float("nan"),
+                "fpr": float("nan"),
+                "npv": float("nan"),
                 "res_balanced_acc": float("nan"),
                 "per_class_acc": [float("nan"), float("nan")]
             }
@@ -389,16 +437,7 @@ def _evaluate_dataset(
     cm[1, 0] = int(((y_true == 1) & (y_pred == 0)).sum())
     cm[1, 1] = int(((y_true == 1) & (y_pred == 1)).sum())
 
-    per_class_acc = np.array(
-        [
-            float(cm[0, 0]) / max(int(cm[0, 0] + cm[0, 1]), 1),
-            float(cm[1, 1]) / max(int(cm[1, 0] + cm[1, 1]), 1),
-        ],
-        dtype=np.float64,
-    )
-    res_balanced_acc = float(per_class_acc.mean())
-    metrics["per_class_acc"] = [float(x) for x in per_class_acc.tolist()]
-    metrics["res_balanced_acc"] = res_balanced_acc
+    metrics = _augment_metrics_with_confusion_stats(metrics=metrics, cm=cm)
 
     return {
         "processed_proteins": int(processed),
@@ -412,6 +451,7 @@ def _evaluate_dataset(
         "accuracy": float((y_true == y_pred).mean()) if y_true.size > 0 else float("nan"),
         "confusion_matrix": [[int(cm[0, 0]), int(cm[0, 1])], [int(cm[1, 0]), int(cm[1, 1])]],
         "votes_needed": votes_needed if n_members > 1 else None,
+        "has_both_classes": bool(metrics.get("has_both_classes", False)),
         "metrics": metrics
     }
 
@@ -756,6 +796,20 @@ def main() -> None:
         device=device,
         logger=logger
     )
+    if not bool(eval_out.get("has_both_classes", False)):
+        logger.warning(
+            "eval_single_class_labels",
+            extra={
+                "extra": {
+                    "pos_residues": int(eval_out["pos_residues"]),
+                    "neg_residues": int(eval_out["neg_residues"]),
+                    "note": (
+                        "Evaluation labels contain only one class; ROC-style metrics may be undefined "
+                        "and positive-class metrics may be degenerate."
+                    ),
+                }
+            },
+        )
 
     summary = {
         "model_artifact": str(args.model_artifact),

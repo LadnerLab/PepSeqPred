@@ -46,10 +46,21 @@ usage() {
     echo "  THRESHOLD            default: unset"
     echo "  ENSEMBLE_SET_INDEX   default: 1"
     echo "  K_FOLDS              default: unset"
+    echo "  SELECT_BEST_SET_RUNS_CSV default: unset"
+    echo "  BEST_SET_BY          default: PR_AUC"
+    echo "  BEST_SET_AGG         default: mean"
+    echo "  BEST_SET_DIRECTION   default: auto"
     echo "  SUBSET               default: 0"
     echo "  EVAL_BATCH_SIZE      default: 64"
     echo "  EVAL_NUM_WORKERS     default: 1"
     echo "  LABEL_CACHE_MODE     default: current"
+    echo "  EMIT_FOLD_METRICS    default: 0 (1=true)"
+    echo "  INCLUDE_CURVES       default: 0 (1=true)"
+    echo "  CURVE_MAX_POINTS     default: 2048"
+    echo "  BEST_FOLD_BY         default: pr_auc"
+    echo "  BEST_FOLD_DIRECTION  default: auto"
+    echo "  PLOT_DIR             default: unset"
+    echo "  PLOT_FORMATS         default: png,svg"
     echo "  LOG_LEVEL            default: INFO"
     echo ""
     echo "Optional explicit model architecture flags (forwarded to predict/eval CLIs):"
@@ -73,7 +84,7 @@ fi
 
 MODEL_ARTIFACT="$1"
 
-DATA_DIR="${DATA_DIR:-data/$USER/data/CWP}"
+DATA_DIR="${DATA_DIR:-scratch/$USER/data/CWP}"
 EVAL_MODE="${EVAL_MODE:-combined}"
 RUN_ROOT_DEFAULT="/scratch/$USER/evals/${SLURM_JOB_NAME:-evaluate_ffnn}/${EVAL_MODE}"
 RUN_ROOT="${2:-${RUN_ROOT:-$RUN_ROOT_DEFAULT}}"
@@ -92,10 +103,21 @@ EMBED_BATCH_SIZE="${EMBED_BATCH_SIZE:-24}"
 THRESHOLD="${THRESHOLD:-}"
 ENSEMBLE_SET_INDEX="${ENSEMBLE_SET_INDEX:-1}"
 K_FOLDS="${K_FOLDS:-}"
+SELECT_BEST_SET_RUNS_CSV="${SELECT_BEST_SET_RUNS_CSV:-}"
+BEST_SET_BY="${BEST_SET_BY:-PR_AUC}"
+BEST_SET_AGG="${BEST_SET_AGG:-mean}"
+BEST_SET_DIRECTION="${BEST_SET_DIRECTION:-max}"
 SUBSET="${SUBSET:-0}"
 EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-64}"
 EVAL_NUM_WORKERS="${EVAL_NUM_WORKERS:-1}"
 LABEL_CACHE_MODE="${LABEL_CACHE_MODE:-current}" # current or all
+EMIT_FOLD_METRICS="${EMIT_FOLD_METRICS:-1}"
+INCLUDE_CURVES="${INCLUDE_CURVES:-1}"
+CURVE_MAX_POINTS="${CURVE_MAX_POINTS:-2048}"
+BEST_FOLD_BY="${BEST_FOLD_BY:-pr_auc}"
+BEST_FOLD_DIRECTION="${BEST_FOLD_DIRECTION:-auto}"
+PLOT_DIR="${PLOT_DIR:-}"
+PLOT_FORMATS="${PLOT_FORMATS:-png,svg}"
 LOG_LEVEL="${LOG_LEVEL:-INFO}"
 
 # optional model config variables
@@ -251,7 +273,16 @@ EVAL_ARGS=(
 [ -n "${THRESHOLD}" ] && EVAL_ARGS+=(--threshold "${THRESHOLD}")
 [ -n "${ENSEMBLE_SET_INDEX}" ] && EVAL_ARGS+=(--ensemble-set-index "${ENSEMBLE_SET_INDEX}")
 [ -n "${K_FOLDS}" ] && EVAL_ARGS+=(--k-folds "${K_FOLDS}")
+[ -n "${SELECT_BEST_SET_RUNS_CSV}" ] && EVAL_ARGS+=(--select-best-set-runs-csv "${SELECT_BEST_SET_RUNS_CSV}")
+[ -n "${BEST_SET_BY}" ] && EVAL_ARGS+=(--best-set-by "${BEST_SET_BY}")
+[ -n "${BEST_SET_AGG}" ] && EVAL_ARGS+=(--best-set-agg "${BEST_SET_AGG}")
+[ -n "${BEST_SET_DIRECTION}" ] && EVAL_ARGS+=(--best-set-direction "${BEST_SET_DIRECTION}")
 [ -n "${SUBSET}" ] && EVAL_ARGS+=(--subset "${SUBSET}")
+[ -n "${CURVE_MAX_POINTS}" ] && EVAL_ARGS+=(--curve-max-points "${CURVE_MAX_POINTS}")
+[ -n "${BEST_FOLD_BY}" ] && EVAL_ARGS+=(--best-fold-by "${BEST_FOLD_BY}")
+[ -n "${BEST_FOLD_DIRECTION}" ] && EVAL_ARGS+=(--best-fold-direction "${BEST_FOLD_DIRECTION}")
+[ -n "${PLOT_DIR}" ] && EVAL_ARGS+=(--plot-dir "${PLOT_DIR}")
+[ -n "${PLOT_FORMATS}" ] && EVAL_ARGS+=(--plot-formats "${PLOT_FORMATS}")
 [ -n "${EMB_DIM}" ] && EVAL_ARGS+=(--emb-dim "${EMB_DIM}")
 [ -n "${HIDDEN_SIZES}" ] && EVAL_ARGS+=(--hidden-sizes "${HIDDEN_SIZES}")
 [ -n "${DROPOUTS}" ] && EVAL_ARGS+=(--dropouts "${DROPOUTS}")
@@ -263,6 +294,12 @@ esac
 case "${USE_RESIDUAL,,}" in
     true|1|yes|on) EVAL_ARGS+=(--use-residual) ;;
     false|0|no|off) EVAL_ARGS+=(--no-use-residual) ;;
+esac
+case "${EMIT_FOLD_METRICS,,}" in
+    true|1|yes|on) EVAL_ARGS+=(--emit-fold-metrics) ;;
+esac
+case "${INCLUDE_CURVES,,}" in
+    true|1|yes|on) EVAL_ARGS+=(--include-curves) ;;
 esac
 
 if [ "${RUN_EVAL}" -eq 1 ]; then

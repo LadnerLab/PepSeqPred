@@ -5,6 +5,7 @@ import pytest
 from pepseqpred.apps.evaluate_ffnn_cli import (
     _build_pr_curve_payload,
     _build_roc_curve_payload,
+    _compute_pr_auc_trapezoid,
     _pick_best_fold,
     _resolve_best_set_index,
 )
@@ -77,6 +78,9 @@ def test_build_curves_and_best_fold_selection():
     assert len(roc["fpr"]) <= 5
     assert pr["available"] is True
     assert pr["baseline_positive_rate"] == pytest.approx(0.5)
+    assert pr["ap"] == pytest.approx(1.0)
+    assert pr["auprc_trapz"] == pytest.approx(1.0)
+    assert _compute_pr_auc_trapezoid(y_true=y_true, y_prob=y_prob) == pytest.approx(1.0)
 
     fold_evaluations = [
         {"fold_index": 1, "metrics": {"pr_auc": 0.71}},

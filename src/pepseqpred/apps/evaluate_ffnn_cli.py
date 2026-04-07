@@ -14,7 +14,7 @@ import numpy as np
 import pandas as pd
 import torch
 from torch.utils.data import DataLoader
-from sklearn.metrics import precision_recall_curve, roc_curve
+from sklearn.metrics import average_precision_score, precision_recall_curve, roc_curve
 from pepseqpred.core.io.logger import setup_logger
 from pepseqpred.core.io.read import parse_float_csv, parse_int_csv
 from pepseqpred.core.data.proteindataset import ProteinDataset, pad_collate
@@ -487,11 +487,21 @@ def _build_pr_curve_payload(
             "reason": "no-valid-residues",
             "precision": [],
             "recall": [],
-            "baseline_positive_rate": None
+            "baseline_positive_rate": None,
+            "ap": None,
+            "auprc_trapz": None
         }
     precision, recall, _ = precision_recall_curve(y_true, y_prob)
     recall = np.asarray(recall, dtype=np.float64)[::-1]
     precision = np.asarray(precision, dtype=np.float64)[::-1]
+    try:
+        ap = float(average_precision_score(y_true, y_prob))
+    except Exception:
+        ap = float("nan")
+    try:
+        auprc_trapz = float(np.trapezoid(precision, recall))
+    except Exception:
+        auprc_trapz = float("nan")
     recall_points, precision_points = _downsample_curve(
         x=recall,
         y=precision,
@@ -507,8 +517,25 @@ def _build_pr_curve_payload(
         "recall": recall_points,
         "baseline_positive_rate": (
             float(pos_rate) if math.isfinite(pos_rate) else None
-        )
+        ),
+        "ap": float(ap) if math.isfinite(ap) else None,
+        "auprc_trapz": (
+            float(auprc_trapz) if math.isfinite(auprc_trapz) else None
+        ),
     }
+
+
+def _compute_pr_auc_trapezoid(y_true: np.ndarray, y_prob: np.ndarray) -> float:
+    """Computes PR AUC by trapezoidal integration for interpretation alongside AP."""
+    if y_true.size < 1:
+        return float("nan")
+    unique_labels = np.unique(y_true)
+    if unique_labels.size < 2:
+        return 1.0 if int(unique_labels[0]) == 1 else 0.0
+    precision, recall, _ = precision_recall_curve(y_true, y_prob)
+    recall = np.asarray(recall, dtype=np.float64)[::-1]
+    precision = np.asarray(precision, dtype=np.float64)[::-1]
+    return float(np.trapezoid(precision, recall))
 
 
 def _empty_eval_output(votes_needed: int | None, include_curves: bool) -> Dict[str, Any]:
@@ -534,6 +561,7 @@ def _empty_eval_output(votes_needed: int | None, include_curves: bool) -> Dict[s
             "auc": float("nan"),
             "auc10": float("nan"),
             "pr_auc": float("nan"),
+            "pr_auc_trapz": float("nan"),
             "support_neg": 0,
             "support_pos": 0,
             "specificity": float("nan"),
@@ -555,7 +583,9 @@ def _empty_eval_output(votes_needed: int | None, include_curves: bool) -> Dict[s
             "reason": "no-valid-residues",
             "precision": [],
             "recall": [],
-            "baseline_positive_rate": None
+            "baseline_positive_rate": None,
+            "ap": None,
+            "auprc_trapz": None
         }
     return out
 
@@ -581,6 +611,9 @@ def _build_eval_output_from_arrays(
         return out
 
     metrics = compute_eval_metrics(y_true=y_true, y_pred=y_pred, y_prob=y_prob)
+    metrics["pr_auc_trapz"] = _compute_pr_auc_trapezoid(
+        y_true=y_true, y_prob=y_prob
+    )
     cm = np.zeros((2, 2), dtype=np.int64)
     cm[0, 0] = int(((y_true == 0) & (y_pred == 0)).sum())
     cm[0, 1] = int(((y_true == 0) & (y_pred == 1)).sum())
@@ -719,7 +752,13 @@ def _plot_fold_curves(
     y_key: str,
     metric_key: str,
     chance_line: bool,
-    baseline_y: float | None = None
+    baseline_y: float | None = None,
+    secondary_metric_key: str | None = None,
+    metric_label: str | None = None,
+    secondary_metric_label: str | None = None,
+    x_limits: Tuple[float, float] | None = None,
+    y_limits: Tuple[float, float] | None = None,
+    legend_loc: str = "lower right",
 ) -> List[str]:
     """Writes a fold-only curve panel for ROC or PR."""
     try:
@@ -754,14 +793,39 @@ def _plot_fold_curves(
                 metric_value = float(raw_metric)
             except (TypeError, ValueError):
                 metric_value = float("nan")
-        metric_label = f"{metric_value:.3f}" if math.isfinite(
-            metric_value) else "nan"
+        primary_label = (
+            metric_label if metric_label is not None else metric_key.upper()
+        )
+        primary_metric_text = f"{primary_label}: {metric_value:.3f}" if math.isfinite(
+            metric_value
+        ) else f"{primary_label}: nan"
+        secondary_metric_text = None
+        if secondary_metric_key is not None and isinstance(metrics_obj, Mapping):
+            raw_secondary = metrics_obj.get(secondary_metric_key, float("nan"))
+            try:
+                secondary_value = float(raw_secondary)
+            except (TypeError, ValueError):
+                secondary_value = float("nan")
+            secondary_label = (
+                secondary_metric_label
+                if secondary_metric_label is not None
+                else secondary_metric_key.upper()
+            )
+            if math.isfinite(secondary_value):
+                secondary_metric_text = (
+                    f"{secondary_label}: {secondary_value:.3f}"
+                )
+            else:
+                secondary_metric_text = f"{secondary_label}: nan"
+        label_parts = [f"Fold {fold_label}", primary_metric_text]
+        if secondary_metric_text is not None:
+            label_parts.append(secondary_metric_text)
         ax.plot(
             x_vals,
             y_vals,
             linewidth=1.8,
             alpha=0.95,
-            label=f"Fold {fold_label} {metric_key.upper()}: {metric_label}"
+            label=" | ".join(label_parts),
         )
         plotted += 1
 
@@ -771,16 +835,22 @@ def _plot_fold_curves(
     if baseline_y is not None and math.isfinite(float(baseline_y)):
         y_val = float(baseline_y)
         ax.plot([0.0, 1.0], [y_val, y_val], linestyle="--",
-                linewidth=1.0, color="#888888", label=f"Baseline: {y_val:.3f}")
+                linewidth=1.0, color="#888888", label=f"Prevalence baseline: {y_val:.4f}")
 
     ax.set_title(title)
     ax.set_xlabel(x_label)
     ax.set_ylabel(y_label)
-    ax.set_xlim(0.0, 1.0)
-    ax.set_ylim(0.0, 1.0)
+    if x_limits is None:
+        ax.set_xlim(0.0, 1.0)
+    else:
+        ax.set_xlim(float(x_limits[0]), float(x_limits[1]))
+    if y_limits is None:
+        ax.set_ylim(0.0, 1.0)
+    else:
+        ax.set_ylim(float(y_limits[0]), float(y_limits[1]))
     ax.grid(alpha=0.2)
     if plotted > 0:
-        ax.legend(loc="lower right", frameon=False, fontsize=9)
+        ax.legend(loc=legend_loc, frameon=False, fontsize=9)
     fig.tight_layout()
 
     saved_paths: List[str] = []
@@ -852,6 +922,46 @@ def _plot_confusion_matrix(
         saved_paths.append(str(out_path))
     plt.close(fig)
     return saved_paths
+
+
+def _resolve_pr_zoom_limits(
+    fold_evaluations: Sequence[Mapping[str, Any]],
+    baseline_y: float | None,
+) -> Tuple[float, float]:
+    """Computes stable PR-plot zoom y-limits for highly imbalanced datasets."""
+    precision_values: List[float] = []
+    for fold_eval in fold_evaluations:
+        pr_obj = fold_eval.get("pr_curve")
+        if not isinstance(pr_obj, Mapping):
+            continue
+        if not bool(pr_obj.get("available", False)):
+            continue
+        recalls = pr_obj.get("recall")
+        precisions = pr_obj.get("precision")
+        if not isinstance(recalls, list) or not isinstance(precisions, list):
+            continue
+        if len(recalls) != len(precisions):
+            continue
+        for recall, precision in zip(recalls, precisions):
+            try:
+                recall_f = float(recall)
+                precision_f = float(precision)
+            except (TypeError, ValueError):
+                continue
+            if not math.isfinite(recall_f) or not math.isfinite(precision_f):
+                continue
+            if 0.0 < recall_f <= 0.20:
+                precision_values.append(precision_f)
+
+    if len(precision_values) < 1:
+        y_top = 0.05
+    else:
+        q95 = float(np.quantile(np.asarray(precision_values), 0.95))
+        y_top = max(0.02, q95 * 1.15)
+    if baseline_y is not None and math.isfinite(float(baseline_y)):
+        y_top = max(y_top, float(baseline_y) * 6.0)
+    y_top = min(1.0, max(0.02, y_top))
+    return (0.0, y_top)
 
 
 def _evaluate_dataset(
@@ -1051,7 +1161,8 @@ def _evaluate_dataset(
             x_key="fpr",
             y_key="tpr",
             metric_key="auc",
-            chance_line=True
+            chance_line=True,
+            metric_label="AUC",
         )
         pr_paths = _plot_fold_curves(
             fold_evaluations=fold_evaluations,
@@ -1065,11 +1176,45 @@ def _evaluate_dataset(
             y_key="precision",
             metric_key="pr_auc",
             chance_line=False,
+            secondary_metric_key="pr_auc_trapz",
+            metric_label="AP",
+            secondary_metric_label="AUPRC(trapz)",
             baseline_y=(
                 float(pr_baseline)
                 if pr_baseline is not None and math.isfinite(float(pr_baseline))
                 else None
             )
+        )
+        pr_zoom_paths = _plot_fold_curves(
+            fold_evaluations=fold_evaluations,
+            plot_path_base=plot_dir / "pr_auc_folds_zoom",
+            formats=plot_formats,
+            curve_key="pr_curve",
+            title="Fold PR Curves (Zoomed)",
+            x_label="Recall",
+            y_label="Precision",
+            x_key="recall",
+            y_key="precision",
+            metric_key="pr_auc",
+            chance_line=False,
+            secondary_metric_key="pr_auc_trapz",
+            metric_label="AP",
+            secondary_metric_label="AUPRC(trapz)",
+            baseline_y=(
+                float(pr_baseline)
+                if pr_baseline is not None and math.isfinite(float(pr_baseline))
+                else None
+            ),
+            x_limits=(0.0, 0.20),
+            y_limits=_resolve_pr_zoom_limits(
+                fold_evaluations=fold_evaluations,
+                baseline_y=(
+                    float(pr_baseline)
+                    if pr_baseline is not None and math.isfinite(float(pr_baseline))
+                    else None
+                ),
+            ),
+            legend_loc="upper right",
         )
         cm = np.asarray(best_fold_eval["confusion_matrix"], dtype=np.int64)
         cm_paths = _plot_confusion_matrix(
@@ -1083,6 +1228,7 @@ def _evaluate_dataset(
             "formats": [str(fmt) for fmt in plot_formats],
             "roc_auc_folds": roc_paths,
             "pr_auc_folds": pr_paths,
+            "pr_auc_folds_zoom": pr_zoom_paths,
             "confusion_matrix_best_fold": cm_paths
         }
 

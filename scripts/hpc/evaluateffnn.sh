@@ -7,8 +7,8 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --mem=64G
-#SBATCH --time=08:00:00
+#SBATCH --mem=128G
+#SBATCH --time=04:00:00
 
 # for testing
 USE_SRUN="${USE_SRUN:-1}"
@@ -28,7 +28,7 @@ usage() {
     echo ""
     echo "Optional environment variables:"
     echo "  USE_SRUN             default: 1 (set 0 to run without srun)"
-    echo "  DATA_DIR             default: localdata/FullCocciDataset/CocciData"
+    echo "  DATA_DIR             default: /scratch/\$USER/data/CWP"
     echo "  EVAL_MODE            default: combined (reactive|nonreactive|combined)"
     echo "  RUN_ROOT             default: /scratch/\$USER/evals/\${SLURM_JOB_NAME}/\${EVAL_MODE}"
     echo "  SKIP_IF_EXISTS       default: 1 (skip stage when output sentinel already exists)"
@@ -45,6 +45,7 @@ usage() {
     echo "  EMBED_BATCH_SIZE     default: 24"
     echo "  THRESHOLD            default: unset"
     echo "  ENSEMBLE_SET_INDEX   default: 1"
+    echo "  EXPECTED_SET_INDEX   default: unset (optional guard; fail if resolved set differs)"
     echo "  K_FOLDS              default: unset"
     echo "  SELECT_BEST_SET_RUNS_CSV default: unset"
     echo "  BEST_SET_BY          default: PR_AUC"
@@ -54,8 +55,8 @@ usage() {
     echo "  EVAL_BATCH_SIZE      default: 64"
     echo "  EVAL_NUM_WORKERS     default: 1"
     echo "  LABEL_CACHE_MODE     default: current"
-    echo "  EMIT_FOLD_METRICS    default: 0 (1=true)"
-    echo "  INCLUDE_CURVES       default: 0 (1=true)"
+    echo "  EMIT_FOLD_METRICS    default: 1 (1=true)"
+    echo "  INCLUDE_CURVES       default: 1 (1=true)"
     echo "  CURVE_MAX_POINTS     default: 2048"
     echo "  BEST_FOLD_BY         default: pr_auc"
     echo "  BEST_FOLD_DIRECTION  default: auto"
@@ -84,7 +85,7 @@ fi
 
 MODEL_ARTIFACT="$1"
 
-DATA_DIR="${DATA_DIR:-scratch/$USER/data/CWP}"
+DATA_DIR="${DATA_DIR:-/scratch/$USER/data/CWP}"
 EVAL_MODE="${EVAL_MODE:-combined}"
 RUN_ROOT_DEFAULT="/scratch/$USER/evals/${SLURM_JOB_NAME:-evaluate_ffnn}/${EVAL_MODE}"
 RUN_ROOT="${2:-${RUN_ROOT:-$RUN_ROOT_DEFAULT}}"
@@ -102,6 +103,7 @@ MAX_TOKENS="${MAX_TOKENS:-1022}"
 EMBED_BATCH_SIZE="${EMBED_BATCH_SIZE:-24}"
 THRESHOLD="${THRESHOLD:-}"
 ENSEMBLE_SET_INDEX="${ENSEMBLE_SET_INDEX:-1}"
+EXPECTED_SET_INDEX="${EXPECTED_SET_INDEX:-}"
 K_FOLDS="${K_FOLDS:-}"
 SELECT_BEST_SET_RUNS_CSV="${SELECT_BEST_SET_RUNS_CSV:-}"
 BEST_SET_BY="${BEST_SET_BY:-PR_AUC}"
@@ -175,6 +177,12 @@ echo "[evaluateffnn] model_artifact=${MODEL_ARTIFACT}"
 echo "[evaluateffnn] data_dir=${DATA_DIR}"
 echo "[evaluateffnn] eval_mode=${EVAL_MODE}"
 echo "[evaluateffnn] run_root=${RUN_ROOT}"
+echo "[evaluateffnn] ensemble_set_index=${ENSEMBLE_SET_INDEX}"
+
+if [ -n "${EXPECTED_SET_INDEX}" ] && [ "${EXPECTED_SET_INDEX}" != "${ENSEMBLE_SET_INDEX}" ]; then
+    echo "[evaluateffnn] ERROR: EXPECTED_SET_INDEX=${EXPECTED_SET_INDEX} does not match ENSEMBLE_SET_INDEX=${ENSEMBLE_SET_INDEX}"
+    exit 1
+fi
 
 if [ "${RUN_PREP}" -eq 1 ]; then
     if [ "${SKIP_IF_EXISTS}" -eq 1 ] && [ -s "${PREP_SUMMARY_JSON}" ]; then
@@ -315,6 +323,10 @@ if [ "${RUN_EVAL}" -eq 1 ]; then
             run_launcher python -u -m pepseqpred.apps.evaluate_ffnn_cli "${MODEL_ARTIFACT}" "${EVAL_ARGS[@]}"
         fi
     fi
+fi
+
+if [ "${RUN_EVAL}" -eq 1 ] && [ -n "${EXPECTED_SET_INDEX}" ] && [ -s "${EVAL_JSON}" ]; then
+    python -c "import json,sys; p=sys.argv[1]; expected=int(sys.argv[2]); d=json.load(open(p, 'r', encoding='utf-8')); req=d.get('requested_ensemble_set_index'); act=d.get('ensemble_set_index'); assert req==expected and act==expected, f'set-index mismatch expected={expected} requested={req} actual={act} path={p}'; print(f'[evaluateffnn] set-index verified expected={expected} requested={req} actual={act}')" "${EVAL_JSON}" "${EXPECTED_SET_INDEX}"
 fi
 
 if [ "${RUN_COMPARE}" -eq 1 ]; then

@@ -1,4 +1,7 @@
 from pathlib import Path
+import shutil
+from contextlib import contextmanager
+from uuid import uuid4
 import numpy as np
 import pandas as pd
 import pytest
@@ -13,48 +16,62 @@ from pepseqpred.apps.evaluate_ffnn_cli import (
 pytestmark = pytest.mark.unit
 
 
-def test_resolve_best_set_index_by_mean_pr_auc(tmp_path: Path):
-    runs_csv = tmp_path / "runs.csv"
-    pd.DataFrame(
-        {
-            "EnsembleSetIndex": [1, 1, 2, 2, 3, 3],
-            "FoldIndex": [1, 2, 1, 2, 1, 2],
-            "PR_AUC": [0.20, 0.30, 0.41, 0.39, 0.31, 0.30],
-        }
-    ).to_csv(runs_csv, index=False)
-
-    best_set, meta = _resolve_best_set_index(
-        runs_csv_path=runs_csv,
-        metric_name="PR_AUC",
-        agg_name="mean",
-        direction="max",
-    )
-
-    assert best_set == 2
-    assert meta["metric_column"] == "PR_AUC"
-    assert meta["best_set_index"] == 2
-    assert meta["best_set_score"] == pytest.approx(0.40)
+@contextmanager
+def _scratch_dir():
+    root = Path("localdata") / "tmp_pytest_eval_selection"
+    root.mkdir(parents=True, exist_ok=True)
+    path = root / f"run_{uuid4().hex}"
+    path.mkdir(parents=True, exist_ok=False)
+    try:
+        yield path
+    finally:
+        shutil.rmtree(path, ignore_errors=True)
 
 
-def test_resolve_best_set_index_auto_direction_uses_min_for_loss(tmp_path: Path):
-    runs_csv = tmp_path / "runs.csv"
-    pd.DataFrame(
-        {
-            "EnsembleSetIndex": [1, 1, 2, 2],
-            "BestValLoss": [1.2, 1.1, 0.9, 1.0],
-        }
-    ).to_csv(runs_csv, index=False)
+def test_resolve_best_set_index_by_mean_pr_auc():
+    with _scratch_dir() as tmp_path:
+        runs_csv = tmp_path / "runs.csv"
+        pd.DataFrame(
+            {
+                "EnsembleSetIndex": [1, 1, 2, 2, 3, 3],
+                "FoldIndex": [1, 2, 1, 2, 1, 2],
+                "PR_AUC": [0.20, 0.30, 0.41, 0.39, 0.31, 0.30],
+            }
+        ).to_csv(runs_csv, index=False)
 
-    best_set, meta = _resolve_best_set_index(
-        runs_csv_path=runs_csv,
-        metric_name="bestvalloss",
-        agg_name="mean",
-        direction="auto",
-    )
+        best_set, meta = _resolve_best_set_index(
+            runs_csv_path=runs_csv,
+            metric_name="PR_AUC",
+            agg_name="mean",
+            direction="max",
+        )
 
-    assert best_set == 2
-    assert meta["direction"] == "min"
-    assert meta["best_set_score"] == pytest.approx(0.95)
+        assert best_set == 2
+        assert meta["metric_column"] == "PR_AUC"
+        assert meta["best_set_index"] == 2
+        assert meta["best_set_score"] == pytest.approx(0.40)
+
+
+def test_resolve_best_set_index_auto_direction_uses_min_for_loss():
+    with _scratch_dir() as tmp_path:
+        runs_csv = tmp_path / "runs.csv"
+        pd.DataFrame(
+            {
+                "EnsembleSetIndex": [1, 1, 2, 2],
+                "BestValLoss": [1.2, 1.1, 0.9, 1.0],
+            }
+        ).to_csv(runs_csv, index=False)
+
+        best_set, meta = _resolve_best_set_index(
+            runs_csv_path=runs_csv,
+            metric_name="bestvalloss",
+            agg_name="mean",
+            direction="auto",
+        )
+
+        assert best_set == 2
+        assert meta["direction"] == "min"
+        assert meta["best_set_score"] == pytest.approx(0.95)
 
 
 def test_build_roc_curve_payload_handles_single_class():

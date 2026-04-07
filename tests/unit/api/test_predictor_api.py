@@ -1,5 +1,8 @@
 import types
+import shutil
+from contextlib import contextmanager
 from pathlib import Path
+from uuid import uuid4
 
 import pytest
 import torch
@@ -8,6 +11,18 @@ from pepseqpred.api import PepSeqPredictor, predict_fasta, predict_sequence
 from pepseqpred.core.models.ffnn import PepSeqFFNN
 
 pytestmark = pytest.mark.unit
+
+
+@contextmanager
+def _scratch_dir():
+    root = Path("localdata") / "tmp_pytest_predictor_api"
+    root.mkdir(parents=True, exist_ok=True)
+    path = root / f"run_{uuid4().hex}"
+    path.mkdir(parents=True, exist_ok=False)
+    try:
+        yield path
+    finally:
+        shutil.rmtree(path, ignore_errors=True)
 
 
 class FakeAlphabet:
@@ -65,86 +80,89 @@ def _write_checkpoint(path: Path, threshold: float = 0.37) -> None:
     )
 
 
-def test_predictor_from_artifact_predict_sequence(monkeypatch, tmp_path: Path):
+def test_predictor_from_artifact_predict_sequence(monkeypatch):
     fake_pretrained = types.SimpleNamespace(
         fake_model=lambda: (FakeESMModel(), FakeAlphabet())
     )
     monkeypatch.setattr(
         "pepseqpred.api.predictor.esm.pretrained", fake_pretrained)
 
-    checkpoint = tmp_path / "model.pt"
-    _write_checkpoint(checkpoint)
+    with _scratch_dir() as tmp_path:
+        checkpoint = tmp_path / "model.pt"
+        _write_checkpoint(checkpoint)
 
-    predictor = PepSeqPredictor.from_artifact(
-        model_artifact=checkpoint,
-        model_name="fake_model",
-        device="cpu",
-    )
-    out = predictor.predict_sequence("ACDEFG", header="protein_1")
+        predictor = PepSeqPredictor.from_artifact(
+            model_artifact=checkpoint,
+            model_name="fake_model",
+            device="cpu",
+        )
+        out = predictor.predict_sequence("ACDEFG", header="protein_1")
 
-    assert out.header == "protein_1"
-    assert out.length == 6
-    assert len(out.binary_mask) == 6
-    assert set(out.binary_mask).issubset({"0", "1"})
-    assert out.n_members == 1
-    assert len(out.member_thresholds) == 1
-    assert out.member_thresholds[0] == pytest.approx(0.37)
+        assert out.header == "protein_1"
+        assert out.length == 6
+        assert len(out.binary_mask) == 6
+        assert set(out.binary_mask).issubset({"0", "1"})
+        assert out.n_members == 1
+        assert len(out.member_thresholds) == 1
+        assert out.member_thresholds[0] == pytest.approx(0.37)
 
 
-def test_predict_fasta_helper_writes_output(monkeypatch, tmp_path: Path):
+def test_predict_fasta_helper_writes_output(monkeypatch):
     fake_pretrained = types.SimpleNamespace(
         fake_model=lambda: (FakeESMModel(), FakeAlphabet())
     )
     monkeypatch.setattr(
         "pepseqpred.api.predictor.esm.pretrained", fake_pretrained)
 
-    checkpoint = tmp_path / "model.pt"
-    _write_checkpoint(checkpoint)
+    with _scratch_dir() as tmp_path:
+        checkpoint = tmp_path / "model.pt"
+        _write_checkpoint(checkpoint)
 
-    fasta = tmp_path / "input.fasta"
-    fasta.write_text(">p1\nACDEFG\n>p2\nLMNPQ\n", encoding="utf-8")
-    output_fasta = tmp_path / "predictions.fasta"
+        fasta = tmp_path / "input.fasta"
+        fasta.write_text(">p1\nACDEFG\n>p2\nLMNPQ\n", encoding="utf-8")
+        output_fasta = tmp_path / "predictions.fasta"
 
-    outputs = predict_fasta(
-        model_artifact=checkpoint,
-        fasta_input=fasta,
-        output_fasta=output_fasta,
-        model_name="fake_model",
-        device="cpu",
-    )
+        outputs = predict_fasta(
+            model_artifact=checkpoint,
+            fasta_input=fasta,
+            output_fasta=output_fasta,
+            model_name="fake_model",
+            device="cpu",
+        )
 
-    assert len(outputs) == 2
-    assert output_fasta.exists()
+        assert len(outputs) == 2
+        assert output_fasta.exists()
 
-    lines = [
-        line.strip()
-        for line in output_fasta.read_text(encoding="utf-8").splitlines()
-        if line.strip()
-    ]
-    assert lines[0] == ">p1"
-    assert len(lines[1]) == 6
-    assert lines[2] == ">p2"
-    assert len(lines[3]) == 5
+        lines = [
+            line.strip()
+            for line in output_fasta.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        assert lines[0] == ">p1"
+        assert len(lines[1]) == 6
+        assert lines[2] == ">p2"
+        assert len(lines[3]) == 5
 
 
-def test_predict_sequence_helper(monkeypatch, tmp_path: Path):
+def test_predict_sequence_helper(monkeypatch):
     fake_pretrained = types.SimpleNamespace(
         fake_model=lambda: (FakeESMModel(), FakeAlphabet())
     )
     monkeypatch.setattr(
         "pepseqpred.api.predictor.esm.pretrained", fake_pretrained)
 
-    checkpoint = tmp_path / "model.pt"
-    _write_checkpoint(checkpoint)
+    with _scratch_dir() as tmp_path:
+        checkpoint = tmp_path / "model.pt"
+        _write_checkpoint(checkpoint)
 
-    out = predict_sequence(
-        model_artifact=checkpoint,
-        protein_seq="ACDEFG",
-        header="direct_call",
-        model_name="fake_model",
-        device="cpu",
-    )
+        out = predict_sequence(
+            model_artifact=checkpoint,
+            protein_seq="ACDEFG",
+            header="direct_call",
+            model_name="fake_model",
+            device="cpu",
+        )
 
-    assert out.header == "direct_call"
-    assert out.length == 6
-    assert len(out.binary_mask) == 6
+        assert out.header == "direct_call"
+        assert out.length == 6
+        assert len(out.binary_mask) == 6

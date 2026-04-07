@@ -1,6 +1,7 @@
 import math
 import random
 import warnings
+from datetime import timedelta
 from pathlib import Path
 import numpy as np
 import pytest
@@ -104,3 +105,82 @@ def test_init_ddp_enabled(monkeypatch):
     assert out == {"rank": 2, "world_size": 4, "local_rank": 1}
     assert calls["backend"] == "nccl"
     assert calls["local_rank"] == 1
+
+
+def test_init_ddp_no_rank_returns_none(monkeypatch):
+    monkeypatch.delenv("RANK", raising=False)
+    assert ddp_mod.init_ddp() is None
+
+
+def test_init_ddp_invalid_timeout_falls_back_to_default(monkeypatch):
+    monkeypatch.setenv("RANK", "1")
+    monkeypatch.setenv("LOCAL_RANK", "0")
+    monkeypatch.setenv("PEPSEQPRED_DDP_TIMEOUT_MIN", "not-an-int")
+
+    calls = {}
+
+    def _init_process_group(backend, timeout):
+        calls["backend"] = backend
+        calls["timeout"] = timeout
+
+    monkeypatch.setattr(ddp_mod.dist, "init_process_group", _init_process_group)
+    monkeypatch.setattr(ddp_mod.dist, "get_rank", lambda: 1)
+    monkeypatch.setattr(ddp_mod.dist, "get_world_size", lambda: 2)
+    monkeypatch.setattr(ddp_mod.torch.cuda, "set_device", lambda _idx: None)
+
+    out = ddp_mod.init_ddp()
+    assert out == {"rank": 1, "world_size": 2, "local_rank": 0}
+    assert calls["backend"] == "nccl"
+    assert calls["timeout"] == timedelta(minutes=60)
+
+
+def test_ddp_rank_world_and_all_reduce_enabled(monkeypatch):
+    monkeypatch.setattr(ddp_mod.dist, "is_available", lambda: True)
+    monkeypatch.setattr(ddp_mod.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(ddp_mod.dist, "get_rank", lambda: 3)
+    monkeypatch.setattr(ddp_mod.dist, "get_world_size", lambda: 5)
+
+    def _all_reduce(t, op):
+        assert op == ddp_mod.dist.ReduceOp.SUM
+        t += 10
+
+    monkeypatch.setattr(ddp_mod.dist, "all_reduce", _all_reduce)
+
+    assert ddp_mod.ddp_rank() == 3
+    assert ddp_mod._ddp_world() == 5
+
+    t = torch.tensor([1.0, 2.0], dtype=torch.float32)
+    out = ddp_mod.ddp_all_reduce_sum(t)
+    assert torch.equal(out, torch.tensor([11.0, 12.0]))
+
+
+def test_ddp_gather_all_1d_enabled(monkeypatch):
+    monkeypatch.setattr(ddp_mod.dist, "is_available", lambda: True)
+    monkeypatch.setattr(ddp_mod.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(ddp_mod.dist, "get_world_size", lambda: 3)
+
+    def _all_gather(out_list, in_tensor):
+        if in_tensor.dtype == torch.long and in_tensor.numel() == 1:
+            for dst, value in zip(out_list, [2, 4, 1]):
+                dst.fill_(value)
+            return
+        payloads = [
+            torch.tensor([9, 8, 0, 0], dtype=in_tensor.dtype),
+            torch.tensor([7, 6, 5, 4], dtype=in_tensor.dtype),
+            torch.tensor([3, 0, 0, 0], dtype=in_tensor.dtype)
+        ]
+        for dst, src in zip(out_list, payloads):
+            dst.copy_(src)
+
+    monkeypatch.setattr(ddp_mod.dist, "all_gather", _all_gather)
+
+    gathered, sizes = ddp_mod.ddp_gather_all_1d(
+        torch.tensor([1, 2], dtype=torch.int64),
+        torch.device("cpu")
+    )
+
+    assert sizes == [2, 4, 1]
+    assert len(gathered) == 3
+    assert gathered[0].tolist() == [9, 8, 0, 0]
+    assert gathered[1].tolist() == [7, 6, 5, 4]
+    assert gathered[2].tolist() == [3, 0, 0, 0]

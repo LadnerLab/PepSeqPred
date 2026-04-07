@@ -42,3 +42,4 @@ pytest-*.xml
 *.pyz
 *.metadata
 *.json
+localdata/evals/*

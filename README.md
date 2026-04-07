@@ -518,6 +518,28 @@ sbatch --export=ALL,EVAL_MODE=nonreactive,SKIP_IF_EXISTS=1,RUN_PREP=1,RUN_EMBED=
   /scratch/$USER/evals/cocci_eval/nonreactive
 ```
 
+Seeded sweep example (two flagship manifests, set indices 1..10):
+
+```bash
+HPC_DIR=/home/$USER/test \
+SHARED=/scratch/$USER/evals/cocci_eval/combined \
+OUT_BASE=/scratch/$USER/evals/cocci_eval/seeded_runs \
+DATA_DIR=/scratch/$USER/data/CWP \
+./evalffnnsweep.sh \
+  /scratch/$USER/models/phaseB/flagship1/ensemble_manifest.json \
+  /scratch/$USER/models/phaseB/flagship2/ensemble_manifest.json
+```
+
+Verify seeded run set-index alignment (`set_XX` directory must match evaluated ensemble set index):
+
+```bash
+python scripts/tools/verify_seeded_eval_set_indices.py \
+  --base-dir localdata/evals/cocci_eval/seeded_runs \
+  --models flagship1,flagship2 \
+  --set-start 1 \
+  --set-end 10
+```
+
 Expected outputs:
 - `prepared/eval_metadata.tsv`, `prepared/eval_proteins.fasta`, `prepared/prepare_summary.json`.
 - `embeddings/artifacts/eval_embedding_index.csv`.
@@ -571,6 +593,8 @@ Common issues and fixes:
   Ensure both CSV lists have one value per hidden layer.
 - Prediction threshold errors (`(0.0, 1.0)` required):
   Set `--threshold` strictly between `0` and `1`, or omit it to use checkpoint/default behavior.
+- Plot generation produces no files when `--plot-dir` is set:
+  Install `matplotlib` in the runtime environment (for HPC: ensure `envs/environment.hpc.yml` is applied with `matplotlib` present).
 - `python: can't open file ... esm.pyz` (or `labels.pyz` / `predict.pyz`):
   Transfer missing `.pyz` files to the same working directory as the HPC shell script, or run from an installed package environment using CLI entrypoints.
 - `labels_eval.pt` or `predictions.fasta` not found during evaluation:

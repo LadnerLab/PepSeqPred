@@ -11,8 +11,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Sequence, Tuple
 import numpy as np
+import pandas as pd
 import torch
 from torch.utils.data import DataLoader
+from sklearn.metrics import average_precision_score, precision_recall_curve, roc_curve
 from pepseqpred.core.io.logger import setup_logger
 from pepseqpred.core.io.read import parse_float_csv, parse_int_csv
 from pepseqpred.core.data.proteindataset import ProteinDataset, pad_collate
@@ -31,6 +33,128 @@ class EvaluationMember:
     threshold: float | None
     fold_index: int | None
     member_index: int | None
+
+
+def _norm_metric_token(value: str) -> str:
+    """Normalizes metric names for permissive matching."""
+    return "".join(ch for ch in str(value).lower() if ch.isalnum())
+
+
+def _resolve_metric_column(columns: Sequence[str], metric_name: str) -> str:
+    """Resolves a requested metric column against runs.csv columns."""
+    if metric_name in columns:
+        return metric_name
+
+    requested = _norm_metric_token(metric_name)
+    lookup: Dict[str, str] = {}
+    for col in columns:
+        lookup.setdefault(_norm_metric_token(col), col)
+    if requested in lookup:
+        return lookup[requested]
+
+    raise ValueError(
+        f"Metric column '{metric_name}' was not found in runs.csv columns: {list(columns)}"
+    )
+
+
+def _auto_direction_for_metric(metric_name: str) -> str:
+    """Returns a default optimization direction for common metric naming patterns."""
+    token = _norm_metric_token(metric_name)
+    if any(key in token for key in ("loss", "error", "elapsed", "duration", "time")):
+        return "min"
+    return "max"
+
+
+def _resolve_best_set_index(
+    runs_csv_path: Path,
+    metric_name: str,
+    agg_name: str,
+    direction: str
+) -> Tuple[int, Dict[str, Any]]:
+    """Selects the best ensemble set index from runs.csv by aggregated metric score."""
+    if not runs_csv_path.exists():
+        raise FileNotFoundError(f"runs.csv not found: {runs_csv_path}")
+
+    df = pd.read_csv(runs_csv_path)
+    if "EnsembleSetIndex" not in df.columns:
+        raise ValueError(
+            "runs.csv must include 'EnsembleSetIndex' to support best-set selection"
+        )
+    metric_col = _resolve_metric_column(df.columns, metric_name)
+
+    set_index_series = pd.to_numeric(df["EnsembleSetIndex"], errors="coerce")
+    metric_series = pd.to_numeric(df[metric_col], errors="coerce")
+    status_mask = pd.Series(True, index=df.index)
+    if "Status" in df.columns:
+        status_mask = (
+            df["Status"]
+            .astype(str)
+            .str.strip()
+            .str.upper()
+            .eq("OK")
+        )
+    valid_mask = set_index_series.notna() & metric_series.notna() & status_mask
+    if int(valid_mask.sum()) < 1:
+        raise ValueError(
+            "No valid rows found in runs.csv for best-set selection after numeric parsing"
+        )
+
+    agg_name_lower = str(agg_name).strip().lower()
+    if agg_name_lower not in {"mean", "median", "min", "max"}:
+        raise ValueError(
+            "--best-set-agg must be one of: mean, median, min, max")
+
+    agg_df = pd.DataFrame(
+        {
+            "EnsembleSetIndex": set_index_series[valid_mask].astype(int),
+            "metric": metric_series[valid_mask].astype(float),
+        }
+    )
+    grouped = (
+        agg_df.groupby("EnsembleSetIndex", as_index=False)
+        .agg(aggregate_metric=("metric", agg_name_lower))
+    )
+    if grouped.empty:
+        raise ValueError(
+            "Could not aggregate any set-level metrics from runs.csv")
+
+    resolved_direction = (
+        _auto_direction_for_metric(metric_col)
+        if direction == "auto"
+        else str(direction).strip().lower()
+    )
+    if resolved_direction not in {"max", "min"}:
+        raise ValueError("--best-set-direction must be one of: auto, max, min")
+
+    if resolved_direction == "max":
+        grouped_sorted = grouped.sort_values(
+            by=["aggregate_metric", "EnsembleSetIndex"],
+            ascending=[False, True]
+        )
+    else:
+        grouped_sorted = grouped.sort_values(
+            by=["aggregate_metric", "EnsembleSetIndex"],
+            ascending=[True, True]
+        )
+    best_row = grouped_sorted.iloc[0]
+    best_set_index = int(best_row["EnsembleSetIndex"])
+    details = {
+        "runs_csv_path": str(runs_csv_path),
+        "metric_requested": str(metric_name),
+        "metric_column": str(metric_col),
+        "aggregate": str(agg_name_lower),
+        "direction": str(resolved_direction),
+        "best_set_index": best_set_index,
+        "best_set_score": float(best_row["aggregate_metric"]),
+        "set_scores": [
+            {
+                "ensemble_set_index": int(row["EnsembleSetIndex"]),
+                "aggregate_metric": float(row["aggregate_metric"])
+            }
+            for _, row in grouped_sorted.iterrows()
+        ]
+    }
+    return best_set_index, details
 
 
 def _build_cli_model_config(args: argparse.Namespace) -> FFNNModelConfig | None:
@@ -274,7 +398,8 @@ def _augment_metrics_with_confusion_stats(
 ) -> Dict[str, Any]:
     """Adds confusion-derived metrics and class coverage details."""
     if cm.shape != (2, 2):
-        raise ValueError(f"Expected confusion matrix shape (2, 2), got {cm.shape}")
+        raise ValueError(
+            f"Expected confusion matrix shape (2, 2), got {cm.shape}")
 
     tn = int(cm[0, 0])
     fp = int(cm[0, 1])
@@ -304,12 +429,555 @@ def _augment_metrics_with_confusion_stats(
     return metrics
 
 
+def _downsample_curve(
+    x: np.ndarray,
+    y: np.ndarray,
+    max_points: int
+) -> Tuple[List[float], List[float]]:
+    """Downsamples curve points to keep JSON and plot payloads bounded."""
+    if x.size != y.size:
+        raise ValueError(
+            f"Curve x/y size mismatch: x={x.size} y={y.size}")
+    if max_points < 2:
+        raise ValueError("--curve-max-points must be >= 2")
+    if x.size <= max_points:
+        return [float(v) for v in x], [float(v) for v in y]
+
+    idx = np.linspace(0, x.size - 1, num=max_points, dtype=np.int64)
+    idx = np.unique(idx)
+    return [float(v) for v in x[idx]], [float(v) for v in y[idx]]
+
+
+def _build_roc_curve_payload(
+    y_true: np.ndarray,
+    y_prob: np.ndarray,
+    max_points: int
+) -> Dict[str, Any]:
+    """Builds ROC curve points for JSON/plotting."""
+    if y_true.size < 1 or np.unique(y_true).size < 2:
+        return {
+            "available": False,
+            "reason": "single-class-labels",
+            "fpr": [],
+            "tpr": []
+        }
+    fpr, tpr, _ = roc_curve(y_true, y_prob)
+    x_points, y_points = _downsample_curve(
+        x=np.asarray(fpr, dtype=np.float64),
+        y=np.asarray(tpr, dtype=np.float64),
+        max_points=max_points
+    )
+    return {
+        "available": True,
+        "reason": None,
+        "fpr": x_points,
+        "tpr": y_points
+    }
+
+
+def _build_pr_curve_payload(
+    y_true: np.ndarray,
+    y_prob: np.ndarray,
+    max_points: int
+) -> Dict[str, Any]:
+    """Builds PR curve points for JSON/plotting."""
+    if y_true.size < 1:
+        return {
+            "available": False,
+            "reason": "no-valid-residues",
+            "precision": [],
+            "recall": [],
+            "baseline_positive_rate": None,
+            "ap": None,
+            "auprc_trapz": None
+        }
+    precision, recall, _ = precision_recall_curve(y_true, y_prob)
+    recall = np.asarray(recall, dtype=np.float64)[::-1]
+    precision = np.asarray(precision, dtype=np.float64)[::-1]
+    try:
+        ap = float(average_precision_score(y_true, y_prob))
+    except Exception:
+        ap = float("nan")
+    try:
+        auprc_trapz = float(np.trapezoid(precision, recall))
+    except Exception:
+        auprc_trapz = float("nan")
+    recall_points, precision_points = _downsample_curve(
+        x=recall,
+        y=precision,
+        max_points=max_points
+    )
+    pos_rate = float((y_true == 1).mean()) if y_true.size > 0 else float("nan")
+    if not math.isfinite(pos_rate):
+        pos_rate = float("nan")
+    return {
+        "available": True,
+        "reason": None,
+        "precision": precision_points,
+        "recall": recall_points,
+        "baseline_positive_rate": (
+            float(pos_rate) if math.isfinite(pos_rate) else None
+        ),
+        "ap": float(ap) if math.isfinite(ap) else None,
+        "auprc_trapz": (
+            float(auprc_trapz) if math.isfinite(auprc_trapz) else None
+        ),
+    }
+
+
+def _compute_pr_auc_trapezoid(y_true: np.ndarray, y_prob: np.ndarray) -> float:
+    """Computes PR AUC by trapezoidal integration for interpretation alongside AP."""
+    if y_true.size < 1:
+        return float("nan")
+    unique_labels = np.unique(y_true)
+    if unique_labels.size < 2:
+        return 1.0 if int(unique_labels[0]) == 1 else 0.0
+    precision, recall, _ = precision_recall_curve(y_true, y_prob)
+    recall = np.asarray(recall, dtype=np.float64)[::-1]
+    precision = np.asarray(precision, dtype=np.float64)[::-1]
+    return float(np.trapezoid(precision, recall))
+
+
+def _empty_eval_output(votes_needed: int | None, include_curves: bool) -> Dict[str, Any]:
+    """Returns a canonical empty evaluation payload."""
+    out = {
+        "processed_proteins": 0,
+        "proteins_with_valid_residues": 0,
+        "proteins_zero_valid_residues": 0,
+        "valid_residues": 0,
+        "pos_residues": 0,
+        "neg_residues": 0,
+        "pred_pos_residues": 0,
+        "pred_neg_residues": 0,
+        "accuracy": float("nan"),
+        "confusion_matrix": [[0, 0], [0, 0]],
+        "votes_needed": votes_needed,
+        "has_both_classes": False,
+        "metrics": {
+            "precision": float("nan"),
+            "recall": float("nan"),
+            "f1": float("nan"),
+            "mcc": float("nan"),
+            "auc": float("nan"),
+            "auc10": float("nan"),
+            "pr_auc": float("nan"),
+            "pr_auc_trapz": float("nan"),
+            "support_neg": 0,
+            "support_pos": 0,
+            "specificity": float("nan"),
+            "fpr": float("nan"),
+            "npv": float("nan"),
+            "res_balanced_acc": float("nan"),
+            "per_class_acc": [float("nan"), float("nan")]
+        }
+    }
+    if include_curves:
+        out["roc_curve"] = {
+            "available": False,
+            "reason": "no-valid-residues",
+            "fpr": [],
+            "tpr": []
+        }
+        out["pr_curve"] = {
+            "available": False,
+            "reason": "no-valid-residues",
+            "precision": [],
+            "recall": [],
+            "baseline_positive_rate": None,
+            "ap": None,
+            "auprc_trapz": None
+        }
+    return out
+
+
+def _build_eval_output_from_arrays(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    y_prob: np.ndarray,
+    processed_proteins: int,
+    proteins_zero_valid_residues: int,
+    votes_needed: int | None,
+    include_curves: bool,
+    curve_max_points: int
+) -> Dict[str, Any]:
+    """Builds a full evaluation summary from flattened residue-level arrays."""
+    if y_true.size < 1:
+        out = _empty_eval_output(
+            votes_needed=votes_needed, include_curves=include_curves)
+        out["processed_proteins"] = int(processed_proteins)
+        out["proteins_zero_valid_residues"] = int(proteins_zero_valid_residues)
+        out["proteins_with_valid_residues"] = int(
+            processed_proteins - proteins_zero_valid_residues)
+        return out
+
+    metrics = compute_eval_metrics(y_true=y_true, y_pred=y_pred, y_prob=y_prob)
+    metrics["pr_auc_trapz"] = _compute_pr_auc_trapezoid(
+        y_true=y_true, y_prob=y_prob
+    )
+    cm = np.zeros((2, 2), dtype=np.int64)
+    cm[0, 0] = int(((y_true == 0) & (y_pred == 0)).sum())
+    cm[0, 1] = int(((y_true == 0) & (y_pred == 1)).sum())
+    cm[1, 0] = int(((y_true == 1) & (y_pred == 0)).sum())
+    cm[1, 1] = int(((y_true == 1) & (y_pred == 1)).sum())
+    metrics = _augment_metrics_with_confusion_stats(metrics=metrics, cm=cm)
+
+    out = {
+        "processed_proteins": int(processed_proteins),
+        "proteins_with_valid_residues": int(processed_proteins - proteins_zero_valid_residues),
+        "proteins_zero_valid_residues": int(proteins_zero_valid_residues),
+        "valid_residues": int(y_true.size),
+        "pos_residues": int((y_true == 1).sum()),
+        "neg_residues": int((y_true == 0).sum()),
+        "pred_pos_residues": int((y_pred == 1).sum()),
+        "pred_neg_residues": int((y_pred == 0).sum()),
+        "accuracy": float((y_true == y_pred).mean()) if y_true.size > 0 else float("nan"),
+        "confusion_matrix": [[int(cm[0, 0]), int(cm[0, 1])], [int(cm[1, 0]), int(cm[1, 1])]],
+        "votes_needed": votes_needed,
+        "has_both_classes": bool(metrics.get("has_both_classes", False)),
+        "metrics": metrics
+    }
+    if include_curves:
+        out["roc_curve"] = _build_roc_curve_payload(
+            y_true=y_true, y_prob=y_prob, max_points=curve_max_points
+        )
+        out["pr_curve"] = _build_pr_curve_payload(
+            y_true=y_true, y_prob=y_prob, max_points=curve_max_points
+        )
+    return out
+
+
+def _resolve_eval_metric_value(eval_item: Mapping[str, Any], metric_name: str) -> float:
+    """Resolves a metric value from eval payload for fold ranking."""
+    metrics = eval_item.get("metrics")
+    if not isinstance(metrics, Mapping):
+        raise ValueError("Fold evaluation payload missing 'metrics' mapping")
+    if metric_name in metrics:
+        value = metrics[metric_name]
+    else:
+        metric_lookup = {
+            _norm_metric_token(str(key)): key for key in metrics.keys()
+        }
+        token = _norm_metric_token(metric_name)
+        if token not in metric_lookup:
+            raise ValueError(
+                f"Metric '{metric_name}' not found in fold metrics keys={list(metrics.keys())}"
+            )
+        value = metrics[metric_lookup[token]]
+    value_float = float(value)
+    if not math.isfinite(value_float):
+        raise ValueError(
+            f"Fold ranking metric '{metric_name}' produced non-finite value: {value}"
+        )
+    return value_float
+
+
+def _pick_best_fold(
+    fold_evaluations: Sequence[Mapping[str, Any]],
+    metric_name: str,
+    direction: str
+) -> Tuple[int, Dict[str, Any]]:
+    """Returns best fold array index and fold-level selection metadata."""
+    if len(fold_evaluations) < 1:
+        raise ValueError(
+            "At least one fold evaluation is required to pick a best fold")
+
+    resolved_direction = (
+        _auto_direction_for_metric(metric_name)
+        if direction == "auto"
+        else str(direction).strip().lower()
+    )
+    if resolved_direction not in {"max", "min"}:
+        raise ValueError(
+            "--best-fold-direction must be one of: auto, max, min")
+
+    scored: List[Tuple[int, float, int]] = []
+    for idx, fold_eval in enumerate(fold_evaluations):
+        metric_value = _resolve_eval_metric_value(fold_eval, metric_name)
+        fold_index_value = _as_optional_int(fold_eval.get("fold_index"))
+        fold_index = int(
+            fold_index_value) if fold_index_value is not None else (idx + 1)
+        scored.append((idx, metric_value, fold_index))
+
+    if resolved_direction == "max":
+        scored_sorted = sorted(
+            scored,
+            key=lambda row: (-row[1], row[2], row[0])
+        )
+    else:
+        scored_sorted = sorted(
+            scored,
+            key=lambda row: (row[1], row[2], row[0])
+        )
+    best_idx, best_score, best_fold_index = scored_sorted[0]
+    meta = {
+        "metric_requested": str(metric_name),
+        "direction": str(resolved_direction),
+        "best_fold_index": int(best_fold_index),
+        "best_score": float(best_score),
+        "fold_scores": [
+            {
+                "fold_index": int(fold_idx),
+                "metric_value": float(score)
+            }
+            for _, score, fold_idx in scored_sorted
+        ]
+    }
+    return best_idx, meta
+
+
+def _parse_plot_formats(raw: str) -> List[str]:
+    """Parses comma-separated plot file formats."""
+    tokens = [t.strip().lower() for t in str(raw).split(",")]
+    formats = [t for t in tokens if len(t) > 0]
+    if len(formats) < 1:
+        raise ValueError("--plot-formats must include at least one format")
+    allowed = {"png", "svg", "pdf"}
+    bad = [fmt for fmt in formats if fmt not in allowed]
+    if len(bad) > 0:
+        raise ValueError(
+            f"Unsupported --plot-formats values={bad}; allowed={sorted(allowed)}"
+        )
+    return formats
+
+
+def _plot_fold_curves(
+    fold_evaluations: Sequence[Mapping[str, Any]],
+    plot_path_base: Path,
+    formats: Sequence[str],
+    curve_key: str,
+    title: str,
+    x_label: str,
+    y_label: str,
+    x_key: str,
+    y_key: str,
+    metric_key: str,
+    chance_line: bool,
+    baseline_y: float | None = None,
+    secondary_metric_key: str | None = None,
+    metric_label: str | None = None,
+    secondary_metric_label: str | None = None,
+    x_limits: Tuple[float, float] | None = None,
+    y_limits: Tuple[float, float] | None = None,
+    legend_loc: str = "lower right",
+) -> List[str]:
+    """Writes a fold-only curve panel for ROC or PR."""
+    try:
+        import matplotlib.pyplot as plt
+    except Exception as e:
+        raise RuntimeError(
+            "Matplotlib is required for plotting. Install matplotlib to use --plot-dir."
+        ) from e
+
+    fig, ax = plt.subplots(figsize=(7.0, 6.0), dpi=150)
+    plotted = 0
+    for fold_eval in fold_evaluations:
+        curve_obj = fold_eval.get(curve_key)
+        if not isinstance(curve_obj, Mapping):
+            continue
+        if not bool(curve_obj.get("available", False)):
+            continue
+        x_vals = curve_obj.get(x_key)
+        y_vals = curve_obj.get(y_key)
+        if not isinstance(x_vals, list) or not isinstance(y_vals, list):
+            continue
+        if len(x_vals) < 2 or len(y_vals) < 2:
+            continue
+        fold_index = _as_optional_int(fold_eval.get("fold_index"))
+        fold_label = int(
+            fold_index) if fold_index is not None else (plotted + 1)
+        metrics_obj = fold_eval.get("metrics")
+        metric_value = float("nan")
+        if isinstance(metrics_obj, Mapping):
+            raw_metric = metrics_obj.get(metric_key, float("nan"))
+            try:
+                metric_value = float(raw_metric)
+            except (TypeError, ValueError):
+                metric_value = float("nan")
+        primary_label = (
+            metric_label if metric_label is not None else metric_key.upper()
+        )
+        primary_metric_text = f"{primary_label}: {metric_value:.3f}" if math.isfinite(
+            metric_value
+        ) else f"{primary_label}: nan"
+        secondary_metric_text = None
+        if secondary_metric_key is not None and isinstance(metrics_obj, Mapping):
+            raw_secondary = metrics_obj.get(secondary_metric_key, float("nan"))
+            try:
+                secondary_value = float(raw_secondary)
+            except (TypeError, ValueError):
+                secondary_value = float("nan")
+            secondary_label = (
+                secondary_metric_label
+                if secondary_metric_label is not None
+                else secondary_metric_key.upper()
+            )
+            if math.isfinite(secondary_value):
+                secondary_metric_text = (
+                    f"{secondary_label}: {secondary_value:.3f}"
+                )
+            else:
+                secondary_metric_text = f"{secondary_label}: nan"
+        label_parts = [f"Fold {fold_label}", primary_metric_text]
+        if secondary_metric_text is not None:
+            label_parts.append(secondary_metric_text)
+        ax.plot(
+            x_vals,
+            y_vals,
+            linewidth=1.8,
+            alpha=0.95,
+            label=" | ".join(label_parts),
+        )
+        plotted += 1
+
+    if chance_line:
+        ax.plot([0.0, 1.0], [0.0, 1.0], linestyle="--",
+                linewidth=1.0, color="#C77DBB", label="Chance")
+    if baseline_y is not None and math.isfinite(float(baseline_y)):
+        y_val = float(baseline_y)
+        ax.plot([0.0, 1.0], [y_val, y_val], linestyle="--",
+                linewidth=1.0, color="#888888", label=f"Prevalence baseline: {y_val:.4f}")
+
+    ax.set_title(title)
+    ax.set_xlabel(x_label)
+    ax.set_ylabel(y_label)
+    if x_limits is None:
+        ax.set_xlim(0.0, 1.0)
+    else:
+        ax.set_xlim(float(x_limits[0]), float(x_limits[1]))
+    if y_limits is None:
+        ax.set_ylim(0.0, 1.0)
+    else:
+        ax.set_ylim(float(y_limits[0]), float(y_limits[1]))
+    ax.grid(alpha=0.2)
+    if plotted > 0:
+        ax.legend(loc=legend_loc, frameon=False, fontsize=9)
+    fig.tight_layout()
+
+    saved_paths: List[str] = []
+    plot_path_base.parent.mkdir(parents=True, exist_ok=True)
+    for fmt in formats:
+        out_path = plot_path_base.with_suffix(f".{fmt}")
+        fig.savefig(out_path, dpi=300, bbox_inches="tight")
+        saved_paths.append(str(out_path))
+    plt.close(fig)
+    return saved_paths
+
+
+def _plot_confusion_matrix(
+    confusion_matrix: np.ndarray,
+    plot_path_base: Path,
+    formats: Sequence[str],
+    title: str
+) -> List[str]:
+    """Writes confusion matrix heatmap plot with counts and percentages."""
+    try:
+        import matplotlib.pyplot as plt
+    except Exception as e:
+        raise RuntimeError(
+            "Matplotlib is required for plotting. Install matplotlib to use --plot-dir."
+        ) from e
+
+    if confusion_matrix.shape != (2, 2):
+        raise ValueError(
+            f"Expected confusion matrix shape=(2,2), got {confusion_matrix.shape}"
+        )
+    cm = confusion_matrix.astype(np.int64, copy=False)
+    total = int(cm.sum())
+    pct = (
+        (cm.astype(np.float64) / float(total)) * 100.0
+        if total > 0
+        else np.zeros_like(cm, dtype=np.float64)
+    )
+
+    fig, ax = plt.subplots(figsize=(6.3, 5.6), dpi=150)
+    im = ax.imshow(cm, cmap="Oranges")
+    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    ax.set_xticks([0, 1], labels=["Non-epitope residue", "Epitope residue"])
+    ax.set_yticks([0, 1], labels=[
+                  "True non-epitope residue", "True epitope residue"])
+    ax.set_xlabel("Predicted")
+    ax.set_ylabel("True")
+    ax.set_title(title)
+
+    max_val = int(cm.max()) if cm.size > 0 else 0
+    for i in range(2):
+        for j in range(2):
+            color = "white" if cm[i, j] > (max_val / 2.0) else "#333333"
+            ax.text(
+                j,
+                i,
+                f"{pct[i, j]:.2f}%\n{int(cm[i, j])}",
+                ha="center",
+                va="center",
+                fontsize=10,
+                color=color
+            )
+    fig.tight_layout()
+
+    saved_paths: List[str] = []
+    plot_path_base.parent.mkdir(parents=True, exist_ok=True)
+    for fmt in formats:
+        out_path = plot_path_base.with_suffix(f".{fmt}")
+        fig.savefig(out_path, dpi=300, bbox_inches="tight")
+        saved_paths.append(str(out_path))
+    plt.close(fig)
+    return saved_paths
+
+
+def _resolve_pr_zoom_limits(
+    fold_evaluations: Sequence[Mapping[str, Any]],
+    baseline_y: float | None,
+) -> Tuple[float, float]:
+    """Computes stable PR-plot zoom y-limits for highly imbalanced datasets."""
+    precision_values: List[float] = []
+    for fold_eval in fold_evaluations:
+        pr_obj = fold_eval.get("pr_curve")
+        if not isinstance(pr_obj, Mapping):
+            continue
+        if not bool(pr_obj.get("available", False)):
+            continue
+        recalls = pr_obj.get("recall")
+        precisions = pr_obj.get("precision")
+        if not isinstance(recalls, list) or not isinstance(precisions, list):
+            continue
+        if len(recalls) != len(precisions):
+            continue
+        for recall, precision in zip(recalls, precisions):
+            try:
+                recall_f = float(recall)
+                precision_f = float(precision)
+            except (TypeError, ValueError):
+                continue
+            if not math.isfinite(recall_f) or not math.isfinite(precision_f):
+                continue
+            if 0.0 < recall_f <= 0.20:
+                precision_values.append(precision_f)
+
+    if len(precision_values) < 1:
+        y_top = 0.05
+    else:
+        q95 = float(np.quantile(np.asarray(precision_values), 0.95))
+        y_top = max(0.02, q95 * 1.15)
+    if baseline_y is not None and math.isfinite(float(baseline_y)):
+        y_top = max(y_top, float(baseline_y) * 6.0)
+    y_top = min(1.0, max(0.02, y_top))
+    return (0.0, y_top)
+
+
 def _evaluate_dataset(
     psp_models: Sequence[torch.nn.Module],
     thresholds: Sequence[float],
     eval_loader: DataLoader,
     device: str,
-    logger: Any
+    logger: Any,
+    member_specs: Sequence[EvaluationMember],
+    emit_fold_metrics: bool,
+    include_curves: bool,
+    curve_max_points: int,
+    best_fold_by: str,
+    best_fold_direction: str,
+    plot_dir: Path | None,
+    plot_formats: Sequence[str]
 ) -> Dict[str, Any]:
     """Evaluates one model or an ensemble on the given eval dataset loader."""
     n_members = int(len(psp_models))
@@ -319,20 +987,25 @@ def _evaluate_dataset(
         raise ValueError(
             f"Model/threshold length mismatch: models={n_members} thresholds={len(thresholds)}"
         )
+    if len(member_specs) != n_members:
+        raise ValueError(
+            f"member_specs length mismatch: specs={len(member_specs)} models={n_members}"
+        )
+    if curve_max_points < 2:
+        raise ValueError("--curve-max-points must be >= 2")
 
     votes_needed = int((n_members // 2) + 1)
 
     all_true: List[torch.Tensor] = []
-    all_pred: List[torch.Tensor] = []
-    all_prob: List[torch.Tensor] = []
+    ens_pred: List[torch.Tensor] = []
+    ens_prob: List[torch.Tensor] = []
+
+    fold_pred: List[List[torch.Tensor]] = [[] for _ in range(n_members)]
+    fold_prob: List[List[torch.Tensor]] = [[] for _ in range(n_members)]
 
     processed = 0
     zero_valid = 0
-    total_valid = 0
-    total_pos = 0
-    total_neg = 0
-    total_pred_pos = 0
-    total_pred_neg = 0
+    running_valid_residues = 0
 
     for batch_idx, batch in enumerate(eval_loader, start=1):
         X, y, mask = batch
@@ -348,38 +1021,47 @@ def _evaluate_dataset(
                 zero_valid += 1
                 continue
 
-            if n_members == 1:
-                probs = predict_member_probabilities_from_embedding(
-                    psp_model=psp_models[0], protein_emb=protein_emb, device=device
+            member_probs_full: List[torch.Tensor] = []
+            member_pred_full: List[torch.Tensor] = []
+            for model, threshold in zip(psp_models, thresholds):
+                probs_member = predict_member_probabilities_from_embedding(
+                    psp_model=model,
+                    protein_emb=protein_emb,
+                    device=device
                 )
-                pred = (probs >= float(thresholds[0])).to(torch.int64)
+                member_probs_full.append(probs_member)
+                member_pred_full.append(
+                    (probs_member >= threshold).to(torch.int64))
+
+            if n_members == 1:
+                pred_ensemble = member_pred_full[0]
+                prob_ensemble = member_probs_full[0]
             else:
-                member_probs: List[torch.Tensor] = []
-                member_masks: List[torch.Tensor] = []
-                for model, threshold in zip(psp_models, thresholds):
-                    probs_member = predict_member_probabilities_from_embedding(
-                        psp_model=model, protein_emb=protein_emb, device=device
-                    )
-                    member_probs.append(probs_member)
-                    member_masks.append(
-                        (probs_member >= threshold).to(torch.int64))
-                vote_sum = torch.stack(member_masks, dim=0).sum(dim=0)
-                pred = (vote_sum >= votes_needed).to(torch.int64)
-                probs = torch.stack(member_probs, dim=0).mean(dim=0)
+                vote_sum = torch.stack(member_pred_full, dim=0).sum(dim=0)
+                pred_ensemble = (vote_sum >= votes_needed).to(torch.int64)
+                prob_ensemble = torch.stack(
+                    member_probs_full, dim=0).mean(dim=0)
 
             y_true_valid = y_row[valid_mask].to(torch.int64).cpu()
-            y_pred_valid = pred[valid_mask].to(torch.int64).cpu()
-            y_prob_valid = probs[valid_mask].to(torch.float32).cpu()
+            ens_pred_valid = pred_ensemble[valid_mask].to(torch.int64).cpu()
+            ens_prob_valid = prob_ensemble[valid_mask].to(torch.float32).cpu()
 
             all_true.append(y_true_valid)
-            all_pred.append(y_pred_valid)
-            all_prob.append(y_prob_valid)
+            ens_pred.append(ens_pred_valid)
+            ens_prob.append(ens_prob_valid)
 
-            total_valid += int(y_true_valid.numel())
-            total_pos += int((y_true_valid == 1).sum().item())
-            total_neg += int((y_true_valid == 0).sum().item())
-            total_pred_pos += int((y_pred_valid == 1).sum().item())
-            total_pred_neg += int((y_pred_valid == 0).sum().item())
+            if emit_fold_metrics:
+                for member_idx in range(n_members):
+                    fold_pred[member_idx].append(
+                        member_pred_full[member_idx][valid_mask].to(
+                            torch.int64).cpu()
+                    )
+                    fold_prob[member_idx].append(
+                        member_probs_full[member_idx][valid_mask].to(
+                            torch.float32).cpu()
+                    )
+
+            running_valid_residues += int(y_true_valid.numel())
 
         if batch_idx % 50 == 0:
             logger.info(
@@ -387,73 +1069,170 @@ def _evaluate_dataset(
                 extra={
                     "extra": {
                         "batches": batch_idx,
-                        "processed_proteins": processed,
-                        "valid_residues": total_valid
+                        "processed_proteins": int(processed),
+                        "valid_residues": int(running_valid_residues)
                     }
-                },
+                }
             )
 
-    if not all_true:
-        return {
-            "processed_proteins": int(processed),
-            "proteins_with_valid_residues": 0,
-            "proteins_zero_valid_residues": int(zero_valid),
-            "valid_residues": 0,
-            "pos_residues": 0,
-            "neg_residues": 0,
-            "pred_pos_residues": 0,
-            "pred_neg_residues": 0,
-            "accuracy": float("nan"),
-            "confusion_matrix": [[0, 0], [0, 0]],
-            "votes_needed": votes_needed if n_members > 1 else None,
-            "has_both_classes": False,
-            "metrics": {
-                "precision": float("nan"),
-                "recall": float("nan"),
-                "f1": float("nan"),
-                "mcc": float("nan"),
-                "auc": float("nan"),
-                "auc10": float("nan"),
-                "pr_auc": float("nan"),
-                "support_neg": 0,
-                "support_pos": 0,
-                "specificity": float("nan"),
-                "fpr": float("nan"),
-                "npv": float("nan"),
-                "res_balanced_acc": float("nan"),
-                "per_class_acc": [float("nan"), float("nan")]
-            }
+    y_true_np = (
+        torch.cat(all_true, dim=0).numpy()
+        if len(all_true) > 0
+        else np.asarray([], dtype=np.int64)
+    )
+    ens_pred_np = (
+        torch.cat(ens_pred, dim=0).numpy()
+        if len(ens_pred) > 0
+        else np.asarray([], dtype=np.int64)
+    )
+    ens_prob_np = (
+        torch.cat(ens_prob, dim=0).numpy()
+        if len(ens_prob) > 0
+        else np.asarray([], dtype=np.float32)
+    )
+
+    ensemble_eval = _build_eval_output_from_arrays(
+        y_true=y_true_np,
+        y_pred=ens_pred_np,
+        y_prob=ens_prob_np,
+        processed_proteins=int(processed),
+        proteins_zero_valid_residues=int(zero_valid),
+        votes_needed=(votes_needed if n_members > 1 else None),
+        include_curves=include_curves,
+        curve_max_points=curve_max_points
+    )
+
+    if not emit_fold_metrics:
+        return ensemble_eval
+
+    fold_evaluations: List[Dict[str, Any]] = []
+    for member_idx, member in enumerate(member_specs):
+        fold_pred_np = (
+            torch.cat(fold_pred[member_idx], dim=0).numpy()
+            if len(fold_pred[member_idx]) > 0
+            else np.asarray([], dtype=np.int64)
+        )
+        fold_prob_np = (
+            torch.cat(fold_prob[member_idx], dim=0).numpy()
+            if len(fold_prob[member_idx]) > 0
+            else np.asarray([], dtype=np.float32)
+        )
+        fold_eval = _build_eval_output_from_arrays(
+            y_true=y_true_np,
+            y_pred=fold_pred_np,
+            y_prob=fold_prob_np,
+            processed_proteins=int(processed),
+            proteins_zero_valid_residues=int(zero_valid),
+            votes_needed=None,
+            include_curves=include_curves,
+            curve_max_points=curve_max_points
+        )
+        fold_eval["fold_index"] = member.fold_index
+        fold_eval["member_index"] = member.member_index
+        fold_eval["checkpoint"] = str(member.checkpoint)
+        fold_eval["threshold"] = float(thresholds[member_idx])
+        fold_evaluations.append(fold_eval)
+
+    best_fold_array_idx, best_fold_meta = _pick_best_fold(
+        fold_evaluations=fold_evaluations,
+        metric_name=best_fold_by,
+        direction=best_fold_direction
+    )
+    best_fold_eval = fold_evaluations[best_fold_array_idx]
+
+    ensemble_eval["folds"] = fold_evaluations
+    ensemble_eval["best_fold_selection"] = best_fold_meta
+    ensemble_eval["best_fold"] = best_fold_eval
+
+    if plot_dir is not None:
+        pr_baseline = None
+        pr_obj = best_fold_eval.get("pr_curve")
+        if isinstance(pr_obj, Mapping):
+            pr_baseline = pr_obj.get("baseline_positive_rate")
+
+        roc_paths = _plot_fold_curves(
+            fold_evaluations=fold_evaluations,
+            plot_path_base=plot_dir / "roc_auc_folds",
+            formats=plot_formats,
+            curve_key="roc_curve",
+            title="Fold ROC Curves",
+            x_label="FPR",
+            y_label="TPR",
+            x_key="fpr",
+            y_key="tpr",
+            metric_key="auc",
+            chance_line=True,
+            metric_label="AUC",
+        )
+        pr_paths = _plot_fold_curves(
+            fold_evaluations=fold_evaluations,
+            plot_path_base=plot_dir / "pr_auc_folds",
+            formats=plot_formats,
+            curve_key="pr_curve",
+            title="Fold PR Curves",
+            x_label="Recall",
+            y_label="Precision",
+            x_key="recall",
+            y_key="precision",
+            metric_key="pr_auc",
+            chance_line=False,
+            secondary_metric_key="pr_auc_trapz",
+            metric_label="AP",
+            secondary_metric_label="AUPRC(trapz)",
+            baseline_y=(
+                float(pr_baseline)
+                if pr_baseline is not None and math.isfinite(float(pr_baseline))
+                else None
+            )
+        )
+        pr_zoom_paths = _plot_fold_curves(
+            fold_evaluations=fold_evaluations,
+            plot_path_base=plot_dir / "pr_auc_folds_zoom",
+            formats=plot_formats,
+            curve_key="pr_curve",
+            title="Fold PR Curves (Zoomed)",
+            x_label="Recall",
+            y_label="Precision",
+            x_key="recall",
+            y_key="precision",
+            metric_key="pr_auc",
+            chance_line=False,
+            secondary_metric_key="pr_auc_trapz",
+            metric_label="AP",
+            secondary_metric_label="AUPRC(trapz)",
+            baseline_y=(
+                float(pr_baseline)
+                if pr_baseline is not None and math.isfinite(float(pr_baseline))
+                else None
+            ),
+            x_limits=(0.0, 0.20),
+            y_limits=_resolve_pr_zoom_limits(
+                fold_evaluations=fold_evaluations,
+                baseline_y=(
+                    float(pr_baseline)
+                    if pr_baseline is not None and math.isfinite(float(pr_baseline))
+                    else None
+                ),
+            ),
+            legend_loc="upper right",
+        )
+        cm = np.asarray(best_fold_eval["confusion_matrix"], dtype=np.int64)
+        cm_paths = _plot_confusion_matrix(
+            confusion_matrix=cm,
+            plot_path_base=plot_dir / "confusion_matrix_best_fold",
+            formats=plot_formats,
+            title="Best Fold Confusion Matrix"
+        )
+        ensemble_eval["plot_outputs"] = {
+            "plot_dir": str(plot_dir),
+            "formats": [str(fmt) for fmt in plot_formats],
+            "roc_auc_folds": roc_paths,
+            "pr_auc_folds": pr_paths,
+            "pr_auc_folds_zoom": pr_zoom_paths,
+            "confusion_matrix_best_fold": cm_paths
         }
 
-    y_true = torch.cat(all_true, dim=0).numpy()
-    y_pred = torch.cat(all_pred, dim=0).numpy()
-    y_prob = torch.cat(all_prob, dim=0).numpy()
-
-    metrics = compute_eval_metrics(y_true=y_true, y_pred=y_pred, y_prob=y_prob)
-
-    cm = np.zeros((2, 2), dtype=np.int64)
-    cm[0, 0] = int(((y_true == 0) & (y_pred == 0)).sum())
-    cm[0, 1] = int(((y_true == 0) & (y_pred == 1)).sum())
-    cm[1, 0] = int(((y_true == 1) & (y_pred == 0)).sum())
-    cm[1, 1] = int(((y_true == 1) & (y_pred == 1)).sum())
-
-    metrics = _augment_metrics_with_confusion_stats(metrics=metrics, cm=cm)
-
-    return {
-        "processed_proteins": int(processed),
-        "proteins_with_valid_residues": int(processed - zero_valid),
-        "proteins_zero_valid_residues": int(zero_valid),
-        "valid_residues": int(total_valid),
-        "pos_residues": int(total_pos),
-        "neg_residues": int(total_neg),
-        "pred_pos_residues": int(total_pred_pos),
-        "pred_neg_residues": int(total_pred_neg),
-        "accuracy": float((y_true == y_pred).mean()) if y_true.size > 0 else float("nan"),
-        "confusion_matrix": [[int(cm[0, 0]), int(cm[0, 1])], [int(cm[1, 0]), int(cm[1, 1])]],
-        "votes_needed": votes_needed if n_members > 1 else None,
-        "has_both_classes": bool(metrics.get("has_both_classes", False)),
-        "metrics": metrics
-    }
+    return ensemble_eval
 
 
 def main() -> None:
@@ -515,6 +1294,43 @@ def main() -> None:
         help="Optional number of ensemble members to evaluate (first K by fold/member order)."
     )
     parser.add_argument(
+        "--select-best-set-runs-csv",
+        action="store",
+        dest="select_best_set_runs_csv",
+        type=Path,
+        default=None,
+        help=(
+            "Optional runs.csv path used to auto-select --ensemble-set-index by set-level "
+            "aggregate metric."
+        )
+    )
+    parser.add_argument(
+        "--best-set-by",
+        action="store",
+        dest="best_set_by",
+        type=str,
+        default="PR_AUC",
+        help="Metric name (runs.csv column) used for --select-best-set-runs-csv."
+    )
+    parser.add_argument(
+        "--best-set-agg",
+        action="store",
+        dest="best_set_agg",
+        type=str,
+        choices=["mean", "median", "min", "max"],
+        default="mean",
+        help="Aggregation across folds for best-set selection."
+    )
+    parser.add_argument(
+        "--best-set-direction",
+        action="store",
+        dest="best_set_direction",
+        type=str,
+        choices=["auto", "max", "min"],
+        default="auto",
+        help="Optimization direction for best-set selection metric."
+    )
+    parser.add_argument(
         "--subset",
         action="store",
         dest="subset",
@@ -537,6 +1353,61 @@ def main() -> None:
         type=int,
         default=0,
         help="Number of data loader workers."
+    )
+    parser.add_argument(
+        "--emit-fold-metrics",
+        action="store_true",
+        dest="emit_fold_metrics",
+        default=False,
+        help="Emit per-fold evaluation payloads in addition to ensemble evaluation."
+    )
+    parser.add_argument(
+        "--include-curves",
+        action="store_true",
+        dest="include_curves",
+        default=False,
+        help="Include ROC and PR curve points in evaluation JSON payloads."
+    )
+    parser.add_argument(
+        "--curve-max-points",
+        action="store",
+        dest="curve_max_points",
+        type=int,
+        default=2048,
+        help="Maximum number of curve points saved per ROC/PR curve."
+    )
+    parser.add_argument(
+        "--best-fold-by",
+        action="store",
+        dest="best_fold_by",
+        type=str,
+        default="pr_auc",
+        help="Metric used to pick the best fold when --emit-fold-metrics is enabled."
+    )
+    parser.add_argument(
+        "--best-fold-direction",
+        action="store",
+        dest="best_fold_direction",
+        type=str,
+        choices=["auto", "max", "min"],
+        default="auto",
+        help="Optimization direction used for --best-fold-by."
+    )
+    parser.add_argument(
+        "--plot-dir",
+        action="store",
+        dest="plot_dir",
+        type=Path,
+        default=None,
+        help="Optional directory to write fold ROC/PR and best-fold confusion matrix plots."
+    )
+    parser.add_argument(
+        "--plot-formats",
+        action="store",
+        dest="plot_formats",
+        type=str,
+        default="png,svg",
+        help="Comma-separated plot formats (png,svg,pdf)."
     )
     parser.add_argument(
         "--label-cache-mode",
@@ -642,6 +1513,28 @@ def main() -> None:
         raise ValueError("--batch-size must be >= 1")
     if args.num_workers < 0:
         raise ValueError("--num-workers must be >= 0")
+    if args.curve_max_points < 2:
+        raise ValueError("--curve-max-points must be >= 2")
+
+    plot_formats: List[str] = []
+    if args.plot_dir is not None:
+        plot_formats = _parse_plot_formats(args.plot_formats)
+        args.emit_fold_metrics = True
+        args.include_curves = True
+
+    selected_set_meta: Dict[str, Any] | None = None
+    if args.select_best_set_runs_csv is not None:
+        if args.model_artifact.suffix.lower() != ".json":
+            raise ValueError(
+                "--select-best-set-runs-csv requires a .json ensemble manifest model artifact"
+            )
+        selected_set_index, selected_set_meta = _resolve_best_set_index(
+            runs_csv_path=args.select_best_set_runs_csv,
+            metric_name=args.best_set_by,
+            agg_name=args.best_set_agg,
+            direction=args.best_set_direction
+        )
+        args.ensemble_set_index = int(selected_set_index)
 
     json_indent = 2 if args.log_json else None
     logger = setup_logger(
@@ -763,6 +1656,14 @@ def main() -> None:
                 "manifest_schema_version": artifact_meta.get("schema_version"),
                 "ensemble_set_index": artifact_meta.get("set_index"),
                 "requested_ensemble_set_index": int(args.ensemble_set_index),
+                "selected_set_via_runs_csv": bool(
+                    args.select_best_set_runs_csv is not None
+                ),
+                "selected_set_runs_csv": (
+                    str(args.select_best_set_runs_csv)
+                    if args.select_best_set_runs_csv is not None
+                    else None
+                ),
                 "k_folds": args.k_folds,
                 "n_members": int(len(psp_models)),
                 "threshold_mode": (
@@ -783,6 +1684,13 @@ def main() -> None:
                 "use_layer_norm": bool(first_cfg.use_layer_norm),
                 "use_residual": bool(first_cfg.use_residual),
                 "num_classes": int(first_cfg.num_classes),
+                "emit_fold_metrics": bool(args.emit_fold_metrics),
+                "include_curves": bool(args.include_curves),
+                "curve_max_points": int(args.curve_max_points),
+                "best_fold_by": str(args.best_fold_by),
+                "best_fold_direction": str(args.best_fold_direction),
+                "plot_dir": str(args.plot_dir) if args.plot_dir is not None else None,
+                "plot_formats": plot_formats if len(plot_formats) > 0 else None,
                 "n_candidate_proteins": int(len(candidate_ids)),
                 "n_selected_proteins": int(len(selected_ids))
             }
@@ -794,7 +1702,15 @@ def main() -> None:
         thresholds=member_thresholds,
         eval_loader=eval_loader,
         device=device,
-        logger=logger
+        logger=logger,
+        member_specs=member_specs,
+        emit_fold_metrics=bool(args.emit_fold_metrics),
+        include_curves=bool(args.include_curves),
+        curve_max_points=int(args.curve_max_points),
+        best_fold_by=str(args.best_fold_by),
+        best_fold_direction=str(args.best_fold_direction),
+        plot_dir=args.plot_dir,
+        plot_formats=plot_formats
     )
     if not bool(eval_out.get("has_both_classes", False)):
         logger.warning(
@@ -817,6 +1733,27 @@ def main() -> None:
         "manifest_schema_version": artifact_meta.get("schema_version"),
         "ensemble_set_index": artifact_meta.get("set_index"),
         "requested_ensemble_set_index": int(args.ensemble_set_index),
+        "selected_set_runs_csv": (
+            str(args.select_best_set_runs_csv)
+            if args.select_best_set_runs_csv is not None
+            else None
+        ),
+        "selected_set_meta": selected_set_meta,
+        "best_set_by": (
+            str(args.best_set_by)
+            if args.select_best_set_runs_csv is not None
+            else None
+        ),
+        "best_set_agg": (
+            str(args.best_set_agg)
+            if args.select_best_set_runs_csv is not None
+            else None
+        ),
+        "best_set_direction": (
+            str(args.best_set_direction)
+            if args.select_best_set_runs_csv is not None
+            else None
+        ),
         "k_folds": args.k_folds,
         "n_members": int(len(psp_models)),
         "threshold_mode": (
@@ -824,6 +1761,13 @@ def main() -> None:
         ),
         "threshold": float(member_thresholds[0]) if len(member_thresholds) == 1 else None,
         "member_thresholds": [float(x) for x in member_thresholds],
+        "emit_fold_metrics": bool(args.emit_fold_metrics),
+        "include_curves": bool(args.include_curves),
+        "curve_max_points": int(args.curve_max_points),
+        "best_fold_by": str(args.best_fold_by),
+        "best_fold_direction": str(args.best_fold_direction),
+        "plot_dir": str(args.plot_dir) if args.plot_dir is not None else None,
+        "plot_formats": plot_formats if len(plot_formats) > 0 else None,
         "subset": int(args.subset),
         "n_candidate_proteins": int(len(candidate_ids)),
         "n_selected_proteins": int(len(selected_ids)),

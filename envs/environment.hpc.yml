@@ -44,6 +44,7 @@ dependencies:
   - typing_extensions
 
   # plotting
+  - matplotlib
   - matplotlib-inline
 
   # bio ML and ESM

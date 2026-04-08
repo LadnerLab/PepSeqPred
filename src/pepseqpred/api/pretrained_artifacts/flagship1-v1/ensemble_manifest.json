@@ -1,0 +1,54 @@
+{
+  "schema_version": 1,
+  "ensemble_type": "kfold_majority_vote",
+  "train_mode": "ensemble-kfold",
+  "split_type": "id-family",
+  "n_folds": 5,
+  "set_index": 1,
+  "split_seed": 101,
+  "train_seed": 11,
+  "best_model_metric": "loss",
+  "n_members": 5,
+  "n_valid_members": 5,
+  "voting": {
+    "rule": "majority",
+    "tie_break": "negative"
+  },
+  "members": [
+    {
+      "member_index": 1,
+      "fold_index": 1,
+      "checkpoint": "fold_01.pt",
+      "threshold": 0.44017091393470764,
+      "status": "OK"
+    },
+    {
+      "member_index": 2,
+      "fold_index": 2,
+      "checkpoint": "fold_02.pt",
+      "threshold": 0.37585383653640747,
+      "status": "OK"
+    },
+    {
+      "member_index": 3,
+      "fold_index": 3,
+      "checkpoint": "fold_03.pt",
+      "threshold": 0.8216748237609863,
+      "status": "OK"
+    },
+    {
+      "member_index": 4,
+      "fold_index": 4,
+      "checkpoint": "fold_04.pt",
+      "threshold": 0.7342239618301392,
+      "status": "OK"
+    },
+    {
+      "member_index": 5,
+      "fold_index": 5,
+      "checkpoint": "fold_05.pt",
+      "threshold": 0.8626397252082825,
+      "status": "OK"
+    }
+  ]
+}

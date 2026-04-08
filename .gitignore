@@ -43,3 +43,7 @@ pytest-*.xml
 *.metadata
 *.json
 localdata/evals/*
+
+# Bundled pretrained model artifacts shipped with the package
+!src/pepseqpred/api/pretrained_artifacts/**/*.pt
+!src/pepseqpred/api/pretrained_artifacts/**/*.json

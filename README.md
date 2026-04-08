@@ -22,8 +22,13 @@ This API allows you to use any of the pretrained models in your own code, or loa
 
 Example usage:
 ```python
-from pepseqpred import load_predictor
+from pepseqpred import load_predictor, load_pretrained_predictor
 
+# load a bundled pretrained model
+predictor = load_pretrained_predictor("default", device="cuda")
+result = predictor.predict_sequence("ACDEFGHIKLMNP")
+
+# or load your own checkpoint/manifest artifact
 predictor = load_predictor("path/to/model.pt", device="cuda")
 result = predictor.predict_sequence("ACDEFGHIKLMNP")
 

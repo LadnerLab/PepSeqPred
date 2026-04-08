@@ -3,6 +3,7 @@ include LICENSE
 include pyproject.toml
 
 graft src/pepseqpred
+recursive-include src/pepseqpred/api/pretrained_artifacts *.json *.pt
 
 prune .github
 prune dist

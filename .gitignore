@@ -47,3 +47,8 @@ localdata/evals/*
 # Bundled pretrained model artifacts shipped with the package
 !src/pepseqpred/api/pretrained_artifacts/**/*.pt
 !src/pepseqpred/api/pretrained_artifacts/**/*.json
+
+# GitHub Pages benchmark assets/contracts
+!docs/data/*.json
+!docs/assets/results/*.csv
+!docs/assets/results/*.json

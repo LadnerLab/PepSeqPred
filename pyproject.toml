@@ -4,9 +4,9 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pepseqpred"
-version = "0.1.4"
+version = "1.0.0"
 description = "Residue-level epitope prediction pipeline for peptide/protein workflows."
-readme = "README.md"
+readme = "README.pypi.md"
 requires-python = ">=3.12"
 license = { file = "LICENSE" }
 authors = [
@@ -15,7 +15,7 @@ authors = [
 ]
 keywords = ["bioinformatics", "epitope", "protein", "esm2", "pytorch"]
 classifiers = [
-  "Development Status :: 4 - Beta",
+  "Development Status :: 5 - Production/Stable",
   "Intended Audience :: Science/Research",
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3.12",

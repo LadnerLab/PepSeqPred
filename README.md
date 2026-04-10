@@ -6,117 +6,410 @@
   </picture>
 </p>
 
-# Overview
+[![PyPI version](https://img.shields.io/pypi/v/pepseqpred.svg)](https://pypi.org/project/pepseqpred/)
+[![Python versions](https://img.shields.io/pypi/pyversions/pepseqpred.svg)](https://pypi.org/project/pepseqpred/)
+[![License: GPL-3.0](https://img.shields.io/badge/license-GPL--3.0-blue.svg)](LICENSE)
+[![PyPI README](https://img.shields.io/badge/docs-PyPI%20quickstart-2ea44f.svg)](README.pypi.md)
+[![Developer README](https://img.shields.io/badge/docs-developer%20pipeline-1f6feb.svg)](README.md)
 
-PepSeqPred is a residue-level epitope prediction pipeline for protein workflows.  
-It converts upstream assay and sequence data into training-ready artifacts, trains feed-forward neural network models on ESM-2 embeddings, produces binary residue masks for downstream inference, and supports post-training evaluation workflows on held-out datasets.
+# PepSeqPred Developer README
 
-## Quickstart
+This README is the developer-facing reference for the full PepSeqPred training and evaluation pipeline.
 
-PepSeqPred can be installed via:
-```bash
-pip install pepseqpred
-```
+For lightweight inference usage and API quickstart, use [README.pypi.md](README.pypi.md).
 
-This API allows you to use any of the pretrained models in your own code, or load your own model(s) for downstream predictions.
+## Scope
 
-Example usage:
-```python
-from pepseqpred import load_predictor, load_pretrained_predictor
+PepSeqPred supports two usage profiles:
 
-# load a bundled pretrained model
-predictor = load_pretrained_predictor("default", device="cuda")
-result = predictor.predict_sequence("ACDEFGHIKLMNP")
+- **PyPI quickstart profile (`pip install pepseqpred`)**: user-facing inference API with bundled pretrained artifacts and artifact-path inference helpers.
+- **Repository developer profile (`pip install -e .[dev]`)**: full source tree for preprocessing, embeddings, label generation, FFNN training, Optuna tuning, prediction, evaluation, and HPC orchestration.
 
-# or load your own checkpoint/manifest artifact
-predictor = load_predictor("path/to/model.pt", device="cuda")
-result = predictor.predict_sequence("ACDEFGHIKLMNP")
+The repository profile is the source of truth for reproducing experiments end-to-end.
 
-print(result.binary_mask, result.n_epitopes)
-```
+## Repository Map
 
-**Disclaimer:** The API is meant to be a simplified version of the overall codebase where you can build epitope inference into your existing/new workflows. To have more control over exactly how PepSeqPred works, feel free to fork this repository and ensure you adhere to the [GPL-3.0 license](LICENSE).
+| Path | Purpose |
+| --- | --- |
+| `src/pepseqpred/apps/` | CLI entrypoints for each pipeline stage |
+| `src/pepseqpred/core/preprocess/` | Metadata and z-score preprocessing |
+| `src/pepseqpred/core/embeddings/` | ESM-2 sequence embedding generation |
+| `src/pepseqpred/core/labels/` | Residue-level label construction |
+| `src/pepseqpred/core/data/` | Iterable dataset and windowing/padding logic |
+| `src/pepseqpred/core/models/` | FFNN model definitions |
+| `src/pepseqpred/core/train/` | DDP, splitting, metrics, thresholds, trainer, seeds, weights |
+| `src/pepseqpred/core/predict/` | Checkpoint/manifest resolution and inference logic |
+| `src/pepseqpred/core/io/` | FASTA/TSV readers, key parsing, logging, CSV appends |
+| `src/pepseqpred/api/` | Stable Python inference API and pretrained registry |
+| `scripts/hpc/` | SLURM wrappers for each production stage |
+| `scripts/tools/` | Zipapp build tools and Cocci eval prep/compare tooling |
+| `tests/` | Unit, integration, and e2e coverage |
+| `envs/` | Conda environment specs for local and HPC |
 
-## About
-
-PepSeqPred is designed for research workflows where you need to:
-- map peptide-level signals to residue-level supervision,
-- train reproducible epitope prediction models,
-- run large jobs on HPCs with DistributedDataParallel (DDP),
-- generate per-residue binary epitope predictions to develop new peptide libraries,
-- evaluate trained checkpoints or ensemble manifests with residue-level and peptide-level metrics.
-
-The pipeline is built around CLI entrypoints in `src/pepseqpred/apps/` and matching HPC scripts in `scripts/hpc/`.
-
-## What Goes In / What Comes Out
-
-Typical inputs:
-- Metadata and reactivity tables (TSV) for preprocessing and label generation.
-- Protein FASTA files for embedding generation and prediction.
-- Optional metadata file for ID-family embedding key generation.
-
-Typical outputs:
-- Preprocessed model input table (TSV).
-- Per-protein ESM-2 embedding shards (`.pt`) plus embedding index CSV.
-- Residue-level label shards (`.pt`) including epitope / uncertain / non-epitope supervision.
-- FFNN checkpoints and run summaries (for standard training or Optuna tuning).
-- Predicted binary epitope mask FASTA files for inference.
-- FFNN evaluation summary JSON and optional per-peptide comparison CSV/JSON artifacts.
-
-## Pipeline Snapshot
+## End-to-End Pipeline
 
 ```text
-Preprocess data
-  -> cleaned + labeled metadata TSV for downstream steps
-
-Generate ESM-2 embeddings
-  -> per-protein embedding .pt files (+ index CSV), often sharded
-
-Generate residue-level labels
-  -> label shard .pt files aligned to embedding keys/shards
-
-Train FFNN (DDP)
-  -> checkpoints + metrics artifacts
-
-Predict epitopes
-  -> output FASTA with binary residue mask predictions
-
-Evaluate trained FFNN
-  -> residue-level metrics JSON and optional peptide-level comparison outputs
-
-Optional: Optuna hyperparameter tuning
-  -> study storage + trial CSV + best-model artifacts
+Stage 1  preprocess metadata + zscores
+Stage 2  generate ESM-2 per-residue embeddings
+Stage 3  build residue-level label shards
+Stage 4  train FFNN (seeded or ensemble-kfold, DDP-aware)
+Stage 5  optional Optuna tuning (DDP-aware)
+Stage 6  predict residue masks from checkpoint/manifest
+Stage 7  evaluate residue metrics (+ optional Cocci peptide compare)
 ```
 
-## Project Scope
+## Stage Reference
 
-This repository supports both:
-- local development and validation of pipeline logic, and
-- production-scale HPC execution for embedding generation, training, and tuning.
+### Stage 1: Preprocess
 
-## Maintainer Contact
+**CLI:** `pepseqpred-preprocess` (`src/pepseqpred/apps/preprocess_cli.py`)
 
-- Use GitHub issues for normal development questions, bug reports, and feature requests.
-- Use email for private or sensitive matters that should not be posted publicly.
-- Maintainer contact: [Jeffrey Hoelzel](mailto:jmh2338@nau.edu) or [Jason Ladner](mailto:jason.ladner@nau.edu).
+**Inputs**
 
-## Prerequisites
+- metadata TSV (PV1-style)
+- z-score TSV
 
-Software:
-- At least Python `3.12` (required by project configuration and CI).
-- `pip` and virtual environments (`venv`) or `conda`.
-- `git` for cloning and contribution workflows.
+**Core modules**
 
-Platform notes:
-- Local development can run on CPU.
-- GPU is highly recommended for embedding generation and required for practical training/tuning runtimes.
-- HPC scripts in `scripts/hpc/` assume a SLURM-style environment and module-based setup (for example, `anaconda3` and `cuda`).
+- `core/preprocess/pv1.py`
+- `core/preprocess/zscores.py`
+- `core/io/read.py`
 
-## Setup
+**Command**
 
-### Option A: Conda Environment (recommended)
+```bash
+pepseqpred-preprocess data/meta.tsv data/zscores.tsv --save
+```
 
-Local CPU-oriented environment:
+**Output**
+
+- training-ready metadata TSV with `Def epitope`, `Uncertain`, `Not epitope`
+- default filename pattern: `input_data_<is_epi_z>_<is_epi_min_subs>_<not_epi_z>_<not_epi_max_subs|all>.tsv`
+
+### Stage 2: Generate ESM-2 Embeddings
+
+**CLI:** `pepseqpred-esm` (`src/pepseqpred/apps/esm_cli.py`)
+
+**Inputs**
+
+- FASTA file
+- optional metadata TSV for `id-family` naming mode
+
+**Core modules**
+
+- `core/embeddings/esm2.py`
+- `core/io/read.py`
+- `core/io/keys.py`
+
+**Command**
+
+```bash
+pepseqpred-esm \
+  --fasta-file data/targets.fasta \
+  --out-dir localdata/esm2 \
+  --embedding-key-mode id-family \
+  --key-delimiter - \
+  --model-name esm2_t33_650M_UR50D \
+  --max-tokens 1022 \
+  --batch-size 8
+```
+
+**Output**
+
+- per-protein embedding files under `<out-dir>/artifacts/pts/*.pt`
+- embedding index CSV under `<out-dir>/artifacts/*.csv`
+- optional shard-specific outputs when `--num-shards > 1`
+
+### Stage 3: Build Residue Labels
+
+**CLI:** `pepseqpred-labels` (`src/pepseqpred/apps/labels_cli.py`)
+
+**Inputs**
+
+- preprocessed metadata TSV
+- one or more embedding directories
+
+**Core module**
+
+- `core/labels/builder.py`
+
+**Command**
+
+```bash
+pepseqpred-labels \
+  data/input_data_20_4_10_all.tsv \
+  localdata/labels/labels_shard_000.pt \
+  --emb-dir localdata/esm2/artifacts/pts/shard_000 \
+  --restrict-to-embeddings \
+  --calc-pos-weight \
+  --embedding-key-delim -
+```
+
+**Output**
+
+- label shard `.pt` with protein label tensors and peptide metadata
+- optional `class_stats` payload when `--calc-pos-weight` is enabled
+
+### Stage 4: Train FFNN
+
+**CLI:** `pepseqpred-train-ffnn` (`src/pepseqpred/apps/train_ffnn_cli.py`)
+
+**Modes**
+
+- `seeded`: split/train seed pairs define runs
+- `ensemble-kfold`: K-fold members per set, optional multiple set seeds
+
+**Core modules**
+
+- `core/data/proteindataset.py`
+- `core/models/ffnn.py`
+- `core/train/{trainer,split,ddp,metrics,threshold,weights,seed,embedding}.py`
+
+**Command (smoke)**
+
+```bash
+pepseqpred-train-ffnn \
+  --embedding-dirs localdata/esm2/artifacts/pts/shard_000 \
+  --label-shards localdata/labels/labels_shard_000.pt \
+  --epochs 1 \
+  --subset 100 \
+  --save-path localdata/models/ffnn_smoke \
+  --results-csv localdata/models/ffnn_smoke/runs.csv
+```
+
+**Outputs**
+
+- run checkpoint(s), usually `fully_connected.pt`
+- per-run CSV (`runs.csv` or `multi_run_results.csv`)
+- aggregate `multi_run_summary.json`
+- ensemble manifest JSON in `ensemble-kfold` mode
+
+### Stage 5: Optuna Tuning (Optional)
+
+**CLI:** `pepseqpred-train-ffnn-optuna` (`src/pepseqpred/apps/train_ffnn_optuna_cli.py`)
+
+**Core modules**
+
+- same data/model/train stack as Stage 4
+- Optuna trial orchestration in app layer
+
+**Command (smoke)**
+
+```bash
+pepseqpred-train-ffnn-optuna \
+  --embedding-dirs localdata/esm2/artifacts/pts/shard_000 \
+  --label-shards localdata/labels/labels_shard_000.pt \
+  --n-trials 2 \
+  --epochs 1 \
+  --save-path localdata/models/optuna_smoke \
+  --csv-path localdata/models/optuna_smoke/trials.csv
+```
+
+**Outputs**
+
+- trial rows CSV
+- study storage (if configured)
+- per-trial checkpoints under `trials/trial_*`
+- `best_trial.json` and copied best checkpoint
+
+### Stage 6: Predict
+
+**CLI:** `pepseqpred-predict` (`src/pepseqpred/apps/prediction_cli.py`)
+
+**Accepted model artifact types**
+
+- single checkpoint `.pt`
+- ensemble manifest `.json` (schema v1 or v2)
+
+**Core modules**
+
+- `core/predict/artifacts.py`
+- `core/predict/inference.py`
+
+**Command**
+
+```bash
+pepseqpred-predict \
+  localdata/models/run_001/fully_connected.pt \
+  data/inference_targets.fasta \
+  --output-fasta localdata/predictions/predictions.fasta
+```
+
+**Output**
+
+- FASTA containing binary residue masks
+
+### Stage 7: Evaluate
+
+**CLI:** `pepseqpred-eval-ffnn` (`src/pepseqpred/apps/evaluate_ffnn_cli.py`)
+
+**Capabilities**
+
+- evaluate single checkpoint or ensemble manifest
+- optional set auto-selection from `runs.csv`
+- optional fold-level metrics and ROC/PR curves
+- optional plot generation
+
+**Core modules**
+
+- `core/predict/artifacts.py`
+- `core/predict/inference.py`
+- `core/data/proteindataset.py`
+- `core/train/metrics.py`
+
+**Command**
+
+```bash
+pepseqpred-eval-ffnn \
+  localdata/models/run_001/fully_connected.pt \
+  --embedding-dirs localdata/esm2/artifacts/pts/shard_000 \
+  --label-shards localdata/labels/labels_shard_000.pt \
+  --output-json localdata/eval/ffnn_eval_summary.json
+```
+
+**Output**
+
+- residue-level evaluation JSON
+- optional fold payloads, curves, and plot files
+
+## Inference API (`pepseqpred.api`)
+
+The stable Python API is implemented in:
+
+- `src/pepseqpred/api/predictor.py`
+- `src/pepseqpred/api/pretrainedregistry.py`
+- `src/pepseqpred/api/types.py`
+
+Top-level exports (`import pepseqpred`):
+
+- `load_pretrained_predictor`
+- `list_pretrained_models`
+- `load_predictor`
+- `predict_sequence`
+- `predict_fasta`
+- `PepSeqPredictor`
+- `PredictionResult`
+
+Bundled pretrained registry currently includes:
+
+- `flagship1-v1` (`alias: flagship1`)
+- `flagship2-v1` (`aliases: flagship2, default`)
+
+## Artifact Contracts
+
+### Embedding `.pt`
+
+- tensor shape: `(L, D+1)`
+- `L`: residue count
+- final feature column stores sequence length
+
+### Label shard `.pt`
+
+```python
+{
+  "labels": {"<protein_id>": Tensor[(L,3)] or Tensor[(L,)]},
+  "proteins": {"<protein_id>": {"tax_info": {...}, "peptides": [...]}}
+  # optional:
+  "class_stats": {"pos_count": int, "neg_count": int, "pos_weight": float}
+}
+```
+
+### Training checkpoint `.pt`
+
+```python
+{
+  "model_state_dict": ..., 
+  "optim_state_dict": ..., 
+  "epoch": int,
+  "config": {...},
+  "best_loss": float,
+  "metrics": {...}
+}
+```
+
+### Ensemble manifest JSON
+
+- schema v1: single set, `members` list
+- schema v2: root `sets` list with `set_index`, each with `members`
+- members are filtered by `status == "OK"` in predict/eval resolution
+
+## CLI Reference
+
+| CLI | File | Purpose |
+| --- | --- | --- |
+| `pepseqpred-preprocess` | `apps/preprocess_cli.py` | metadata + z-score preprocessing |
+| `pepseqpred-esm` | `apps/esm_cli.py` | ESM-2 embedding generation |
+| `pepseqpred-labels` | `apps/labels_cli.py` | residue label shard generation |
+| `pepseqpred-train-ffnn` | `apps/train_ffnn_cli.py` | seeded or ensemble-kfold training |
+| `pepseqpred-train-ffnn-optuna` | `apps/train_ffnn_optuna_cli.py` | Optuna tuning |
+| `pepseqpred-predict` | `apps/prediction_cli.py` | FASTA inference from checkpoint/manifest |
+| `pepseqpred-eval-ffnn` | `apps/evaluate_ffnn_cli.py` | residue-level evaluation |
+
+## HPC Script Reference (`scripts/hpc`)
+
+These wrappers are production-facing interfaces and should be treated as first-class entrypoints.
+
+| Script | Stage | Default resources |
+| --- | --- | --- |
+| `generateembeddings.sh` | Embeddings | GPU, array `0-3`, `a100`, `2` CPU/GPU, `8G`/GPU, `01:00:00` |
+| `generatelabels.sh` | Labels | CPU, `1` CPU, `16G`, `01:00:00` |
+| `trainffnn.sh` | Train FFNN | GPU, `4xa100`, `20` CPU, `256G`, `12:00:00` |
+| `trainffnnoptuna.sh` | Optuna | GPU, `4xa100`, `20` CPU, `448G`, `48:00:00` |
+| `predictepitope.sh` | Predict | GPU, `a100`, `4` CPU, `32G`, `00:30:00` |
+| `evaluateffnn.sh` | End-to-end eval pipeline | GPU, `a100`, `8` CPU, `128G`, `04:00:00` |
+| `evalffnnsweep.sh` | Seeded eval batch submitter | wrapper script (calls `evaluateffnn.sh`) |
+| `preprocessdata.sh` | Preprocess helper | local helper, not a SLURM script |
+
+### Important HPC notes
+
+- `evaluateffnn.sh` orchestrates prepare, embed, labels, predict, eval, and peptide compare stages with stage toggles (`RUN_PREP`, `RUN_EMBED`, `RUN_LABELS`, `RUN_PREDICT`, `RUN_EVAL`, `RUN_COMPARE`).
+- `evaluateffnn.sh` and `evalffnnsweep.sh` depend on `scripts/tools/cocci_eval_pipeline.py`.
+- HPC wrappers expect `.pyz` runtime artifacts in the working directory (for example `esm.pyz`, `train_ffnn.pyz`, `predict.pyz`).
+
+## Zipapp and Tooling (`scripts/tools`)
+
+| Tool | Purpose |
+| --- | --- |
+| `buildpyz.py` | build `.pyz` runtime apps from `src/pepseqpred` |
+| `pyzapps.py` | registry of app target names to module entrypoints |
+| `cocci_eval_pipeline.py` | Cocci-specific eval subset prep and peptide compare |
+| `rename_embeddings_id_family.py` | rename `ID.pt` to `ID-family.pt` embeddings from metadata |
+
+Build examples:
+
+```bash
+python scripts/tools/buildpyz.py --list
+python scripts/tools/buildpyz.py esm
+python scripts/tools/buildpyz.py all
+```
+
+## Testing Map
+
+Test suites are organized as:
+
+- `tests/unit/`: module-level behavior and edge cases
+- `tests/integration/`: CLI-level smoke and interactions
+- `tests/e2e/`: train-to-predict boundary validation
+
+Representative coverage areas include:
+
+- API registry and predictor behavior (`tests/unit/api/*`)
+- dataset, embeddings, labels, predict, train internals (`tests/unit/core/*`)
+- CLI parsers and eval selection/curve logic (`tests/unit/apps/*`)
+- checkpoint/manifest prediction/evaluation smoke tests (`tests/integration/*`)
+
+Run sequence:
+
+```bash
+ruff check .
+pytest tests/unit
+pytest tests/integration
+pytest tests/e2e
+```
+
+## Environment and Setup
+
+### Conda
 
 ```bash
 conda env create -f envs/environment.local.yml
@@ -124,7 +417,7 @@ conda activate pepseqpred
 pip install -e .[dev]
 ```
 
-HPC/GPU-oriented environment:
+For GPU/HPC development:
 
 ```bash
 conda env create -f envs/environment.hpc.yml
@@ -132,14 +425,12 @@ conda activate pepseqpred
 pip install -e .[dev]
 ```
 
-### Option B: Pip + Virtual Environment
-
-Linux/macOS:
+### Pip + venv
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
-python -m pip install --upgrade pip
+python -m venv .venv
+. .venv/bin/activate  # Linux/macOS
+pip install --upgrade pip
 pip install -e .[dev]
 ```
 
@@ -152,469 +443,26 @@ python -m pip install --upgrade pip
 pip install -e .[dev]
 ```
 
-CI-equivalent install shortcut:
+## Reproducibility and Safety Guardrails
 
-```bash
-pip install -r requirements.txt
-```
+When changing training or evaluation logic:
 
-## Verify Setup
+- preserve split semantics (`id` vs `id-family`)
+- preserve seed handling and deterministic run planning
+- avoid rank-dependent side effects in DDP code paths
+- only write shared artifacts from intended rank
+- avoid output path collisions between experiments
+- prefer smoke tests over expensive full retraining during development
 
-Confirm package and CLI entrypoints:
+## Known Operational Notes
 
-```bash
-python -c "import pepseqpred; print('pepseqpred import ok')"
-pepseqpred-preprocess --help
-pepseqpred-esm --help
-pepseqpred-train-ffnn --help
-pepseqpred-predict --help
-pepseqpred-eval-ffnn --help
-```
+- `id-family` embedding key mode requires metadata family mapping.
+- Label generation must align embedding naming with `--embedding-key-delim` (`""` for `ID.pt`, `-` for `ID-family.pt`).
+- Prediction/evaluation threshold overrides must remain in `(0.0, 1.0)`.
+- Ensemble manifests are resolved by valid `status=OK` members and optional `k_folds` truncation.
+- For HPC pipelines, keep `.pyz` artifacts and shell scripts in the same execution directory unless intentionally using module imports.
 
-Run required preflight checks before any development or pipeline usage:
+## Contact
 
-```bash
-ruff check .
-pytest -m "unit or integration or e2e"
-```
-
-This repository expects all of the checks above to pass before you start development work or run pipeline stages.
-
-## Build and Transfer HPC Runtime Artifacts (`.pyz` + SLURM Scripts)
-
-The HPC shell scripts in `scripts/hpc/` execute zipapp files such as `esm.pyz`, `labels.pyz`, `train_ffnn.pyz`, `predict.pyz`, and `evaluate_ffnn.pyz`.
-
-Build only the app(s) you need for your current stage, then copy those `.pyz` files plus the matching SLURM script(s) to HPC.
-
-### 1. Build `.pyz` artifacts locally
-
-List available zipapp targets:
-
-```bash
-python scripts/tools/buildpyz.py --list
-```
-
-Build one runtime app (recommended default):
-
-```bash
-python scripts/tools/buildpyz.py <app_name>
-```
-
-Examples:
-
-```bash
-python scripts/tools/buildpyz.py esm
-python scripts/tools/buildpyz.py train_ffnn
-```
-
-Optional: build all apps:
-
-```bash
-python scripts/tools/buildpyz.py all
-```
-
-By default this writes artifacts to `dist/` as:
-- versioned files: `<name>_<gitrev>.pyz`
-- convenience copies: `<name>_latest.pyz`
-
-### 2. Transfer required `.pyz` file(s) and shell script(s) to HPC
-
-Each HPC script expects a plain `.pyz` filename in the same working directory:
-- `generateembeddings.sh` -> `esm.pyz`
-- `generatelabels.sh` -> `labels.pyz`
-- `trainffnn.sh` -> `train_ffnn.pyz`
-- `trainffnnoptuna.sh` -> `train_ffnn_optuna.pyz`
-- `predictepitope.sh` -> `predict.pyz`
-- `evaluateffnn.sh` -> `evaluate_ffnn.pyz` (or fallback module import)
-- `preprocessdata.sh` -> `preprocess.pyz` (optional)
-
-For the Cocci evaluation workflow in `evaluateffnn.sh`, also transfer:
-- `scripts/tools/cocci_eval_pipeline.py` (called directly by the shell script for `prepare` and `compare` stages)
-
-Example: transfer only embedding stage artifacts:
-
-```bash
-scp dist/esm_latest.pyz <user>@<cluster-host>:/home/<user>/pepseqpred_hpc/esm.pyz
-scp scripts/hpc/generateembeddings.sh <user>@<cluster-host>:/home/<user>/pepseqpred_hpc/
-```
-
-Example: transfer multiple stage artifacts:
-
-```bash
-scp dist/labels_latest.pyz <user>@<cluster-host>:/home/<user>/pepseqpred_hpc/labels.pyz
-scp dist/train_ffnn_latest.pyz <user>@<cluster-host>:/home/<user>/pepseqpred_hpc/train_ffnn.pyz
-scp scripts/hpc/generatelabels.sh scripts/hpc/trainffnn.sh <user>@<cluster-host>:/home/<user>/pepseqpred_hpc/
-```
-
-Example: transfer evaluation artifacts:
-
-```bash
-scp dist/esm_latest.pyz <user>@<cluster-host>:/home/<user>/pepseqpred_hpc/esm.pyz
-scp dist/labels_latest.pyz <user>@<cluster-host>:/home/<user>/pepseqpred_hpc/labels.pyz
-scp dist/predict_latest.pyz <user>@<cluster-host>:/home/<user>/pepseqpred_hpc/predict.pyz
-scp dist/evaluate_ffnn_latest.pyz <user>@<cluster-host>:/home/<user>/pepseqpred_hpc/evaluate_ffnn.pyz
-scp scripts/hpc/evaluateffnn.sh scripts/tools/cocci_eval_pipeline.py <user>@<cluster-host>:/home/<user>/pepseqpred_hpc/
-```
-
-### 3. Prepare on cluster and smoke-check artifacts
-
-```bash
-cd /home/<user>/pepseqpred_hpc
-chmod +x *.sh
-ls -lh *.pyz *.sh
-
-# Run help checks for the app(s) you uploaded
-python3 esm.pyz --help
-```
-
-Run SLURM jobs from this directory so relative `.pyz` filenames resolve correctly.
-
-### 4. Update cycle after code changes
-
-Any CLI code change requires rebuilding and redeploying corresponding `.pyz` files:
-1. Re-run `python scripts/tools/buildpyz.py <app_name>`.
-2. Re-transfer updated `dist/<app>_latest.pyz` to HPC as `<app>.pyz`.
-3. Re-run jobs using the updated artifact.
-
-## Pipeline Stages and Hardware Expectations
-
-Run the main pipeline in this order:
-1. Preprocess metadata/reactivity data.
-2. Generate ESM-2 embeddings.
-3. Generate residue-level labels.
-4. Train FFNN model.
-5. Predict epitopes on new FASTA input.
-6. Evaluate FFNN outputs on labeled embeddings and/or Cocci reduced subsets.
-
-Optional branch:
-1. Run Optuna tuning after label generation instead of fixed-parameter FFNN training.
-
-### Hardware Matrix (default `scripts/hpc/` settings)
-
-| Stage | Hardware target | Default SLURM request in repo scripts |
-| --- | --- | --- |
-| Preprocess | CPU only | Local shell helper (no fixed `#SBATCH` resources) |
-| Embeddings | GPU | `a100` (1 GPU), `2` CPU/GPU, `8G`/GPU, `01:00:00`, array `0-3` |
-| Labels | CPU only | `1` CPU, `16G` RAM, `01:00:00` |
-| Train FFNN | Multi-GPU | `4x a100`, `20` CPU, `256G` RAM, `12:00:00` |
-| Train FFNN Optuna | Multi-GPU | `4x a100`, `20` CPU, `448G` RAM, `48:00:00` |
-| Predict | GPU | `a100` (1 GPU), `4` CPU, `32G` RAM, `00:30:00` |
-| Evaluate FFNN | GPU recommended | `a100` (1 GPU), `8` CPU, `64G` RAM, `08:00:00` |
-
-These are baseline defaults from the current HPC scripts, not strict requirements for every dataset size. You will need to increase or decrease SLURM requests depending on the hardware available to you.
-
-### Stage 1: Preprocess Metadata and Reactivity Inputs
-
-Purpose:
-- Merge metadata with z-score reactivity data and generate training-ready labels at preprocessing stage.
-
-Required inputs:
-- Metadata TSV (for example, PV1 metadata).
-- Reactivity/z-score TSV.
-
-Local CLI example:
-
-```bash
-pepseqpred-preprocess data/meta.tsv data/zscores.tsv --save
-```
-
-Expected outputs:
-- A generated TSV in the working directory, named like `input_data_<is_epi_z>_<is_epi_min_subs>_<not_epi_z>_<not_epi_max_subs|all>.tsv`.
-
-Expected hardware:
-- CPU only; lightweight compared with downstream stages.
-
-### Stage 2: Generate ESM-2 Embeddings
-
-Purpose:
-- Convert protein FASTA sequences into per-residue ESM-2 embeddings.
-
-Required inputs:
-- FASTA file.
-- Metadata file when using `id-family` embedding keys (default mode).
-
-Local CLI example:
-
-```bash
-pepseqpred-esm \
-  --fasta-file data/targets.fasta \
-  --metadata-file data/targets.metadata \
-  --embedding-key-mode id-family \
-  --key-delimiter - \
-  --model-name esm2_t33_650M_UR50D \
-  --max-tokens 1022 \
-  --batch-size 8 \
-  --out-dir localdata/esm2_run
-```
-
-HPC script example:
-
-```bash
-sbatch --export=ALL,IN_FASTA=/scratch/$USER/data/targets.fasta scripts/hpc/generateembeddings.sh
-```
-
-Expected outputs:
-- Per-sequence `.pt` embeddings under `<out_dir>/artifacts/pts/` (or shard subfolders in sharded mode).
-- Embedding index CSV under `<out_dir>/artifacts/`.
-
-Expected hardware:
-- GPU strongly recommended; this is the first expensive stage.
-
-### Stage 3: Generate Residue-Level Label Shards
-
-Purpose:
-- Build dense residue labels aligned to generated embedding keys/shards.
-
-Required inputs:
-- Preprocessed metadata TSV.
-- Embedding directory (or shard directories).
-
-Local CLI example:
-
-```bash
-pepseqpred-labels \
-  data/input_data_20_4_10_all.tsv \
-  localdata/labels/labels_shard_000.pt \
-  --emb-dir localdata/esm2_run/artifacts/pts/shard_000 \
-  --restrict-to-embeddings \
-  --calc-pos-weight \
-  --embedding-key-delim -
-```
-
-HPC script examples:
-
-```bash
-sbatch --array=0-3 scripts/hpc/generatelabels.sh data/input_data_20_4_10_all.tsv /scratch/$USER/labels /scratch/$USER/esm2/artifacts/pts
-```
-
-Expected outputs:
-- Label shard files such as `labels_shard_000.pt`.
-- Optional positive class weight in the saved payload when `--calc-pos-weight` is used.
-
-Expected hardware:
-- CPU only; moderate memory.
-
-### Stage 4: Train FFNN
-
-Purpose:
-- Train PepSeqPred FFNN on embedding shards and label shards.
-
-Required inputs:
-- One or more embedding shard directories.
-- One or more label shard `.pt` files aligned to those embeddings.
-
-Local smoke-test CLI example (small subset):
-
-```bash
-pepseqpred-train-ffnn \
-  --embedding-dirs localdata/esm2_run/artifacts/pts/shard_000 \
-  --label-shards localdata/labels/labels_shard_000.pt \
-  --epochs 1 \
-  --subset 100 \
-  --save-path localdata/models/ffnn_smoke \
-  --results-csv localdata/models/ffnn_smoke/runs.csv
-```
-
-HPC script example:
-
-```bash
-sbatch scripts/hpc/trainffnn.sh \
-  /scratch/$USER/esm2/artifacts/pts/shard_000 /scratch/$USER/esm2/artifacts/pts/shard_001 /scratch/$USER/esm2/artifacts/pts/shard_002 /scratch/$USER/esm2/artifacts/pts/shard_003 \
-  -- \
-  /scratch/$USER/labels/labels_shard_000.pt /scratch/$USER/labels/labels_shard_001.pt /scratch/$USER/labels/labels_shard_002.pt /scratch/$USER/labels/labels_shard_003.pt
-```
-
-Expected outputs:
-- Run directories under `--save-path` containing checkpoints (for example `fully_connected.pt`).
-- Multi-run CSV summary (default `multi_run_results.csv`, or `--results-csv` path).
-- Aggregated `multi_run_summary.json`.
-
-Expected hardware:
-- Practical training is multi-GPU/HPC-oriented.
-
-### Stage 5 (Optional): Train FFNN with Optuna
-
-Purpose:
-- Run distributed hyperparameter optimization over FFNN architecture/training ranges.
-
-Required inputs:
-- Same embedding shard directories and label shard files used by training.
-
-HPC script example:
-
-```bash
-sbatch scripts/hpc/trainffnnoptuna.sh \
-  /scratch/$USER/esm2/artifacts/pts/shard_000 /scratch/$USER/esm2/artifacts/pts/shard_001 /scratch/$USER/esm2/artifacts/pts/shard_002 /scratch/$USER/esm2/artifacts/pts/shard_003 \
-  -- \
-  /scratch/$USER/labels/labels_shard_000.pt /scratch/$USER/labels/labels_shard_001.pt /scratch/$USER/labels/labels_shard_002.pt /scratch/$USER/labels/labels_shard_003.pt
-```
-
-Expected outputs:
-- Trial metrics CSV (`--csv-path`).
-- Optuna storage DB (`--storage`), SQLite on scratch.
-- Trial checkpoint directories under `--save-path`.
-- Best-trial metadata JSON under `--save-path`.
-
-Expected hardware:
-- Most expensive stage; budget multi-GPU runtime from several hours to days depending on `--n-trials`.
-
-### Stage 6: Predict Residue-Level Epitopes
-
-Purpose:
-- Apply trained checkpoint to new FASTA input and emit binary residue masks.
-
-Required inputs:
-- Trained checkpoint `.pt`.
-- Input FASTA file.
-
-Local CLI example:
-
-```bash
-pepseqpred-predict \
-  localdata/models/ffnn_smoke/run_001_split_11_train_101/fully_connected.pt \
-  data/inference_targets.fasta \
-  --output-fasta localdata/predictions/predictions.fasta \
-  --model-name esm2_t33_650M_UR50D \
-  --max-tokens 1022
-```
-
-HPC script example:
-
-```bash
-sbatch scripts/hpc/predictepitope.sh /scratch/$USER/models/ffnn_v1/run_001_split_11_train_101/fully_connected.pt /scratch/$USER/data/inference_targets.fasta /scratch/$USER/predictions/predictions.fasta
-```
-
-Expected outputs:
-- Output FASTA with binary residue-level mask predictions.
-- Prediction logs (console and optional log directory).
-
-Expected hardware:
-- Single GPU is recommended for throughput; CPU inference is possible but much slower.
-
-### Stage 7: Evaluate FFNN on Labeled Embeddings / Cocci Subsets
-
-Purpose:
-- Evaluate trained checkpoints or ensemble manifests on residue-level labels.
-- Optionally run Cocci-specific reduced-dataset preparation and peptide-level 1-count comparison.
-
-Required inputs (minimum residue-level eval):
-- Trained checkpoint `.pt` or ensemble manifest `.json`.
-- One or more embedding directories.
-- One or more label shard `.pt` files.
-
-Local CLI example:
-
-```bash
-pepseqpred-eval-ffnn \
-  localdata/models/ffnn_smoke/run_001_split_11_train_101/fully_connected.pt \
-  --embedding-dirs localdata/esm2_run/artifacts/pts/shard_000 \
-  --label-shards localdata/labels/labels_shard_000.pt \
-  --output-json localdata/eval/ffnn_eval_summary.json \
-  --batch-size 64 \
-  --num-workers 0
-```
-
-HPC script example (Cocci workflow):
-
-```bash
-sbatch --export=ALL,EVAL_MODE=nonreactive,SKIP_IF_EXISTS=1,RUN_PREP=1,RUN_EMBED=1,RUN_LABELS=1,RUN_PREDICT=1,RUN_EVAL=1,RUN_COMPARE=1 \
-  scripts/hpc/evaluateffnn.sh \
-  /scratch/$USER/models/phaseA/ffnn_ens_1.0_xxxxxxxx/ensemble_manifest.json \
-  /scratch/$USER/evals/cocci_eval/nonreactive
-```
-
-Seeded sweep example (two flagship manifests, set indices 1..10):
-
-```bash
-HPC_DIR=/home/$USER/test \
-SHARED=/scratch/$USER/evals/cocci_eval/combined \
-OUT_BASE=/scratch/$USER/evals/cocci_eval/seeded_runs \
-DATA_DIR=/scratch/$USER/data/CWP \
-./evalffnnsweep.sh \
-  /scratch/$USER/models/phaseB/flagship1/ensemble_manifest.json \
-  /scratch/$USER/models/phaseB/flagship2/ensemble_manifest.json
-```
-
-Verify seeded run set-index alignment (`set_XX` directory must match evaluated ensemble set index):
-
-```bash
-python scripts/tools/verify_seeded_eval_set_indices.py \
-  --base-dir localdata/evals/cocci_eval/seeded_runs \
-  --models flagship1,flagship2 \
-  --set-start 1 \
-  --set-end 10
-```
-
-Expected outputs:
-- `prepared/eval_metadata.tsv`, `prepared/eval_proteins.fasta`, `prepared/prepare_summary.json`.
-- `embeddings/artifacts/eval_embedding_index.csv`.
-- `labels/labels_eval.pt`.
-- `prediction/predictions.fasta`.
-- `evaluation/ffnn_eval_summary.json`.
-- `peptide_compare/peptide_comparison.csv` and `peptide_compare/peptide_comparison_summary.json`.
-
-### Stage Compatibility Notes
-
-- Keep embedding key scheme consistent (`id` vs `id-family`) between embedding and label generation.
-- Keep shard alignment explicit: embedding shard directories should map cleanly to label shard files.
-- Use local smoke settings (`--subset`, low epochs, single shard) before submitting expensive HPC jobs.
-- For `evaluateffnn.sh`, ensure `esm.pyz`, `labels.pyz`, `predict.pyz`, `evaluate_ffnn.pyz`, and `cocci_eval_pipeline.py` are present in the submission working directory.
-
-## Reproducibility and Output Conventions
-
-- Use a new output root per run/study to avoid accidental overwrite of prior artifacts.
-- Keep preprocessing outputs, embeddings, labels, checkpoints, and predictions in separate subdirectories.
-- Keep `split-seeds`, `train-seeds`, and core hyperparameters fixed when comparing experiments.
-- Keep `split-type` and embedding key scheme (`id` vs `id-family`) unchanged within a single experiment.
-- Do not mix artifacts from different preprocessing thresholds into one training run.
-
-Suggested layout:
-
-```text
-localdata/
-  runs/
-    <run_name_or_date>/
-      preprocess/
-      embeddings/
-      labels/
-      models/
-      predictions/
-      logs/
-```
-
-## Troubleshooting
-
-Common issues and fixes:
-
-- `Metadata file is required for --embedding-key-mode='id-family'`:
-  Provide `--metadata-file`, or use `--embedding-key-mode id` if that is your intended key scheme.
-- `--embedding-key-delim must be '' or '-'`:
-  Use `-` for `ID-family.pt` naming and empty delimiter for `ID.pt` naming.
-- `No .pt files found in <emb_dir>` during label generation:
-  Verify Stage 2 completed successfully and `--emb-dir` points to the directory that directly contains embedding `.pt` files.
-- Label shard missing `class_stats` when training:
-  Rebuild labels with `--calc-pos-weight`, or pass `--pos-weight` explicitly to training.
-- `--hidden-sizes and --dropouts must be the same length`:
-  Ensure both CSV lists have one value per hidden layer.
-- Prediction threshold errors (`(0.0, 1.0)` required):
-  Set `--threshold` strictly between `0` and `1`, or omit it to use checkpoint/default behavior.
-- Plot generation produces no files when `--plot-dir` is set:
-  Install `matplotlib` in the runtime environment (for HPC: ensure `envs/environment.hpc.yml` is applied with `matplotlib` present).
-- `python: can't open file ... esm.pyz` (or `labels.pyz` / `predict.pyz`):
-  Transfer missing `.pyz` files to the same working directory as the HPC shell script, or run from an installed package environment using CLI entrypoints.
-- `labels_eval.pt` or `predictions.fasta` not found during evaluation:
-  Upstream stage failed or was skipped; rerun with stage flags set (`RUN_EMBED=1`, `RUN_LABELS=1`, `RUN_PREDICT=1`) or disable dependent downstream stages.
-- DDP or multi-GPU runs stall/hang:
-  Confirm the requested GPU count matches `torchrun --nproc_per_node`, and validate with a small single-shard smoke test first.
-- CUDA OOM:
-  Reduce embedding `--batch-size`, reduce training `--batch-size`, or lower trial/search scope for Optuna.
-
-## Pre-Run Checklist
-
-Before starting a real run:
-
-- Environment is activated and `pip install -e .[dev]` completed.
-- Required preflight checks pass: `ruff check .` and `pytest -m "unit or integration or e2e"`.
-- Stage input files exist and are from the intended experiment branch.
-- Output paths are unique for this run and will not overwrite prior artifacts.
-- Embedding key scheme/delimiter and split configuration are consistent across stages.
+- GitHub issues: bug reports, feature requests, and development questions
+- Maintainers: [Jeffrey Hoelzel](mailto:jmh2338@nau.edu), [Jason Ladner](mailto:jason.ladner@nau.edu)

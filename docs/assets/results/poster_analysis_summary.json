@@ -1,0 +1,21 @@
+{
+  "base_dir": "localdata\\evals\\cocci_eval\\seeded_runs",
+  "out_dir": "localdata\\evals\\cocci_eval\\seeded_runs\\poster_analysis",
+  "models": [
+    "flagship1",
+    "flagship2"
+  ],
+  "set_range": [
+    1,
+    10
+  ],
+  "n_seed_rows": 20,
+  "n_fold_rows": 100,
+  "n_warnings": 0,
+  "files": {
+    "seed_metrics_csv": "localdata\\evals\\cocci_eval\\seeded_runs\\poster_analysis\\seed_metrics.csv",
+    "fold_metrics_csv": "localdata\\evals\\cocci_eval\\seeded_runs\\poster_analysis\\fold_metrics.csv",
+    "paired_stats_csv": "localdata\\evals\\cocci_eval\\seeded_runs\\poster_analysis\\paired_stats.csv",
+    "warnings_txt": "localdata\\evals\\cocci_eval\\seeded_runs\\poster_analysis\\warnings.txt"
+  }
+}

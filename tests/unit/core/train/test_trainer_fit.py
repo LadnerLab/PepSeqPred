@@ -4,7 +4,11 @@ import optuna
 import pytest
 import torch
 from pepseqpred.core.models.ffnn import PepSeqFFNN
-from pepseqpred.core.train.trainer import Trainer, TrainerConfig
+from pepseqpred.core.train.trainer import (
+    Trainer,
+    TrainerConfig,
+    ValidationCurveArtifactConfig
+)
 
 pytestmark = pytest.mark.unit
 
@@ -64,6 +68,30 @@ def test_fit_without_validation_saves_no_val_checkpoint(tmp_path: Path):
 
     assert summary["best_epoch"] == -1
     assert (tmp_path / "fully_connected_no_val.pt").exists()
+
+
+def test_fit_with_validation_curve_artifacts(tmp_path: Path):
+    trainer = _make_trainer(
+        _make_batches(), _make_batches(), emb_dim=4, epochs=1)
+    summary = trainer.fit(
+        save_dir=tmp_path,
+        score_key="loss",
+        val_curve_artifacts=ValidationCurveArtifactConfig(
+            max_points=32,
+            plot_formats=("png",),
+            output_subdir="validation_curves"
+        )
+    )
+
+    assert summary["best_epoch"] >= 0
+    curves_dir = tmp_path / "validation_curves"
+    assert (curves_dir / "epoch_0000_curves.json").exists()
+
+    roc_plot = curves_dir / "epoch_0000_roc_auc.png"
+    pr_plot = curves_dir / "epoch_0000_pr_auc.png"
+    if roc_plot.exists() or pr_plot.exists():
+        assert roc_plot.exists()
+        assert pr_plot.exists()
 
 
 def test_run_epoch_eval_no_valid_residues():

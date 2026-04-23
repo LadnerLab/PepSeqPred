@@ -32,7 +32,11 @@ from pepseqpred.core.io.logger import setup_logger
 from pepseqpred.core.io.write import append_csv_row
 from pepseqpred.core.data.proteindataset import ProteinDataset, pad_collate
 from pepseqpred.core.models.ffnn import PepSeqFFNN
-from pepseqpred.core.train.trainer import Trainer, TrainerConfig
+from pepseqpred.core.train.trainer import (
+    Trainer,
+    TrainerConfig,
+    ValidationCurveArtifactConfig
+)
 from pepseqpred.core.train.ddp import init_ddp
 from pepseqpred.core.train.split import (
     split_ids,
@@ -98,6 +102,21 @@ def _finite_or_none(value: Any) -> float | None:
     except (TypeError, ValueError):
         return None
     return num if math.isfinite(num) else None
+
+
+def _parse_plot_formats(raw: str) -> Tuple[str, ...]:
+    """Parses comma-separated plot file formats."""
+    tokens = [t.strip().lower() for t in str(raw).split(",")]
+    formats = tuple(t for t in tokens if len(t) > 0)
+    if len(formats) < 1:
+        raise ValueError("--val-plot-formats must include at least one format")
+    allowed = {"png", "svg", "pdf"}
+    bad = [fmt for fmt in formats if fmt not in allowed]
+    if len(bad) > 0:
+        raise ValueError(
+            f"Unsupported --val-plot-formats values={bad}; allowed={sorted(allowed)}"
+        )
+    return formats
 
 
 @dataclass
@@ -472,6 +491,23 @@ def main() -> None:
                         type=Path,
                         default=None,
                         help="Optional CSV output path for per-run results")
+    parser.add_argument("--save-val-curves",
+                        action="store_true",
+                        dest="save_val_curves",
+                        default=False,
+                        help="If set, save per-epoch validation ROC/PR curve data and plots.")
+    parser.add_argument("--val-curve-max-points",
+                        action="store",
+                        dest="val_curve_max_points",
+                        type=int,
+                        default=2048,
+                        help="Maximum number of points saved per validation ROC/PR curve.")
+    parser.add_argument("--val-plot-formats",
+                        action="store",
+                        dest="val_plot_formats",
+                        type=str,
+                        default="png",
+                        help="Comma-separated plot formats for validation curves (png,svg,pdf).")
     parser.add_argument("--ensemble-manifest",
                         type=Path,
                         default=None,
@@ -498,6 +534,16 @@ def main() -> None:
     # disable logging for other ranks when DDP enabled
     if ddp is not None and rank != 0:
         logger.disabled = True
+
+    val_curve_artifacts = None
+    if args.save_val_curves:
+        if args.val_curve_max_points < 2:
+            raise ValueError("--val-curve-max-points must be >= 2")
+        val_curve_artifacts = ValidationCurveArtifactConfig(
+            max_points=int(args.val_curve_max_points),
+            plot_formats=_parse_plot_formats(args.val_plot_formats),
+            output_subdir="validation_curves"
+        )
 
     results_csv = args.results_csv or (
         args.save_path / "multi_run_results.csv")
@@ -747,7 +793,10 @@ def main() -> None:
             run_save_dir = None
         t0 = time.time()
         fit_summary = trainer.fit(
-            save_dir=run_save_dir, score_key=args.best_model_metric)
+            save_dir=run_save_dir,
+            score_key=args.best_model_metric,
+            val_curve_artifacts=val_curve_artifacts
+        )
         elapsed_s = time.time() - t0
 
         if rank == 0:

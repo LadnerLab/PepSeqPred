@@ -52,6 +52,62 @@ def test_train_ffnn_cli_main_inprocess(training_artifacts, tmp_path: Path, monke
     assert (save_dir / "multi_run_summary.json").exists()
 
 
+def test_train_ffnn_cli_main_inprocess_with_val_curves(
+    training_artifacts, tmp_path: Path, monkeypatch
+):
+    save_dir = tmp_path / "train_out_curves"
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "train_ffnn_cli.py",
+            "--embedding-dirs",
+            str(training_artifacts["embedding_dir"]),
+            "--label-shards",
+            str(training_artifacts["label_shard"]),
+            "--epochs",
+            "1",
+            "--batch-size",
+            "2",
+            "--num-workers",
+            "0",
+            "--hidden-sizes",
+            "8",
+            "--dropouts",
+            "0.1",
+            "--val-frac",
+            "0.5",
+            "--split-seeds",
+            "11",
+            "--train-seeds",
+            "101",
+            "--save-path",
+            str(save_dir),
+            "--results-csv",
+            str(save_dir / "runs.csv"),
+            "--save-val-curves",
+            "--val-curve-max-points",
+            "128",
+            "--val-plot-formats",
+            "png"
+        ]
+    )
+
+    train_cli.main()
+
+    run_dirs = list(save_dir.glob("run_*"))
+    assert run_dirs
+    curves_dir = run_dirs[0] / "validation_curves"
+    assert (curves_dir / "epoch_0000_curves.json").exists()
+
+    roc_plot = curves_dir / "epoch_0000_roc_auc.png"
+    pr_plot = curves_dir / "epoch_0000_pr_auc.png"
+    if roc_plot.exists() or pr_plot.exists():
+        assert roc_plot.exists()
+        assert pr_plot.exists()
+
+
 def test_train_ffnn_cli_ensemble_kfold_inprocess(training_artifacts, tmp_path: Path, monkeypatch):
     save_dir = tmp_path / "ensemble_out"
 

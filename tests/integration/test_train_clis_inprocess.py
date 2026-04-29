@@ -174,6 +174,94 @@ def test_train_ffnn_cli_ensemble_kfold_inprocess(training_artifacts, tmp_path: P
     assert all(Path(x["manifest_path"]).exists() for x in payload["sets"])
 
 
+def test_train_ffnn_cli_ensemble_kfold_with_aggregate_val_curves(
+    training_artifacts, tmp_path: Path, monkeypatch
+):
+    save_dir = tmp_path / "ensemble_out_curves"
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "train_ffnn_cli.py",
+            "--embedding-dirs",
+            str(training_artifacts["embedding_dir"]),
+            "--label-shards",
+            str(training_artifacts["label_shard"]),
+            "--epochs",
+            "1",
+            "--batch-size",
+            "2",
+            "--num-workers",
+            "0",
+            "--hidden-sizes",
+            "8",
+            "--dropouts",
+            "0.1",
+            "--split-type",
+            "id-family",
+            "--train-mode",
+            "ensemble-kfold",
+            "--n-folds",
+            "2",
+            "--split-seeds",
+            "17",
+            "--train-seeds",
+            "101",
+            "--save-val-curves",
+            "--val-curve-max-points",
+            "128",
+            "--val-plot-formats",
+            "png",
+            "--save-path",
+            str(save_dir),
+            "--results-csv",
+            str(save_dir / "runs.csv"),
+        ],
+    )
+
+    train_cli.main()
+
+    fold_dirs = sorted(save_dir.glob("fold_*"))
+    assert len(fold_dirs) == 2
+    assert all((fold_dir / "fully_connected.pt").exists() for fold_dir in fold_dirs)
+    assert all(
+        (fold_dir / "validation_curves" / "epoch_0000_curves.json").exists()
+        for fold_dir in fold_dirs
+    )
+
+    aggregate_json = (
+        save_dir
+        / "validation_curves"
+        / "ensemble_folds"
+        / "ensemble_fold_validation_curves.json"
+    )
+    assert aggregate_json.exists()
+    aggregate_payload = json.loads(aggregate_json.read_text(encoding="utf-8"))
+    assert int(aggregate_payload["set_index"]) == 1
+    assert int(aggregate_payload["n_folds_with_curves"]) == 2
+    assert len(aggregate_payload["folds"]) == 2
+
+    manifest_payload = json.loads(
+        (save_dir / "ensemble_manifest.json").read_text(encoding="utf-8")
+    )
+    curve_meta = manifest_payload.get("validation_curve_artifacts")
+    assert isinstance(curve_meta, dict)
+    assert Path(curve_meta["artifact_json"]).exists()
+
+    if str(curve_meta.get("plot_status")) == "ok":
+        roc_paths = [Path(p) for p in curve_meta["plot_outputs"]["roc_auc_folds"]]
+        pr_paths = [Path(p) for p in curve_meta["plot_outputs"]["pr_auc_folds"]]
+        pr_zoom_paths = [Path(p)
+                         for p in curve_meta["plot_outputs"]["pr_auc_folds_zoom"]]
+        assert len(roc_paths) == 1
+        assert len(pr_paths) == 1
+        assert len(pr_zoom_paths) == 1
+        assert roc_paths[0].exists()
+        assert pr_paths[0].exists()
+        assert pr_zoom_paths[0].exists()
+
+
 @pytest.mark.slow
 def test_train_ffnn_optuna_cli_main_inprocess(
     training_artifacts, tmp_path: Path, monkeypatch

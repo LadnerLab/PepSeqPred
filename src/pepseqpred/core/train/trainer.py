@@ -19,6 +19,7 @@ import optuna
 from .ddp import ddp_rank, ddp_all_reduce_sum, ddp_gather_all_1d
 from .metrics import compute_eval_metrics
 from .threshold import find_threshold_max_recall_min_precision
+from .curveartifacts import write_validation_curve_artifacts
 
 
 @dataclass
@@ -32,6 +33,14 @@ class TrainerConfig:
     # should only train using GPUs (but can be changed to "cpu")
     device: str = "cuda"
     pos_weight: Optional[float] = None
+
+
+@dataclass(frozen=True)
+class ValidationCurveArtifactConfig:
+    """Configuration for optional validation ROC/PR artifact generation."""
+    max_points: int = 2048
+    plot_formats: Tuple[str, ...] = ("png",)
+    output_subdir: str = "validation_curves"
 
 
 class Trainer:
@@ -156,7 +165,12 @@ class Trainer:
                 "y": y_flat.detach().cpu(),
                 "probs": probs_flat.detach().cpu()}
 
-    def _run_epoch(self, epoch: int, train: bool = True) -> Dict[str, Any]:
+    def _run_epoch(
+        self,
+        epoch: int,
+        train: bool = True,
+        capture_eval_arrays: bool = False
+    ) -> Dict[str, Any]:
         """Runs one complete epoch (training step) from start to finish."""
         loader = self.train_loader if train else self.val_loader
         if loader is None:
@@ -243,6 +257,8 @@ class Trainer:
         # compute eval metrics
         cm = None
         eval_metrics = None
+        y_true_epoch: Optional[np.ndarray] = None
+        y_prob_epoch: Optional[np.ndarray] = None
         if not train:
             # all ranks must participate in gathers to avoid DDP divergence.
             if len(all_y) > 0:
@@ -272,6 +288,9 @@ class Trainer:
                     ys) > 0 else np.array([])
                 y_prob = torch.cat(ps, dim=0).numpy() if len(
                     ps) > 0 else np.array([])
+                if capture_eval_arrays:
+                    y_true_epoch = y_true
+                    y_prob_epoch = y_prob
 
                 # guard against invalid or non-existent residues globally
                 if y_true.size == 0:
@@ -344,9 +363,19 @@ class Trainer:
         if not train:
             out["acc"] = avg_acc
             out["eval_metrics"] = eval_metrics
+            if capture_eval_arrays and ddp_rank() == 0:
+                out["eval_arrays"] = {
+                    "y_true": y_true_epoch if y_true_epoch is not None else np.array([]),
+                    "y_prob": y_prob_epoch if y_prob_epoch is not None else np.array([])
+                }
         return out
 
-    def fit(self, save_dir: Optional[Path | str] = None, score_key: str = "loss") -> Dict[str, Any]:
+    def fit(
+        self,
+        save_dir: Optional[Path | str] = None,
+        score_key: str = "loss",
+        val_curve_artifacts: Optional[ValidationCurveArtifactConfig] = None
+    ) -> Dict[str, Any]:
         """
         Fits a neural network model to the data provided.
 
@@ -356,6 +385,8 @@ class Trainer:
                 An optional path to a directory to save the best performing model to.
             score_key : str
                 Score key used to determine the "best" model trained/evaluated so far. Default is `"loss"`.
+            val_curve_artifacts : ValidationCurveArtifactConfig or None
+                Optional config to save per-epoch validation ROC/PR curve data and plots.
 
         Returns
         -------
@@ -393,7 +424,13 @@ class Trainer:
 
             eval_out = None
             if self.val_loader is not None:
-                eval_out = self._run_epoch(epoch, train=False)
+                eval_out = self._run_epoch(
+                    epoch,
+                    train=False,
+                    capture_eval_arrays=(
+                        val_curve_artifacts is not None and save_dir is not None
+                    )
+                )
                 if ddp_rank() == 0 and eval_out["eval_metrics"] is not None:
                     self.logger.info("eval_epoch_summary",
                                      extra={"extra": {
@@ -411,6 +448,34 @@ class Trainer:
                                          "auc10": float(eval_out["eval_metrics"]["auc10"]),
                                          "pr_auc": float(eval_out["eval_metrics"]["pr_auc"])
                                      }})
+
+                if (save_dir is not None and ddp_rank() == 0
+                        and val_curve_artifacts is not None
+                        and eval_out.get("eval_metrics") is not None):
+                    eval_arrays = eval_out.get("eval_arrays")
+                    if isinstance(eval_arrays, dict):
+                        y_true = eval_arrays.get("y_true")
+                        y_prob = eval_arrays.get("y_prob")
+                        if isinstance(y_true, np.ndarray) and isinstance(y_prob, np.ndarray):
+                            artifact_paths = write_validation_curve_artifacts(
+                                epoch=epoch,
+                                y_true=y_true,
+                                y_prob=y_prob,
+                                metrics=eval_out["eval_metrics"],
+                                output_dir=Path(save_dir) /
+                                val_curve_artifacts.output_subdir,
+                                max_points=int(val_curve_artifacts.max_points),
+                                plot_formats=tuple(
+                                    val_curve_artifacts.plot_formats)
+                            )
+                            self.logger.info("val_curve_artifacts_written",
+                                             extra={"extra": {
+                                                 "epoch": int(epoch),
+                                                 "curve_json": artifact_paths.get("curve_json"),
+                                                 "plot_status": artifact_paths.get("plot_status"),
+                                                 "roc_auc_plots": artifact_paths.get("roc_auc_plots", []),
+                                                 "pr_auc_plots": artifact_paths.get("pr_auc_plots", [])
+                                             }})
 
                 # save from validated model only
                 if save_dir is not None and ddp_rank() == 0 and eval_out["eval_metrics"] is not None:

@@ -81,6 +81,9 @@ WINDOW_SIZE="${WINDOW_SIZE:-1000}"
 STRIDE="${STRIDE:-900}"
 SPLIT_TYPE="${SPLIT_TYPE:-id-family}" # id-family or id
 LABEL_CACHE_MODE="${LABEL_CACHE_MODE:-current}" # current or all
+SAVE_VAL_CURVES="${SAVE_VAL_CURVES:-0}" # 1 to enable validation ROC/PR artifacts
+VAL_CURVE_MAX_POINTS="${VAL_CURVE_MAX_POINTS:-2048}"
+VAL_PLOT_FORMATS="${VAL_PLOT_FORMATS:-png}"
 
 mkdir -p "${SAVE_PATH}"
 
@@ -114,6 +117,13 @@ else
     TRAIN_MODE_ARGS+=(--train-seeds "$TRAIN_SEEDS")
 fi
 
+VAL_CURVE_ARGS=()
+if [ "${SAVE_VAL_CURVES}" -eq 1 ]; then
+    VAL_CURVE_ARGS+=(--save-val-curves)
+    VAL_CURVE_ARGS+=(--val-curve-max-points "$VAL_CURVE_MAX_POINTS")
+    VAL_CURVE_ARGS+=(--val-plot-formats "$VAL_PLOT_FORMATS")
+fi
+
 ${LAUNCHER} torchrun --nproc_per_node=4 train_ffnn.pyz \
     --embedding-dirs "${EMBEDDING_DIRS[@]}" \
     --label-shards "${LABEL_SHARDS[@]}" \
@@ -133,6 +143,7 @@ ${LAUNCHER} torchrun --nproc_per_node=4 train_ffnn.pyz \
     --results-csv "$RESULTS_CSV" \
     --num-workers "$NUM_WORKERS" \
     --window-size "$WINDOW_SIZE" \
-    --stride "$STRIDE"
+    --stride "$STRIDE" \
+    "${VAL_CURVE_ARGS[@]}"
 
 # USAGE: sbatch trainffnn.sh /scratch/$USER/esm2/artifacts/pts/shard_000 /scratch/$USER/esm2/artifacts/pts/shard_001 /scratch/$USER/esm2/artifacts/pts/shard_002 /scratch/$USER/esm2/artifacts/pts/shard_003 -- /scratch/$USER/labels/labels_shard_000.pt /scratch/$USER/labels/labels_shard_001.pt /scratch/$USER/labels/labels_shard_002.pt /scratch/$USER/labels/labels_shard_003.pt

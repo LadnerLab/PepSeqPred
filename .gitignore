@@ -42,7 +42,12 @@ pytest-*.xml
 *.pyz
 *.metadata
 *.json
-localdata/evals/*
+*.png
+*.svg
+
+# GitHub and PyPI PepSeqPred logos
+!PepSeqPred_logo_black.png
+!PepSeqPred_logo_white.png 
 
 # Bundled pretrained model artifacts shipped with the package
 !src/pepseqpred/api/pretrained_artifacts/**/*.pt

@@ -22,7 +22,8 @@ import math
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Any, Tuple
+from typing import Dict, List, Any, Mapping, Sequence, Tuple
+import numpy as np
 import torch
 from torch.utils.data import DataLoader
 import torch.distributed as dist
@@ -32,7 +33,11 @@ from pepseqpred.core.io.logger import setup_logger
 from pepseqpred.core.io.write import append_csv_row
 from pepseqpred.core.data.proteindataset import ProteinDataset, pad_collate
 from pepseqpred.core.models.ffnn import PepSeqFFNN
-from pepseqpred.core.train.trainer import Trainer, TrainerConfig
+from pepseqpred.core.train.trainer import (
+    Trainer,
+    TrainerConfig,
+    ValidationCurveArtifactConfig
+)
 from pepseqpred.core.train.ddp import init_ddp
 from pepseqpred.core.train.split import (
     split_ids,
@@ -98,6 +103,509 @@ def _finite_or_none(value: Any) -> float | None:
     except (TypeError, ValueError):
         return None
     return num if math.isfinite(num) else None
+
+
+def _parse_plot_formats(raw: str) -> Tuple[str, ...]:
+    """Parses comma-separated plot file formats."""
+    tokens = [t.strip().lower() for t in str(raw).split(",")]
+    formats = tuple(t for t in tokens if len(t) > 0)
+    if len(formats) < 1:
+        raise ValueError("--val-plot-formats must include at least one format")
+    allowed = {"png", "svg", "pdf"}
+    bad = [fmt for fmt in formats if fmt not in allowed]
+    if len(bad) > 0:
+        raise ValueError(
+            f"Unsupported --val-plot-formats values={bad}; allowed={sorted(allowed)}"
+        )
+    return formats
+
+
+def _as_optional_int(value: Any) -> int | None:
+    """Parses optional integer-like value."""
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _resolve_pr_zoom_limits(
+    fold_evaluations: Sequence[Mapping[str, Any]],
+    baseline_y: float | None,
+    recall_xmax: float = 0.20,
+) -> Tuple[float, float]:
+    """Computes stable PR-plot zoom y-limits for highly imbalanced datasets."""
+    precision_values: List[float] = []
+    xmax = float(recall_xmax)
+    if not math.isfinite(xmax) or xmax <= 0.0:
+        xmax = 0.20
+    for fold_eval in fold_evaluations:
+        pr_obj = fold_eval.get("pr_curve")
+        if not isinstance(pr_obj, Mapping):
+            continue
+        if not bool(pr_obj.get("available", False)):
+            continue
+        recalls = pr_obj.get("recall")
+        precisions = pr_obj.get("precision")
+        if not isinstance(recalls, list) or not isinstance(precisions, list):
+            continue
+        if len(recalls) != len(precisions):
+            continue
+        for recall, precision in zip(recalls, precisions):
+            try:
+                recall_f = float(recall)
+                precision_f = float(precision)
+            except (TypeError, ValueError):
+                continue
+            if not math.isfinite(recall_f) or not math.isfinite(precision_f):
+                continue
+            if 0.0 < recall_f <= xmax:
+                precision_values.append(precision_f)
+
+    if len(precision_values) < 1:
+        y_top = 0.05
+    else:
+        q95 = float(np.quantile(np.asarray(precision_values), 0.95))
+        y_top = max(0.02, q95 * 1.15)
+    if baseline_y is not None and math.isfinite(float(baseline_y)):
+        y_top = max(y_top, float(baseline_y) * 6.0)
+    y_top = min(1.0, max(0.02, y_top))
+    return (0.0, y_top)
+
+
+def _resolve_pr_zoom_xmax(
+    fold_evaluations: Sequence[Mapping[str, Any]],
+    preferred_xmax: float = 0.20,
+) -> float:
+    """Chooses a PR zoom x-maximum with enough sampled points to draw visible lines."""
+    candidate_maxes = [float(preferred_xmax), 0.30, 0.50, 1.00]
+    valid_maxes = [x for x in candidate_maxes if math.isfinite(x) and x > 0.0]
+    if len(valid_maxes) < 1:
+        valid_maxes = [0.20, 0.30, 0.50, 1.00]
+
+    recalls: List[float] = []
+    for fold_eval in fold_evaluations:
+        pr_obj = fold_eval.get("pr_curve")
+        if not isinstance(pr_obj, Mapping):
+            continue
+        if not bool(pr_obj.get("available", False)):
+            continue
+        rec = pr_obj.get("recall")
+        if not isinstance(rec, list):
+            continue
+        for raw in rec:
+            try:
+                value = float(raw)
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(value) and value >= 0.0:
+                recalls.append(value)
+
+    if len(recalls) < 1:
+        return float(valid_maxes[0])
+
+    for xmax in valid_maxes:
+        n_zoom = sum(1 for r in recalls if 0.0 <= r <= xmax)
+        if n_zoom >= 2:
+            return float(xmax)
+    return 1.0
+
+
+def _plot_fold_curves(
+    fold_evaluations: Sequence[Mapping[str, Any]],
+    plot_path_base: Path,
+    formats: Sequence[str],
+    curve_key: str,
+    title: str,
+    x_label: str,
+    y_label: str,
+    x_key: str,
+    y_key: str,
+    metric_key: str,
+    chance_line: bool,
+    baseline_y: float | None = None,
+    secondary_metric_key: str | None = None,
+    metric_label: str | None = None,
+    secondary_metric_label: str | None = None,
+    x_limits: Tuple[float, float] | None = None,
+    y_limits: Tuple[float, float] | None = None,
+    legend_loc: str = "lower right",
+) -> List[str]:
+    """Writes a fold-only curve panel for ROC or PR."""
+    try:
+        import matplotlib.pyplot as plt
+    except Exception as e:
+        raise RuntimeError(
+            "Matplotlib is required for plotting. Install matplotlib to use --save-val-curves."
+        ) from e
+
+    fig, ax = plt.subplots(figsize=(7.0, 6.0), dpi=150)
+    plotted = 0
+    for fold_eval in fold_evaluations:
+        curve_obj = fold_eval.get(curve_key)
+        if not isinstance(curve_obj, Mapping):
+            continue
+        if not bool(curve_obj.get("available", False)):
+            continue
+        x_vals = curve_obj.get(x_key)
+        y_vals = curve_obj.get(y_key)
+        if not isinstance(x_vals, list) or not isinstance(y_vals, list):
+            continue
+        if len(x_vals) < 2 or len(y_vals) < 2:
+            continue
+        fold_index = _as_optional_int(fold_eval.get("fold_index"))
+        fold_label = int(fold_index) if fold_index is not None else (plotted + 1)
+        metrics_obj = fold_eval.get("metrics")
+        metric_value = float("nan")
+        if isinstance(metrics_obj, Mapping):
+            raw_metric = metrics_obj.get(metric_key, float("nan"))
+            try:
+                metric_value = float(raw_metric)
+            except (TypeError, ValueError):
+                metric_value = float("nan")
+        if not math.isfinite(metric_value):
+            if curve_key == "pr_curve" and metric_key == "pr_auc":
+                raw_ap = curve_obj.get("ap", float("nan"))
+                try:
+                    metric_value = float(raw_ap)
+                except (TypeError, ValueError):
+                    metric_value = float("nan")
+        primary_label = metric_label if metric_label is not None else metric_key.upper()
+        primary_metric_text = (
+            f"{primary_label}: {metric_value:.3f}"
+            if math.isfinite(metric_value)
+            else f"{primary_label}: nan"
+        )
+        secondary_metric_text = None
+        if secondary_metric_key is not None and isinstance(metrics_obj, Mapping):
+            raw_secondary = metrics_obj.get(secondary_metric_key, float("nan"))
+            try:
+                secondary_value = float(raw_secondary)
+            except (TypeError, ValueError):
+                secondary_value = float("nan")
+            if (
+                not math.isfinite(secondary_value)
+                and curve_key == "pr_curve"
+                and secondary_metric_key == "pr_auc_trapz"
+            ):
+                raw_trapz = curve_obj.get("auprc_trapz", float("nan"))
+                try:
+                    secondary_value = float(raw_trapz)
+                except (TypeError, ValueError):
+                    secondary_value = float("nan")
+            secondary_label = (
+                secondary_metric_label
+                if secondary_metric_label is not None
+                else secondary_metric_key.upper()
+            )
+            if math.isfinite(secondary_value):
+                secondary_metric_text = f"{secondary_label}: {secondary_value:.3f}"
+            else:
+                secondary_metric_text = f"{secondary_label}: nan"
+        label_parts = [f"Fold {fold_label}", primary_metric_text]
+        if secondary_metric_text is not None:
+            label_parts.append(secondary_metric_text)
+        ax.plot(
+            x_vals,
+            y_vals,
+            linewidth=1.8,
+            alpha=0.95,
+            label=" | ".join(label_parts),
+        )
+        plotted += 1
+
+    if chance_line:
+        ax.plot(
+            [0.0, 1.0],
+            [0.0, 1.0],
+            linestyle="--",
+            linewidth=1.0,
+            color="#C77DBB",
+            label="Chance",
+        )
+    if baseline_y is not None and math.isfinite(float(baseline_y)):
+        y_val = float(baseline_y)
+        ax.plot(
+            [0.0, 1.0],
+            [y_val, y_val],
+            linestyle="--",
+            linewidth=1.0,
+            color="#888888",
+            label=f"Prevalence baseline: {y_val:.4f}",
+        )
+
+    ax.set_title(title)
+    ax.set_xlabel(x_label)
+    ax.set_ylabel(y_label)
+    if x_limits is None:
+        ax.set_xlim(0.0, 1.0)
+    else:
+        ax.set_xlim(float(x_limits[0]), float(x_limits[1]))
+    if y_limits is None:
+        ax.set_ylim(0.0, 1.0)
+    else:
+        ax.set_ylim(float(y_limits[0]), float(y_limits[1]))
+    ax.grid(alpha=0.2)
+    if plotted > 0:
+        ax.legend(loc=legend_loc, frameon=False, fontsize=9)
+    fig.tight_layout()
+
+    saved_paths: List[str] = []
+    plot_path_base.parent.mkdir(parents=True, exist_ok=True)
+    for fmt in formats:
+        out_path = plot_path_base.with_suffix(f".{fmt}")
+        fig.savefig(out_path, dpi=300, bbox_inches="tight")
+        saved_paths.append(str(out_path))
+    plt.close(fig)
+    return saved_paths
+
+
+def _build_set_best_fold_curve_payload(
+    run_rows: Sequence[Mapping[str, Any]],
+    set_index: int,
+    val_curve_subdir: str,
+) -> Dict[str, Any]:
+    """Builds fold-level best-epoch curve payload for one ensemble set."""
+    fold_map: Dict[int, Dict[str, Any]] = {}
+    warnings: List[str] = []
+
+    rows_in_set = sorted(
+        (
+            row
+            for row in run_rows
+            if int(_as_optional_int(row.get("EnsembleSetIndex")) or 1) == int(set_index)
+        ),
+        key=lambda row: int(_as_optional_int(row.get("RunIndex")) or int(1e9)),
+    )
+
+    for row in rows_in_set:
+        fold_idx = _as_optional_int(row.get("FoldIndex"))
+        if fold_idx is None:
+            continue
+        if fold_idx in fold_map:
+            warnings.append(
+                f"set_index={set_index} fold_index={fold_idx} has multiple runs; keeping first by RunIndex."
+            )
+            continue
+
+        run_save_dir_raw = row.get("RunSaveDir")
+        best_epoch = _as_optional_int(row.get("BestEpoch"))
+        status = str(row.get("Status", "")).strip().upper()
+        run_index = _as_optional_int(row.get("RunIndex"))
+
+        if status != "OK":
+            warnings.append(
+                f"Skipping fold {fold_idx} run_index={run_index}: status={status or 'UNKNOWN'}"
+            )
+            continue
+        if run_save_dir_raw is None:
+            warnings.append(
+                f"Skipping fold {fold_idx} run_index={run_index}: missing RunSaveDir."
+            )
+            continue
+        if best_epoch is None or best_epoch < 0:
+            warnings.append(
+                f"Skipping fold {fold_idx} run_index={run_index}: invalid BestEpoch={row.get('BestEpoch')}."
+            )
+            continue
+
+        run_save_dir = Path(str(run_save_dir_raw))
+        curve_json = run_save_dir / str(val_curve_subdir) / f"epoch_{best_epoch:04d}_curves.json"
+        if not curve_json.exists():
+            warnings.append(
+                f"Skipping fold {fold_idx} run_index={run_index}: missing curve JSON {curve_json}."
+            )
+            continue
+
+        try:
+            curve_payload = json.loads(curve_json.read_text(encoding="utf-8"))
+        except Exception as e:
+            warnings.append(
+                f"Skipping fold {fold_idx} run_index={run_index}: could not read {curve_json} ({e})."
+            )
+            continue
+        if not isinstance(curve_payload, Mapping):
+            warnings.append(
+                f"Skipping fold {fold_idx} run_index={run_index}: curve JSON is not an object ({curve_json})."
+            )
+            continue
+
+        metrics_obj = curve_payload.get("eval_metrics")
+        roc_obj = curve_payload.get("roc_curve")
+        pr_obj = curve_payload.get("pr_curve")
+        if not isinstance(metrics_obj, Mapping):
+            metrics_obj = {}
+        if not isinstance(roc_obj, Mapping):
+            roc_obj = {"available": False, "reason": "missing-roc-curve", "fpr": [], "tpr": []}
+        if not isinstance(pr_obj, Mapping):
+            pr_obj = {
+                "available": False,
+                "reason": "missing-pr-curve",
+                "recall": [],
+                "precision": [],
+                "baseline_positive_rate": None,
+                "ap": None,
+                "auprc_trapz": None,
+            }
+
+        fold_map[int(fold_idx)] = {
+            "fold_index": int(fold_idx),
+            "run_index": int(run_index) if run_index is not None else None,
+            "best_epoch": int(best_epoch),
+            "run_save_dir": str(run_save_dir),
+            "curve_json": str(curve_json),
+            "metrics": dict(metrics_obj),
+            "roc_curve": dict(roc_obj),
+            "pr_curve": dict(pr_obj),
+        }
+
+    fold_entries = [fold_map[k] for k in sorted(fold_map.keys())]
+    baseline_values: List[float] = []
+    for fold_eval in fold_entries:
+        pr_obj = fold_eval.get("pr_curve")
+        if not isinstance(pr_obj, Mapping):
+            continue
+        baseline_raw = pr_obj.get("baseline_positive_rate")
+        baseline_value = _finite_or_none(baseline_raw)
+        if baseline_value is not None:
+            baseline_values.append(float(baseline_value))
+    pr_baseline = (
+        float(sum(baseline_values) / len(baseline_values))
+        if len(baseline_values) > 0
+        else None
+    )
+    return {
+        "set_index": int(set_index),
+        "n_folds_with_curves": int(len(fold_entries)),
+        "folds": fold_entries,
+        "pr_baseline_mean": pr_baseline,
+        "warnings": warnings,
+    }
+
+
+def _write_ensemble_validation_curve_artifacts(
+    run_rows: Sequence[Mapping[str, Any]],
+    set_index: int,
+    output_dir: Path,
+    plot_formats: Sequence[str],
+    val_curve_subdir: str = "validation_curves",
+) -> Dict[str, Any]:
+    """Writes fold-level best-epoch ROC/PR plots and sidecar JSON for one set."""
+    payload = _build_set_best_fold_curve_payload(
+        run_rows=run_rows,
+        set_index=set_index,
+        val_curve_subdir=val_curve_subdir,
+    )
+    fold_entries = payload["folds"]
+    baseline_y = payload.get("pr_baseline_mean")
+    baseline_float = (
+        float(baseline_y)
+        if baseline_y is not None and math.isfinite(float(baseline_y))
+        else None
+    )
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    plot_status = "ok"
+    plot_outputs = {
+        "roc_auc_folds": [],
+        "pr_auc_folds": [],
+        "pr_auc_folds_zoom": [],
+    }
+    if len(fold_entries) > 0:
+        try:
+            pr_zoom_xmax = _resolve_pr_zoom_xmax(
+                fold_evaluations=fold_entries,
+                preferred_xmax=0.20,
+            )
+            plot_outputs["roc_auc_folds"] = _plot_fold_curves(
+                fold_evaluations=fold_entries,
+                plot_path_base=output_dir / "roc_auc_folds",
+                formats=plot_formats,
+                curve_key="roc_curve",
+                title="Validation ROC Curves by Fold (Best Epoch)",
+                x_label="FPR",
+                y_label="TPR",
+                x_key="fpr",
+                y_key="tpr",
+                metric_key="auc",
+                chance_line=True,
+                metric_label="AUC",
+            )
+            plot_outputs["pr_auc_folds"] = _plot_fold_curves(
+                fold_evaluations=fold_entries,
+                plot_path_base=output_dir / "pr_auc_folds",
+                formats=plot_formats,
+                curve_key="pr_curve",
+                title="Validation PR Curves by Fold (Best Epoch)",
+                x_label="Recall",
+                y_label="Precision",
+                x_key="recall",
+                y_key="precision",
+                metric_key="pr_auc",
+                chance_line=False,
+                secondary_metric_key="pr_auc_trapz",
+                metric_label="AP",
+                secondary_metric_label="AUPRC(trapz)",
+                baseline_y=baseline_float,
+            )
+            plot_outputs["pr_auc_folds_zoom"] = _plot_fold_curves(
+                fold_evaluations=fold_entries,
+                plot_path_base=output_dir / "pr_auc_folds_zoom",
+                formats=plot_formats,
+                curve_key="pr_curve",
+                title="Validation PR Curves by Fold (Best Epoch, Zoomed)",
+                x_label="Recall",
+                y_label="Precision",
+                x_key="recall",
+                y_key="precision",
+                metric_key="pr_auc",
+                chance_line=False,
+                secondary_metric_key="pr_auc_trapz",
+                metric_label="AP",
+                secondary_metric_label="AUPRC(trapz)",
+                baseline_y=baseline_float,
+                x_limits=(0.0, float(pr_zoom_xmax)),
+                y_limits=_resolve_pr_zoom_limits(
+                    fold_evaluations=fold_entries,
+                    baseline_y=baseline_float,
+                    recall_xmax=float(pr_zoom_xmax),
+                ),
+                legend_loc="upper right",
+            )
+        except RuntimeError:
+            plot_status = "matplotlib_unavailable"
+    else:
+        plot_status = "no_fold_curves"
+
+    out_payload = {
+        "set_index": int(set_index),
+        "plot_status": str(plot_status),
+        "plot_formats": [str(fmt) for fmt in plot_formats],
+        "plot_dir": str(output_dir),
+        "n_folds_with_curves": int(payload["n_folds_with_curves"]),
+        "pr_baseline_mean": payload.get("pr_baseline_mean"),
+        "warnings": list(payload["warnings"]),
+        "plot_outputs": plot_outputs,
+    }
+    out_payload["folds"] = list(fold_entries)
+    out_path = output_dir / "ensemble_fold_validation_curves.json"
+    out_path.write_text(
+        json.dumps(_sanitize_for_json(out_payload), indent=2, allow_nan=False),
+        encoding="utf-8",
+    )
+    return {
+        "set_index": int(set_index),
+        "plot_status": str(plot_status),
+        "plot_formats": [str(fmt) for fmt in plot_formats],
+        "plot_dir": str(output_dir),
+        "artifact_json": str(out_path),
+        "n_folds_with_curves": int(payload["n_folds_with_curves"]),
+        "pr_baseline_mean": payload.get("pr_baseline_mean"),
+        "warnings": list(payload["warnings"]),
+        "plot_outputs": plot_outputs,
+    }
 
 
 @dataclass
@@ -472,6 +980,27 @@ def main() -> None:
                         type=Path,
                         default=None,
                         help="Optional CSV output path for per-run results")
+    parser.add_argument("--save-val-curves",
+                        action="store_true",
+                        dest="save_val_curves",
+                        default=False,
+                        help=(
+                            "If set, save per-epoch validation ROC/PR curve data and plots. "
+                            "In ensemble-kfold mode, also writes set-level fold consistency ROC/PR plots "
+                            "using each fold's best epoch."
+                        ))
+    parser.add_argument("--val-curve-max-points",
+                        action="store",
+                        dest="val_curve_max_points",
+                        type=int,
+                        default=2048,
+                        help="Maximum number of points saved per validation ROC/PR curve.")
+    parser.add_argument("--val-plot-formats",
+                        action="store",
+                        dest="val_plot_formats",
+                        type=str,
+                        default="png",
+                        help="Comma-separated plot formats for validation curves (png,svg,pdf).")
     parser.add_argument("--ensemble-manifest",
                         type=Path,
                         default=None,
@@ -498,6 +1027,16 @@ def main() -> None:
     # disable logging for other ranks when DDP enabled
     if ddp is not None and rank != 0:
         logger.disabled = True
+
+    val_curve_artifacts = None
+    if args.save_val_curves:
+        if args.val_curve_max_points < 2:
+            raise ValueError("--val-curve-max-points must be >= 2")
+        val_curve_artifacts = ValidationCurveArtifactConfig(
+            max_points=int(args.val_curve_max_points),
+            plot_formats=_parse_plot_formats(args.val_plot_formats),
+            output_subdir="validation_curves"
+        )
 
     results_csv = args.results_csv or (
         args.save_path / "multi_run_results.csv")
@@ -747,7 +1286,10 @@ def main() -> None:
             run_save_dir = None
         t0 = time.time()
         fit_summary = trainer.fit(
-            save_dir=run_save_dir, score_key=args.best_model_metric)
+            save_dir=run_save_dir,
+            score_key=args.best_model_metric,
+            val_curve_artifacts=val_curve_artifacts
+        )
         elapsed_s = time.time() - t0
 
         if rank == 0:
@@ -904,6 +1446,43 @@ def main() -> None:
                     "best_metric_value": row.get("BestMetricValue")
                 })
 
+            set_curve_artifacts: Dict[int, Dict[str, Any]] = {}
+            if args.save_val_curves:
+                for set_index in sorted(sets_map.keys()):
+                    entry = sets_map[set_index]
+                    set_dir_raw = entry.get("set_dir")
+                    if set_dir_raw:
+                        curve_out_dir = (
+                            Path(str(set_dir_raw))
+                            / "validation_curves"
+                            / "ensemble_folds"
+                        )
+                    else:
+                        curve_out_dir = (
+                            args.save_path
+                            / "validation_curves"
+                            / "ensemble_folds"
+                        )
+                    curve_artifacts = _write_ensemble_validation_curve_artifacts(
+                        run_rows=run_rows,
+                        set_index=int(set_index),
+                        output_dir=curve_out_dir,
+                        plot_formats=tuple(val_curve_artifacts.plot_formats)
+                        if val_curve_artifacts is not None
+                        else ("png",),
+                    )
+                    set_curve_artifacts[int(set_index)] = curve_artifacts
+                    for warning in curve_artifacts.get("warnings", []):
+                        logger.warning(
+                            "ensemble_validation_curve_warning",
+                            extra={
+                                "extra": {
+                                    "set_index": int(set_index),
+                                    "message": str(warning),
+                                }
+                            },
+                        )
+
             set_payloads: List[Dict[str, Any]] = []
             for set_index in sorted(sets_map.keys()):
                 entry = sets_map[set_index]
@@ -936,6 +1515,9 @@ def main() -> None:
                     },
                     "members": members
                 }
+                curve_artifacts = set_curve_artifacts.get(int(set_index))
+                if curve_artifacts is not None:
+                    set_payload["validation_curve_artifacts"] = curve_artifacts
 
                 if n_sets == 1:
                     set_manifest_path = args.ensemble_manifest or (

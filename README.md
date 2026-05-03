@@ -49,7 +49,7 @@ The repository profile is the source of truth for reproducing experiments end-to
 ## End-to-End Pipeline
 
 ```text
-Stage 1  preprocess metadata + zscores
+Stage 1  normalize dataset inputs (PV1/CWP/BKP) to a shared training contract
 Stage 2  generate ESM-2 per-residue embeddings
 Stage 3  build residue-level label shards
 Stage 4  train FFNN (seeded or ensemble-kfold, DDP-aware)
@@ -60,7 +60,91 @@ Stage 7  evaluate residue metrics (+ optional Cocci peptide compare)
 
 ## Stage Reference
 
-### Stage 1: Preprocess
+### Stage 1: Multi-Dataset Prepare (PV1/CWP/BKP)
+
+**CLI:** `pepseqpred-prepare-dataset` (`src/pepseqpred/apps/prepare_dataset_cli.py`)
+
+This stage is the recommended entrypoint when training on one or more of:
+
+- PV1 (human virome)
+- CWP/Cocci (fungal)
+- BKP (bacterial)
+
+It normalizes source-specific metadata and FASTA headers into a shared PV1-compatible contract so downstream embedding, label generation, and training CLIs can be reused unchanged.
+
+**Core module**
+
+- `src/pepseqpred/core/preprocess/preparedataset.py`
+
+**Required output contract per dataset**
+
+- `prepared_targets.fasta`
+- `prepared_labels_metadata.tsv`
+- `prepared_embedding_metadata.tsv`
+- `prepare_summary.json`
+
+**PV1 inputs and command**
+
+- metadata TSV
+- z-score TSV
+- protein FASTA
+
+```bash
+pepseqpred-prepare-dataset \
+  localdata/PV1/PV1_meta_2020-11-23_cleaned.tsv \
+  localdata/PV1/prepared \
+  --dataset-kind pv1 \
+  --protein-fasta localdata/PV1/PV1_targets.fasta \
+  --z-file localdata/PV1/PV1_zscores.tsv
+```
+
+**CWP/Cocci inputs and command**
+
+- metadata TSV
+- protein FASTA
+- reactive code list TSV
+- non-reactive code list TSV
+
+```bash
+pepseqpred-prepare-dataset \
+  localdata/Cocci/CWP_metadata.tsv \
+  localdata/Cocci/prepared \
+  --dataset-kind cwp \
+  --protein-fasta localdata/Cocci/CWP_targets.faa \
+  --reactive-codes localdata/Cocci/CWP_reactive_Z20N4.tsv \
+  --nonreactive-codes localdata/Cocci/CWP_nonreactive_Z20N4.tsv
+```
+
+**BKP inputs and command**
+
+- metadata TSV
+- protein FASTA
+- reactive code list TSV
+- non-reactive code list TSV
+
+```bash
+pepseqpred-prepare-dataset \
+  localdata/BKP/BKP_metadata.tsv \
+  localdata/BKP/prepared \
+  --dataset-kind bkp \
+  --protein-fasta localdata/BKP/BKP.faa \
+  --reactive-codes localdata/BKP/BKP_reactive_Z20N4.tsv \
+  --nonreactive-codes localdata/BKP/BKP_nonreactive_Z20N4.tsv
+```
+
+**Dataset-specific grouping used for leakage-aware splitting (`--split-type id-family`)**
+
+- PV1: family from PV1 `OXX`
+- CWP/Cocci: `Cluster50ID` mapped to deterministic numeric IDs
+- BKP: `reClusterID_70` mapped to deterministic numeric IDs
+
+**Next stages after prepare**
+
+- run `pepseqpred-esm` with `--embedding-key-mode id-family` and each dataset's `prepared_embedding_metadata.tsv`
+- run `pepseqpred-labels` with `--embedding-key-delim -`
+- train with `--split-type id-family`
+
+### Stage 1 (Legacy): PV1 Z-Score Preprocess
 
 **CLI:** `pepseqpred-preprocess` (`src/pepseqpred/apps/preprocess_cli.py`)
 
@@ -337,6 +421,7 @@ Bundled pretrained registry currently includes:
 
 | CLI | File | Purpose |
 | --- | --- | --- |
+| `pepseqpred-prepare-dataset` | `apps/prepare_dataset_cli.py` | normalize PV1/CWP/BKP into shared training contract |
 | `pepseqpred-preprocess` | `apps/preprocess_cli.py` | metadata + z-score preprocessing |
 | `pepseqpred-esm` | `apps/esm_cli.py` | ESM-2 embedding generation |
 | `pepseqpred-labels` | `apps/labels_cli.py` | residue label shard generation |

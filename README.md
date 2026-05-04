@@ -261,6 +261,54 @@ pepseqpred-train-ffnn \
   --results-csv localdata/models/ffnn_smoke/runs.csv
 ```
 
+**Submit one SLURM training job with multiple datasets (PV1 + CWP + BKP)**
+
+`scripts/hpc/trainffnn.sh` accepts multiple embedding directories and multiple label shards in one call:
+
+- all embedding dirs first
+- separator `--`
+- all label shard `.pt` files after `--`
+
+```bash
+# Example: use per-dataset shard outputs together in one training run
+EMB_DIRS=(
+  /scratch/$USER/esm2/pv1/artifacts/pts/shard_000
+  /scratch/$USER/esm2/pv1/artifacts/pts/shard_001
+  /scratch/$USER/esm2/pv1/artifacts/pts/shard_002
+  /scratch/$USER/esm2/pv1/artifacts/pts/shard_003
+  /scratch/$USER/esm2/cwp/artifacts/pts/shard_000
+  /scratch/$USER/esm2/cwp/artifacts/pts/shard_001
+  /scratch/$USER/esm2/cwp/artifacts/pts/shard_002
+  /scratch/$USER/esm2/cwp/artifacts/pts/shard_003
+  /scratch/$USER/esm2/bkp/artifacts/pts/shard_000
+  /scratch/$USER/esm2/bkp/artifacts/pts/shard_001
+  /scratch/$USER/esm2/bkp/artifacts/pts/shard_002
+  /scratch/$USER/esm2/bkp/artifacts/pts/shard_003
+)
+
+LABEL_SHARDS=(
+  /scratch/$USER/labels/pv1/labels_shard_000.pt
+  /scratch/$USER/labels/pv1/labels_shard_001.pt
+  /scratch/$USER/labels/pv1/labels_shard_002.pt
+  /scratch/$USER/labels/pv1/labels_shard_003.pt
+  /scratch/$USER/labels/cwp/labels_shard_000.pt
+  /scratch/$USER/labels/cwp/labels_shard_001.pt
+  /scratch/$USER/labels/cwp/labels_shard_002.pt
+  /scratch/$USER/labels/cwp/labels_shard_003.pt
+  /scratch/$USER/labels/bkp/labels_shard_000.pt
+  /scratch/$USER/labels/bkp/labels_shard_001.pt
+  /scratch/$USER/labels/bkp/labels_shard_002.pt
+  /scratch/$USER/labels/bkp/labels_shard_003.pt
+)
+
+sbatch trainffnn.sh "${EMB_DIRS[@]}" -- "${LABEL_SHARDS[@]}"
+```
+
+Notes:
+
+- Keep `SPLIT_TYPE=id-family` for family-aware leakage control across PV1/CWP/BKP.
+- Protein IDs should be globally unique across all provided label shards/embedding dirs.
+
 **Outputs**
 
 - run checkpoint(s), usually `fully_connected.pt`

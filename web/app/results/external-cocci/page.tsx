@@ -12,7 +12,7 @@ const metricLabels: Record<string, string> = {
   peptide_f1: "Peptide F1"
 };
 
-export default function ExternalCocciPage(): JSX.Element {
+export default function ExternalCocciPage() {
   return (
     <section className="section alt">
       <div className="wrap">

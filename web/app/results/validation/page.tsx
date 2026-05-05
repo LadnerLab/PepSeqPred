@@ -1,7 +1,7 @@
 import { assetPath, formatFixed, formatPercent } from "@/lib/format";
 import { phaseBValidationData } from "@/lib/manualData";
 
-export default function ValidationPage(): JSX.Element {
+export default function ValidationPage() {
   const { summaries } = phaseBValidationData;
 
   return (

@@ -57,3 +57,13 @@ pytest-*.xml
 !docs/data/*.json
 !docs/assets/results/*.csv
 !docs/assets/results/*.json
+
+# Next.js website source and curated web assets
+!web/package.json
+!web/package-lock.json
+!web/tsconfig.json
+!web/.eslintrc.json
+!web/public/assets/**/*.png
+!web/public/assets/**/*.svg
+node_modules/
+.next/

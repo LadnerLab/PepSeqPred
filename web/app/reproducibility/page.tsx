@@ -1,4 +1,4 @@
-export default function ReproducibilityPage(): JSX.Element {
+export default function ReproducibilityPage() {
   return (
     <section className="section">
       <div className="wrap">

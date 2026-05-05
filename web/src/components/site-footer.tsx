@@ -1,4 +1,4 @@
-export function SiteFooter(): JSX.Element {
+export function SiteFooter() {
   return (
     <footer className="site-footer">
       <div className="wrap footer-content">

@@ -9,7 +9,7 @@ export const metadata: Metadata = {
     "PepSeqPred predicts residue-level epitope locations from protein sequences using ESM embeddings and FFNN ensembles."
 };
 
-export default function RootLayout({ children }: Readonly<{ children: React.ReactNode }>): JSX.Element {
+export default function RootLayout({ children }: Readonly<{ children: React.ReactNode }>) {
   return (
     <html lang="en">
       <body>

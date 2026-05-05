@@ -9,7 +9,7 @@ const navItems = [
   { href: "/reproducibility", label: "Reproducibility" }
 ];
 
-export function SiteHeader(): JSX.Element {
+export function SiteHeader() {
   return (
     <header className="site-header">
       <div className="wrap topbar">

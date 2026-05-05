@@ -1,7 +1,7 @@
 import { assetPath, formatFixed, formatPercent, formatSci, formatSigned } from "@/lib/format";
 import { modelComparisonData } from "@/lib/manualData";
 
-export default function ComparisonPage(): JSX.Element {
+export default function ComparisonPage() {
   return (
     <section className="section alt">
       <div className="wrap">

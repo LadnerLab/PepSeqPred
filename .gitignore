@@ -66,3 +66,4 @@ pytest-*.xml
 !web/public/assets/**/*.png
 !web/public/assets/**/*.svg
 node_modules/
+.next/

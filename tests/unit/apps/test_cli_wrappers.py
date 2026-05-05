@@ -5,6 +5,7 @@ import pandas as pd
 import pytest
 import pepseqpred.apps.esm_cli as esm_cli
 import pepseqpred.apps.labels_cli as labels_cli
+import pepseqpred.apps.prepare_dataset_cli as prepare_dataset_cli
 import pepseqpred.apps.preprocess_cli as preprocess_cli
 
 pytestmark = pytest.mark.unit
@@ -167,3 +168,56 @@ def test_esm_cli_id_family_requires_metadata(monkeypatch, tmp_path: Path):
 
     with pytest.raises(ValueError, match="Metadata file is required"):
         esm_cli.main()
+
+
+def test_prepare_dataset_cli_invokes_adapter(monkeypatch, tmp_path: Path):
+    captured = {}
+
+    def fake_prepare_dataset(**kwargs):
+        captured["kwargs"] = kwargs
+        return {
+            "prepared_targets_fasta": str(tmp_path / "prepared_targets.fasta"),
+            "prepared_labels_metadata_tsv": str(tmp_path / "prepared_labels_metadata.tsv"),
+            "prepared_embedding_metadata_tsv": str(tmp_path / "prepared_embedding_metadata.tsv"),
+            "prepare_summary_json": str(tmp_path / "prepare_summary.json"),
+            "n_targets": 2,
+            "n_label_rows": 4,
+            "n_label_proteins": 2,
+        }
+
+    ns = argparse.Namespace(
+        meta_file=tmp_path / "meta.tsv",
+        output_dir=tmp_path / "out",
+        dataset_kind="cwp",
+        protein_fasta=tmp_path / "proteins.faa",
+        z_file=None,
+        reactive_codes=tmp_path / "reactive.tsv",
+        nonreactive_codes=tmp_path / "nonreactive.tsv",
+        group_id_offset=None,
+        is_epi_z_min=20.0,
+        is_epi_min_subs=4,
+        not_epi_z_max=10.0,
+        not_epi_max_subs=0,
+        subject_prefix="VW_",
+        log_level="INFO",
+        log_json=False,
+    )
+
+    monkeypatch.setattr(
+        prepare_dataset_cli.argparse.ArgumentParser, "parse_args", lambda self: ns
+    )
+    monkeypatch.setattr(
+        prepare_dataset_cli,
+        "setup_logger",
+        lambda **kwargs: logging.getLogger("prepare_dataset_cli_test")
+    )
+    monkeypatch.setattr(
+        prepare_dataset_cli,
+        "prepare_dataset",
+        fake_prepare_dataset
+    )
+
+    prepare_dataset_cli.main()
+
+    assert captured["kwargs"]["dataset_kind"] == "cwp"
+    assert int(captured["kwargs"]["group_id_offset"]) == 100_000_000

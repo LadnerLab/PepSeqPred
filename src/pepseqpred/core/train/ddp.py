@@ -104,12 +104,35 @@ def ddp_gather_all_1d(t: torch.Tensor, device: torch.device) -> Tuple[List[torch
     """
     if not _ddp_enabled():
         return [t], [int(t.numel())]
+    if t.dim() != 1:
+        raise ValueError(
+            f"ddp_gather_all_1d expects a 1D tensor, got shape={tuple(t.shape)}"
+        )
 
     sizes = torch.tensor([t.numel()], device=device, dtype=torch.long)
     size_list = [torch.zeros_like(sizes) for _ in range(_ddp_world())]
     dist.all_gather(size_list, sizes)
     sizes_int = [int(s.item()) for s in size_list]
     max_size = max(sizes_int) if sizes_int else int(t.numel())
+
+    max_allowed_raw = os.environ.get(
+        "PEPSEQPRED_DDP_MAX_GATHER_ELEMS", "100000000")
+    try:
+        max_allowed = max(1, int(max_allowed_raw))
+    except ValueError:
+        max_allowed = 100_000_000
+
+    bad_sizes = [
+        {"rank_index": idx, "size": int(size)}
+        for idx, size in enumerate(sizes_int)
+        if (int(size) < 0) or (int(size) > max_allowed)
+    ]
+    if bad_sizes:
+        raise RuntimeError(
+            "Invalid gathered tensor sizes detected in ddp_gather_all_1d; "
+            "possible DDP desync or failed collective. "
+            f"sizes={bad_sizes} max_allowed={max_allowed}"
+        )
 
     padded = torch.zeros(max_size, device=device, dtype=t.dtype)
     if t.numel() > 0:

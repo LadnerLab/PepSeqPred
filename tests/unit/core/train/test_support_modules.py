@@ -184,3 +184,24 @@ def test_ddp_gather_all_1d_enabled(monkeypatch):
     assert gathered[0].tolist() == [9, 8, 0, 0]
     assert gathered[1].tolist() == [7, 6, 5, 4]
     assert gathered[2].tolist() == [3, 0, 0, 0]
+
+
+def test_ddp_gather_all_1d_rejects_invalid_gathered_sizes(monkeypatch):
+    monkeypatch.setattr(ddp_mod.dist, "is_available", lambda: True)
+    monkeypatch.setattr(ddp_mod.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(ddp_mod.dist, "get_world_size", lambda: 2)
+
+    def _all_gather(out_list, in_tensor):
+        if in_tensor.dtype == torch.long and in_tensor.numel() == 1:
+            out_list[0].fill_(2)
+            out_list[1].fill_(10**12)
+            return
+        raise AssertionError("Payload gather should not execute after size validation failure")
+
+    monkeypatch.setattr(ddp_mod.dist, "all_gather", _all_gather)
+
+    with pytest.raises(RuntimeError, match="Invalid gathered tensor sizes"):
+        ddp_mod.ddp_gather_all_1d(
+            torch.tensor([1, 2], dtype=torch.int64),
+            torch.device("cpu")
+        )

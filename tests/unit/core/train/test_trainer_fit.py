@@ -3,7 +3,9 @@ from pathlib import Path
 import optuna
 import pytest
 import torch
+import torch.nn as nn
 from pepseqpred.core.models.ffnn import PepSeqFFNN
+import pepseqpred.core.train.trainer as trainer_mod
 from pepseqpred.core.train.trainer import (
     Trainer,
     TrainerConfig,
@@ -117,3 +119,35 @@ def test_fit_optuna_prune_path(tmp_path: Path):
     with pytest.raises(optuna.TrialPruned):
         trainer.fit_optuna(save_dir=tmp_path,
                            trial=_AlwaysPruneTrial(), score_key="f1")
+
+
+def test_run_epoch_eval_uses_wrapped_module_for_ddp_like_models(monkeypatch):
+    class _FakeDDP(nn.Module):
+        def __init__(self, module: nn.Module):
+            super().__init__()
+            self.module = module
+
+        def forward(self, _x):
+            raise RuntimeError("DDP wrapper forward should not be used during eval")
+
+    monkeypatch.setattr(trainer_mod, "TorchDDP", _FakeDDP)
+
+    base_model = PepSeqFFNN(
+        emb_dim=4,
+        hidden_sizes=(8,),
+        dropouts=(0.0,),
+        num_classes=1,
+        use_layer_norm=False,
+        use_residual=False
+    )
+    wrapped_model = _FakeDDP(base_model)
+    trainer = Trainer(
+        model=wrapped_model,
+        train_loader=_make_batches(n_batches=1),
+        val_loader=_make_batches(n_batches=1),
+        logger=logging.getLogger("trainer_eval_ddp_like_test"),
+        config=TrainerConfig(epochs=1, batch_size=2, learning_rate=1e-2, device="cpu")
+    )
+
+    out = trainer._run_epoch(0, train=False)
+    assert "eval_metrics" in out

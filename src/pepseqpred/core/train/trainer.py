@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from typing import Optional, List, Dict, Any, Tuple
 import torch
 import torch.nn as nn
+from torch.nn.parallel import DistributedDataParallel as TorchDDP
 from torch.utils.data import DataLoader
 import numpy as np
 import optuna
@@ -124,8 +125,12 @@ class Trainer:
             raise ValueError(
                 f"Expected y_onehot shape (B, L), got {tuple(y.shape)}")
 
-        # get logits to calculate loss and validate shape
-        logits = self.model(X)
+        # In eval with DDP, call the wrapped module directly to avoid
+        # DDP forward-time collectives on uneven per-rank validation inputs.
+        if (not train) and isinstance(self.model, TorchDDP):
+            logits = self.model.module(X)
+        else:
+            logits = self.model(X)
         if logits.shape != y.shape:
             raise ValueError(
                 f"Expected logits shape {tuple(y.shape)}, got {tuple(logits.shape)}")

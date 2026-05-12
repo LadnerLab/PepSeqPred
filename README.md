@@ -340,6 +340,42 @@ pepseqpred-train-ffnn-optuna \
   --csv-path data/models/optuna_smoke/trials.csv
 ```
 
+**Current Optuna search space**
+
+The current study samples the following hyperparameters per trial:
+
+| Hyperparameter (`best_params` key) | Type | Search space (current implementation) | Controlled by |
+| --- | --- | --- | --- |
+| `depth` | integer | `[depth_min, depth_max]` | `--depth-min`, `--depth-max` |
+| `width_step` | categorical | `{16, 32, 64}` | fixed in code |
+| `base_width` | integer | `[width_min, width_max]` with `step=width_step` | `--width-min`, `--width-max` |
+| `shape_ratio` | float | `[0.60, 0.95]` | sampled only when `--arch-mode` is `bottleneck` or `pyramid` |
+| `dropout` | float | `[0.00, 0.25]` | fixed in code |
+| `use_layer_norm` | categorical | `{True, False}` | fixed in code |
+| `use_residual` | categorical | `{True, False}` | fixed in code |
+| `learning_rate` | float (log) | `[lr_min, lr_max]` | `--lr-min`, `--lr-max` |
+| `weight_decay` | float (log) | `[wd_min, wd_max]` | `--wd-min`, `--wd-max` |
+| `batch_size` | categorical | values from `--batch-sizes` CSV | `--batch-sizes` |
+
+Architecture shaping behavior:
+
+- `--arch-mode flat`: hidden widths are `[base_width] * depth`
+- `--arch-mode bottleneck`: widths decrease by `shape_ratio` across layers
+- `--arch-mode pyramid`: widths increase by `shape_ratio` across layers
+
+Not tuned by Optuna in the current setup:
+
+- `pos_weight` (fixed for the study via `--pos-weight`, or computed once from label shards if omitted)
+- split strategy and validation fraction (`--split-type`, `--val-frac`)
+- sequence windowing (`--window-size`, `--stride`) and data-loader behavior
+- trial budget/pruning controls (`--n-trials`, `--epochs`, `--pruner-warmup`, `--timeout-s`)
+- optimization target metric selection (`--metric`) is user-selected, then maximized by Optuna
+
+HPC default override note:
+
+- The CLI default for `--batch-sizes` is `32,64,128`.
+- The SLURM wrapper `scripts/hpc/trainffnnoptuna.sh` currently overrides this to `256,512,1024` unless changed via env var.
+
 **Outputs**
 
 - trial rows CSV

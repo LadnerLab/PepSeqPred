@@ -62,6 +62,8 @@ Stage 7  evaluate residue metrics (+ optional Cocci peptide compare)
 
 ### Stage 1: Multi-Dataset Prepare (PV1/CWP/BKP)
 
+***Note:** [`data/sample/`](data/sample/) contains the expected dataset sample formats.  
+
 **CLI:** `pepseqpred-prepare-dataset` (`src/pepseqpred/apps/prepare_dataset_cli.py`)
 
 This stage is the recommended entrypoint when training on one or more of:
@@ -91,11 +93,11 @@ It normalizes source-specific metadata and FASTA headers into a shared PV1-compa
 
 ```bash
 pepseqpred-prepare-dataset \
-  localdata/PV1/PV1_meta_2020-11-23_cleaned.tsv \
-  localdata/PV1/prepared \
+  data/PV1/PV1_meta_2020-11-23_cleaned.tsv \
+  data/PV1/prepared \
   --dataset-kind pv1 \
-  --protein-fasta localdata/PV1/PV1_targets.fasta \
-  --z-file localdata/PV1/PV1_zscores.tsv
+  --protein-fasta data/PV1/PV1_targets.fasta \
+  --z-file data/PV1/PV1_zscores.tsv
 ```
 
 **CWP/Cocci inputs and command**
@@ -107,12 +109,12 @@ pepseqpred-prepare-dataset \
 
 ```bash
 pepseqpred-prepare-dataset \
-  localdata/Cocci/CWP_metadata.tsv \
-  localdata/Cocci/prepared \
+  data/Cocci/CWP_metadata.tsv \
+  data/Cocci/prepared \
   --dataset-kind cwp \
-  --protein-fasta localdata/Cocci/CWP_targets.faa \
-  --reactive-codes localdata/Cocci/CWP_reactive_Z20N4.tsv \
-  --nonreactive-codes localdata/Cocci/CWP_nonreactive_Z20N4.tsv
+  --protein-fasta data/Cocci/CWP_targets.faa \
+  --reactive-codes data/Cocci/CWP_reactive_Z20N4.tsv \
+  --nonreactive-codes data/Cocci/CWP_nonreactive_Z20N4.tsv
 ```
 
 **BKP inputs and command**
@@ -124,12 +126,12 @@ pepseqpred-prepare-dataset \
 
 ```bash
 pepseqpred-prepare-dataset \
-  localdata/BKP/BKP_metadata.tsv \
-  localdata/BKP/prepared \
+  data/BKP/BKP_metadata.tsv \
+  data/BKP/prepared \
   --dataset-kind bkp \
-  --protein-fasta localdata/BKP/BKP.faa \
-  --reactive-codes localdata/BKP/BKP_reactive_Z20N4.tsv \
-  --nonreactive-codes localdata/BKP/BKP_nonreactive_Z20N4.tsv
+  --protein-fasta data/BKP/BKP.faa \
+  --reactive-codes data/BKP/BKP_reactive_Z20N4.tsv \
+  --nonreactive-codes data/BKP/BKP_nonreactive_Z20N4.tsv
 ```
 
 **Dataset-specific grouping used for leakage-aware splitting (`--split-type id-family`)**
@@ -190,7 +192,7 @@ pepseqpred-preprocess data/meta.tsv data/zscores.tsv --save
 ```bash
 pepseqpred-esm \
   --fasta-file data/targets.fasta \
-  --out-dir localdata/esm2 \
+  --out-dir data/esm2 \
   --embedding-key-mode id-family \
   --key-delimiter - \
   --model-name esm2_t33_650M_UR50D \
@@ -222,8 +224,8 @@ pepseqpred-esm \
 ```bash
 pepseqpred-labels \
   data/input_data_20_4_10_all.tsv \
-  localdata/labels/labels_shard_000.pt \
-  --emb-dir localdata/esm2/artifacts/pts/shard_000 \
+  data/labels/labels_shard_000.pt \
+  --emb-dir data/esm2/artifacts/pts/shard_000 \
   --restrict-to-embeddings \
   --calc-pos-weight \
   --embedding-key-delim -
@@ -253,12 +255,12 @@ pepseqpred-labels \
 
 ```bash
 pepseqpred-train-ffnn \
-  --embedding-dirs localdata/esm2/artifacts/pts/shard_000 \
-  --label-shards localdata/labels/labels_shard_000.pt \
+  --embedding-dirs data/esm2/artifacts/pts/shard_000 \
+  --label-shards data/labels/labels_shard_000.pt \
   --epochs 1 \
   --subset 100 \
-  --save-path localdata/models/ffnn_smoke \
-  --results-csv localdata/models/ffnn_smoke/runs.csv
+  --save-path data/models/ffnn_smoke \
+  --results-csv data/models/ffnn_smoke/runs.csv
 ```
 
 **Submit one SLURM training job with multiple datasets (PV1 + CWP + BKP)**
@@ -329,12 +331,12 @@ Notes:
 
 ```bash
 pepseqpred-train-ffnn-optuna \
-  --embedding-dirs localdata/esm2/artifacts/pts/shard_000 \
-  --label-shards localdata/labels/labels_shard_000.pt \
+  --embedding-dirs data/esm2/artifacts/pts/shard_000 \
+  --label-shards data/labels/labels_shard_000.pt \
   --n-trials 2 \
   --epochs 1 \
-  --save-path localdata/models/optuna_smoke \
-  --csv-path localdata/models/optuna_smoke/trials.csv
+  --save-path data/models/optuna_smoke \
+  --csv-path data/models/optuna_smoke/trials.csv
 ```
 
 **Outputs**
@@ -362,9 +364,9 @@ pepseqpred-train-ffnn-optuna \
 
 ```bash
 pepseqpred-predict \
-  localdata/models/run_001/fully_connected.pt \
+  data/models/run_001/fully_connected.pt \
   data/inference_targets.fasta \
-  --output-fasta localdata/predictions/predictions.fasta
+  --output-fasta data/predictions/predictions.fasta
 ```
 
 **Output**
@@ -393,10 +395,10 @@ pepseqpred-predict \
 
 ```bash
 pepseqpred-eval-ffnn \
-  localdata/models/run_001/fully_connected.pt \
-  --embedding-dirs localdata/esm2/artifacts/pts/shard_000 \
-  --label-shards localdata/labels/labels_shard_000.pt \
-  --output-json localdata/eval/ffnn_eval_summary.json
+  data/models/run_001/fully_connected.pt \
+  --embedding-dirs data/esm2/artifacts/pts/shard_000 \
+  --label-shards data/labels/labels_shard_000.pt \
+  --output-json data/eval/ffnn_eval_summary.json
 ```
 
 **Output**

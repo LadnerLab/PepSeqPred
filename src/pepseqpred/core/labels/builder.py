@@ -2,8 +2,8 @@
 
 Label building utilities for PepSeqPred peptide metadata.
 
-Provides helpers to parse PV1-style metadata, map peptides to protein embeddings,
-and build residue-level label tensors and peptide metadata for training.
+Provides helpers to parse PV1-style (i.e., ID=<ID> AC=<AC> OXX=<OXX>) metadata, map peptides 
+to protein embeddings, and build residue-level label tensors and peptide metadata for training.
 """
 
 import logging

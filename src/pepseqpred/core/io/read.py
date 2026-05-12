@@ -2,8 +2,9 @@
 
 Input parsing utilities for PepSeqPred tabular and FASTA data.
 
-Provides helpers to read PV1-style FASTA files, metadata TSVs, and z-score
-reactivity tables into normalized pandas DataFrames. Also includes CLI CSV arguments parsers for downstream training and predictions.
+Provides helpers to read PV1-style (i.e., ID=<ID> AC=<AC> OXX=<OXX>) FASTA files, metadata TSVs, 
+and z-score reactivity tables into normalized pandas DataFrames. 
+Also includes CLI CSV arguments parsers for downstream training and predictions.
 """
 
 import re
@@ -14,7 +15,7 @@ import pandas as pd
 
 def read_fasta(fasta_path: Path | str, full_name: bool = False) -> pd.DataFrame:
     """
-    Parses a FASTA file with PV1-style headers into a pandas DataFrame.
+    Parses a FASTA file with PV1-style headers (i.e., ID=<ID> AC=<AC> OXX=<OXX>) into a pandas DataFrame.
 
     Expected pattern (example):
     >ID=A8D0M1_ADE02 AC=A8D0M1 OXX=10515,129951,10509,10508
@@ -92,7 +93,7 @@ def read_metadata(meta_path: Path | str,
                   peptide_end_idx: str = "AlignStop",
                   drop_cols: Optional[Iterable[str]] = None) -> pd.DataFrame:
     """
-    Parses a metadata TSV file with PV1-style headers into a pandas DataFrame.
+    Parses a metadata TSV file with PV1-style headers (i.e., ID=<ID> AC=<AC> OXX=<OXX>) into a pandas DataFrame.
 
     Expected columns:
     CodeName, Category, SpeciesID, Species, Protein, AlignStart, AlignStop, FullName, 

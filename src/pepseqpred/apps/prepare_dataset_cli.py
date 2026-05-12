@@ -1,6 +1,7 @@
 """prepare_dataset_cli.py
 
-Normalize PV1/CWP/BKP sources into a shared PV1-compatible training contract.
+Normalize PV1/CWP/BKP sources into a shared PV1-compatible training 
+contract (i.e., ID=<ID> AC=<AC> OXX=<OXX>).
 """
 import argparse
 import time
@@ -15,7 +16,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
             "Prepare dataset-specific metadata/labels/targets into a PV1-compatible "
-            "contract for embedding, label generation, and training."
+            "contract (i.e., ID=<ID> AC=<AC> OXX=<OXX>) for embedding, label generation, and training."
         )
     )
     parser.add_argument(

@@ -72,7 +72,7 @@ This stage is the recommended entrypoint when training on one or more of:
 - CWP/Cocci (fungal)
 - BKP (bacterial)
 
-It normalizes source-specific metadata and FASTA headers into a shared PV1-compatible contract so downstream embedding, label generation, and training CLIs can be reused unchanged.
+It normalizes source-specific metadata and FASTA headers into a shared PV1-compatible contract (i.e., ID=<ID> AC=<AC> OXX=<OXX>) so downstream embedding, label generation, and training CLIs can be reused unchanged.
 
 **Core module**
 
@@ -152,7 +152,7 @@ pepseqpred-prepare-dataset \
 
 **Inputs**
 
-- metadata TSV (PV1-style)
+- metadata TSV
 - z-score TSV
 
 **Core modules**

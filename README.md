@@ -52,7 +52,7 @@ The repository profile is the source of truth for reproducing experiments end-to
 Stage 1  normalize dataset inputs (PV1/CWP/BKP) to a shared training contract
 Stage 2  generate ESM-2 per-residue embeddings
 Stage 3  build residue-level label shards
-Stage 4  train FFNN (seeded or ensemble-kfold, DDP-aware)
+Stage 4  train FFNN (unified n-fold interface, DDP-aware)
 Stage 5  optional Optuna tuning (DDP-aware)
 Stage 6  predict residue masks from checkpoint/manifest
 Stage 7  evaluate residue metrics (+ optional Cocci peptide compare)
@@ -240,10 +240,11 @@ pepseqpred-labels \
 
 **CLI:** `pepseqpred-train-ffnn` (`src/pepseqpred/apps/train_ffnn_cli.py`)
 
-**Modes**
+**Unified run interface**
 
-- `seeded`: split/train seed pairs define runs
-- `ensemble-kfold`: K-fold members per set, optional multiple set seeds
+- `--n-folds 1`: one holdout run per split/train seed pair (uses `--val-frac`)
+- `--n-folds K` (`K > 1`): K-fold members per split/train seed pair set
+- `--split-seeds` and `--train-seeds` are paired by index; if both are omitted, both default to `--seed`
 
 **Core modules**
 
@@ -316,7 +317,7 @@ Notes:
 - run checkpoint(s), usually `fully_connected.pt`
 - per-run CSV (`runs.csv` or `multi_run_results.csv`)
 - aggregate `multi_run_summary.json`
-- ensemble manifest JSON in `ensemble-kfold` mode
+- ensemble manifest JSON when `--n-folds > 1`
 
 ### Stage 5: Optuna Tuning (Optional)
 
@@ -475,7 +476,7 @@ Bundled pretrained registry currently includes:
 | `pepseqpred-preprocess` | `apps/preprocess_cli.py` | metadata + z-score preprocessing |
 | `pepseqpred-esm` | `apps/esm_cli.py` | ESM-2 embedding generation |
 | `pepseqpred-labels` | `apps/labels_cli.py` | residue label shard generation |
-| `pepseqpred-train-ffnn` | `apps/train_ffnn_cli.py` | seeded or ensemble-kfold training |
+| `pepseqpred-train-ffnn` | `apps/train_ffnn_cli.py` | unified holdout/K-fold FFNN training (`--n-folds`) |
 | `pepseqpred-train-ffnn-optuna` | `apps/train_ffnn_optuna_cli.py` | Optuna tuning |
 | `pepseqpred-predict` | `apps/prediction_cli.py` | FASTA inference from checkpoint/manifest |
 | `pepseqpred-eval-ffnn` | `apps/evaluate_ffnn_cli.py` | residue-level evaluation |
@@ -492,7 +493,7 @@ These wrappers are production-facing interfaces and should be treated as first-c
 | `trainffnnoptuna.sh` | Optuna | GPU, `4xa100`, `20` CPU, `448G`, `48:00:00` |
 | `predictepitope.sh` | Predict | GPU, `a100`, `4` CPU, `32G`, `00:30:00` |
 | `evaluateffnn.sh` | End-to-end eval pipeline | GPU, `a100`, `8` CPU, `128G`, `04:00:00` |
-| `evalffnnsweep.sh` | Seeded eval batch submitter | wrapper script (calls `evaluateffnn.sh`) |
+| `evalffnnsweep.sh` | Set-indexed eval batch submitter | wrapper script (calls `evaluateffnn.sh`) |
 | `preprocessdata.sh` | Preprocess helper | local helper, not a SLURM script |
 
 ### Important HPC notes

@@ -130,6 +130,36 @@ def _as_optional_int(value: Any) -> int | None:
         return None
 
 
+def _legacy_train_mode_label(n_folds: int) -> str:
+    """Resolves legacy-compatible train_mode label from unified n_folds input."""
+    return "ensemble-kfold" if int(n_folds) > 1 else "seeded"
+
+
+_LEGACY_TRAIN_FLAGS: Dict[str, str] = {
+    "--train-mode": (
+        "Removed. Use --n-folds 1 for holdout runs, or --n-folds K (K>1) for K-fold ensemble runs."
+    ),
+    "--fold-seed": (
+        "Removed. Use --split-seeds (paired with --train-seeds) to control per-set fold assignment seeds."
+    ),
+    "--ensemble-train-seeds": (
+        "Removed. Use --train-seeds as per-set training seeds."
+    ),
+}
+
+
+def _match_legacy_train_flags(tokens: Sequence[str]) -> List[str]:
+    """Finds removed legacy train-mode flags in parser unknown-token output."""
+    found: List[str] = []
+    for token in tokens:
+        token_s = str(token).strip()
+        for flag in _LEGACY_TRAIN_FLAGS:
+            if token_s == flag or token_s.startswith(f"{flag}="):
+                if flag not in found:
+                    found.append(flag)
+    return found
+
+
 def _resolve_pr_zoom_limits(
     fold_evaluations: Sequence[Mapping[str, Any]],
     baseline_y: float | None,
@@ -642,126 +672,14 @@ def _build_run_plans(
     protein_ids: List[str],
     family_groups: Dict[str, str]
 ) -> Tuple[List[RunPlan], Dict[str, Any]]:
-    """Builds run plans for either seeded or ensemble-kfold training modes."""
+    """Builds run plans from unified seed lists and n-folds configuration."""
     if len(protein_ids) == 0:
         raise ValueError("No proteins found to train on")
 
-    if args.train_mode == "ensemble-kfold":
-        n_folds = int(args.n_folds)
-        if n_folds < 2:
-            raise ValueError(
-                "--n-folds must be >= 2 when --train-mode ensemble-kfold")
+    n_folds = int(args.n_folds)
+    if n_folds < 1:
+        raise ValueError("--n-folds must be >= 1")
 
-        uses_set_seed_lists = (args.split_seeds is not None) or (
-            args.train_seeds is not None)
-
-        # Preferred mode: each (split_seed, train_seed) pair defines one K-fold set.
-        if uses_set_seed_lists:
-            if args.split_seeds is None or args.train_seeds is None:
-                raise ValueError(
-                    "Provide both --split-seeds and --train-seeds for ensemble-kfold set replication")
-            if args.fold_seed is not None:
-                raise ValueError(
-                    "--fold-seed cannot be combined with --split-seeds in ensemble-kfold mode")
-            if args.ensemble_train_seeds is not None:
-                raise ValueError(
-                    "--ensemble-train-seeds cannot be combined with --split-seeds/--train-seeds")
-
-            set_split_seeds = parse_int_csv(args.split_seeds, "--split-seeds")
-            set_train_seeds = parse_int_csv(args.train_seeds, "--train-seeds")
-            if len(set_split_seeds) != len(set_train_seeds):
-                raise ValueError(
-                    "--split-seeds and --train-seeds must be the same length")
-            ensemble_seed_mode = "set-paired"
-            legacy_per_fold_train_seeds: List[int] = []
-        else:
-            # Backward-compatible mode: single K-fold set with optional per-fold train seeds.
-            fold_seed = int(args.fold_seed) if args.fold_seed is not None else int(args.seed)
-            set_split_seeds = [int(fold_seed)]
-            set_train_seeds = [int(args.seed)]
-
-            if args.ensemble_train_seeds is not None:
-                legacy_per_fold_train_seeds = parse_int_csv(
-                    args.ensemble_train_seeds, "--ensemble-train-seeds")
-                if len(legacy_per_fold_train_seeds) != n_folds:
-                    raise ValueError("--ensemble-train-seeds must match --n-folds")
-                ensemble_seed_mode = "legacy-per-fold-train-seeds"
-            else:
-                legacy_per_fold_train_seeds = []
-                ensemble_seed_mode = "set-paired"
-
-        n_sets = len(set_split_seeds)
-        run_plans: List[RunPlan] = []
-        global_run_index = 1
-        for set_index, (set_split_seed, set_train_seed) in enumerate(
-            zip(set_split_seeds, set_train_seeds),
-            start=1
-        ):
-            if args.split_type == "id-family":
-                fold_splits = build_grouped_kfold_splits(
-                    protein_ids, n_folds=n_folds, seed=int(set_split_seed), groups=family_groups
-                )
-            else:
-                fold_splits = build_kfold_splits(
-                    protein_ids, n_folds=n_folds, seed=int(set_split_seed)
-                )
-
-            if n_sets > 1:
-                set_dir_name = f"set_{set_index:03d}_split_{int(set_split_seed)}_train_{int(set_train_seed)}"
-            else:
-                set_dir_name = None
-
-            for fold_index, (train_ids_all, val_ids_all) in enumerate(fold_splits, start=1):
-                if args.split_type == "id-family":
-                    _check_family_leakage(
-                        train_ids_all, val_ids_all, family_groups)
-
-                if ensemble_seed_mode == "legacy-per-fold-train-seeds":
-                    fold_train_seed = int(legacy_per_fold_train_seeds[fold_index - 1])
-                else:
-                    fold_train_seed = int(set_train_seed)
-
-                if set_dir_name is None:
-                    save_dir_name = (
-                        f"fold_{fold_index:02d}_split_{int(set_split_seed)}_train_{int(fold_train_seed)}")
-                else:
-                    save_dir_name = f"{set_dir_name}/fold_{fold_index:02d}"
-
-                run_plans.append(
-                    RunPlan(
-                        run_index=global_run_index,
-                        train_mode=args.train_mode,
-                        split_seed=int(set_split_seed),
-                        train_seed=int(fold_train_seed),
-                        train_ids_all=list(train_ids_all),
-                        val_ids_all=list(val_ids_all),
-                        save_dir_name=save_dir_name,
-                        fold_index=fold_index,
-                        n_folds=n_folds,
-                        ensemble_set_index=set_index,
-                        ensemble_set_split_seed=int(set_split_seed),
-                        ensemble_set_train_seed=int(set_train_seed),
-                        ensemble_set_dir_name=set_dir_name
-                    )
-                )
-                global_run_index += 1
-
-        split_meta: Dict[str, Any] = {
-            "split_seeds": [int(x) for x in set_split_seeds],
-            "train_seeds": [int(x) for x in set_train_seeds],
-            "n_folds": int(n_folds),
-            "n_sets": int(n_sets),
-            "ensemble_seed_mode": ensemble_seed_mode
-        }
-        if args.fold_seed is not None:
-            split_meta["fold_seed"] = int(args.fold_seed)
-        if ensemble_seed_mode == "legacy-per-fold-train-seeds":
-            split_meta["ensemble_train_seeds_per_fold"] = [
-                int(x) for x in legacy_per_fold_train_seeds
-            ]
-        return run_plans, split_meta
-
-    # seeded/single mode (backward-compatible default)
     if args.split_seeds is None and args.train_seeds is None:
         split_seeds = [int(args.seed)]
         train_seeds = [int(args.seed)]
@@ -778,36 +696,105 @@ def _build_run_plans(
             "--split-seeds and --train-seeds must be the same length"
         )
 
+    n_sets = len(split_seeds)
+    train_mode = _legacy_train_mode_label(n_folds)
+
+    if n_folds == 1:
+        run_plans: List[RunPlan] = []
+        for run_index, (split_seed, train_seed) in enumerate(zip(split_seeds, train_seeds), start=1):
+            if args.split_type == "id-family":
+                train_ids_all, val_ids_all = split_ids_grouped(
+                    protein_ids, args.val_frac, split_seed, family_groups
+                )
+                _check_family_leakage(train_ids_all, val_ids_all, family_groups)
+            else:
+                train_ids_all, val_ids_all = split_ids(
+                    protein_ids, args.val_frac, split_seed
+                )
+
+            if len(train_ids_all) == 0:
+                raise ValueError("Global split produced 0 train IDs")
+
+            run_plans.append(
+                RunPlan(
+                    run_index=run_index,
+                    train_mode=train_mode,
+                    split_seed=int(split_seed),
+                    train_seed=int(train_seed),
+                    train_ids_all=list(train_ids_all),
+                    val_ids_all=list(val_ids_all),
+                    save_dir_name=f"run_{run_index:03d}_split_{int(split_seed)}_train_{int(train_seed)}",
+                    n_folds=1
+                )
+            )
+
+        return run_plans, {
+            "split_seeds": [int(x) for x in split_seeds],
+            "train_seeds": [int(x) for x in train_seeds],
+            "n_folds": 1,
+            "n_sets": int(n_sets),
+            "train_mode": train_mode
+        }
+
     run_plans = []
-    for run_index, (split_seed, train_seed) in enumerate(zip(split_seeds, train_seeds), start=1):
+    global_run_index = 1
+    for set_index, (set_split_seed, set_train_seed) in enumerate(
+        zip(split_seeds, train_seeds),
+        start=1
+    ):
         if args.split_type == "id-family":
-            train_ids_all, val_ids_all = split_ids_grouped(
-                protein_ids, args.val_frac, split_seed, family_groups
+            fold_splits = build_grouped_kfold_splits(
+                protein_ids, n_folds=n_folds, seed=int(set_split_seed), groups=family_groups
             )
-            _check_family_leakage(train_ids_all, val_ids_all, family_groups)
         else:
-            train_ids_all, val_ids_all = split_ids(
-                protein_ids, args.val_frac, split_seed
+            fold_splits = build_kfold_splits(
+                protein_ids, n_folds=n_folds, seed=int(set_split_seed)
             )
 
-        if len(train_ids_all) == 0:
-            raise ValueError("Global split produced 0 train IDs")
+        if n_sets > 1:
+            set_dir_name = f"set_{set_index:03d}_split_{int(set_split_seed)}_train_{int(set_train_seed)}"
+        else:
+            set_dir_name = None
 
-        run_plans.append(
-            RunPlan(
-                run_index=run_index,
-                train_mode=args.train_mode,
-                split_seed=int(split_seed),
-                train_seed=int(train_seed),
-                train_ids_all=list(train_ids_all),
-                val_ids_all=list(val_ids_all),
-                save_dir_name=f"run_{run_index:03d}_split_{int(split_seed)}_train_{int(train_seed)}"
+        for fold_index, (train_ids_all, val_ids_all) in enumerate(fold_splits, start=1):
+            if args.split_type == "id-family":
+                _check_family_leakage(
+                    train_ids_all, val_ids_all, family_groups)
+
+            fold_train_seed = int(set_train_seed)
+
+            if set_dir_name is None:
+                save_dir_name = (
+                    f"fold_{fold_index:02d}_split_{int(set_split_seed)}_train_{int(fold_train_seed)}")
+            else:
+                save_dir_name = f"{set_dir_name}/fold_{fold_index:02d}"
+
+            run_plans.append(
+                RunPlan(
+                    run_index=global_run_index,
+                    train_mode=train_mode,
+                    split_seed=int(set_split_seed),
+                    train_seed=int(fold_train_seed),
+                    train_ids_all=list(train_ids_all),
+                    val_ids_all=list(val_ids_all),
+                    save_dir_name=save_dir_name,
+                    fold_index=fold_index,
+                    n_folds=n_folds,
+                    ensemble_set_index=set_index,
+                    ensemble_set_split_seed=int(set_split_seed),
+                    ensemble_set_train_seed=int(set_train_seed),
+                    ensemble_set_dir_name=set_dir_name
+                )
             )
-        )
+            global_run_index += 1
 
     return run_plans, {
         "split_seeds": [int(x) for x in split_seeds],
-        "train_seeds": [int(x) for x in train_seeds]
+        "train_seeds": [int(x) for x in train_seeds],
+        "n_folds": int(n_folds),
+        "n_sets": int(n_sets),
+        "ensemble_seed_mode": "set-paired",
+        "train_mode": train_mode
     }
 
 
@@ -904,11 +891,6 @@ def main() -> None:
                         default="id-family",
                         choices=["id", "id-family"],
                         help="Data partition type, use ID only or ID and taxonomic family.")
-    parser.add_argument("--train-mode",
-                        type=str,
-                        default="seeded",
-                        choices=["seeded", "ensemble-kfold"],
-                        help="Training mode: seeded (single/multi-seed runs) or ensemble-kfold.")
     parser.add_argument("--num-workers",
                         action="store",
                         dest="num_workers",
@@ -953,23 +935,15 @@ def main() -> None:
     parser.add_argument("--split-seeds",
                         type=str,
                         default=None,
-                        help="CSV split seeds (e.g., 11,22,33). In ensemble-kfold mode, each split seed defines one K-fold set.")
+                        help="CSV split seeds (e.g., 11,22,33). Each split seed defines one run set.")
     parser.add_argument("--train-seeds",
                         type=str,
                         default=None,
-                        help="CSV train seeds (e.g., 44,55,66). In ensemble-kfold mode, each train seed pairs with one split seed to define one K-fold set.")
+                        help="CSV train seeds (e.g., 44,55,66). Each train seed pairs with one split seed by index.")
     parser.add_argument("--n-folds",
                         type=int,
-                        default=5,
-                        help="Number of folds for --train-mode ensemble-kfold.")
-    parser.add_argument("--fold-seed",
-                        type=int,
-                        default=None,
-                        help="Seed for fold assignment in single-set ensemble-kfold fallback mode (default: --seed).")
-    parser.add_argument("--ensemble-train-seeds",
-                        type=str,
-                        default=None,
-                        help="Legacy single-set ensemble mode only: CSV per-fold train seeds; length must equal --n-folds.")
+                        default=1,
+                        help="Number of folds per set. Use 1 for holdout split mode and >1 for K-fold ensemble mode.")
     parser.add_argument("--best-model-metric",
                         type=str,
                         default="loss",
@@ -986,7 +960,7 @@ def main() -> None:
                         default=False,
                         help=(
                             "If set, save per-epoch validation ROC/PR curve data and plots. "
-                            "In ensemble-kfold mode, also writes set-level fold consistency ROC/PR plots "
+                            "When --n-folds > 1, also writes set-level fold consistency ROC/PR plots "
                             "using each fold's best epoch."
                         ))
     parser.add_argument("--val-curve-max-points",
@@ -1004,9 +978,21 @@ def main() -> None:
     parser.add_argument("--ensemble-manifest",
                         type=Path,
                         default=None,
-                        help="Optional JSON output path for ensemble manifest (written in ensemble-kfold mode).")
+                        help="Optional JSON output path for ensemble manifest (written when --n-folds > 1).")
 
-    args = parser.parse_args()
+    args, unknown = parser.parse_known_args()
+    legacy_flags = _match_legacy_train_flags(unknown)
+    if len(legacy_flags) > 0:
+        details = " ".join(
+            f"{flag}: {_LEGACY_TRAIN_FLAGS[flag]}"
+            for flag in legacy_flags
+        )
+        raise ValueError(
+            "Legacy train-mode flags are no longer supported. "
+            + details
+        )
+    if len(unknown) > 0:
+        parser.error(f"unrecognized arguments: {' '.join(unknown)}")
     logger = setup_logger(json_lines=True,
                           json_indent=2,
                           name="train_ffnn_cli")
@@ -1096,16 +1082,15 @@ def main() -> None:
     run_plans, split_meta = _build_run_plans(args, protein_ids, family_groups)
     if rank == 0:
         logger.info("run_plan_init", extra={"extra": {
-            "train_mode": args.train_mode,
+            "train_mode": str(split_meta["train_mode"]),
             "n_runs": len(run_plans),
             "split_type": args.split_type,
             "missing_family_ids": missing_family_ids,
             "n_folds": int(split_meta["n_folds"]) if "n_folds" in split_meta else None,
             "n_sets": int(split_meta["n_sets"]) if "n_sets" in split_meta else None,
-            "fold_seed": int(split_meta["fold_seed"]) if "fold_seed" in split_meta else None,
             "ensemble_seed_mode": split_meta.get("ensemble_seed_mode")
         }})
-        if args.train_mode == "ensemble-kfold":
+        if int(split_meta["n_folds"]) > 1:
             logger.info("ensemble_kfold_note", extra={"extra": {
                 "message": "--val-frac is ignored in ensemble-kfold mode because folds define validation sets."
             }})
@@ -1375,7 +1360,7 @@ def main() -> None:
         df_runs = pd.DataFrame(run_rows)
         summary_payload = {
             "n_runs": int(len(run_rows)),
-            "train_mode": str(args.train_mode),
+            "train_mode": str(split_meta["train_mode"]),
             "split_type": str(args.split_type),
             "best_model_metric": str(args.best_model_metric),
             "split_seeds": [int(x) for x in split_meta["split_seeds"]],
@@ -1396,15 +1381,9 @@ def main() -> None:
             summary_payload["n_folds"] = int(split_meta["n_folds"])
         if "n_sets" in split_meta:
             summary_payload["n_sets"] = int(split_meta["n_sets"])
-        if "fold_seed" in split_meta:
-            summary_payload["fold_seed"] = int(split_meta["fold_seed"])
         if "ensemble_seed_mode" in split_meta:
             summary_payload["ensemble_seed_mode"] = str(
                 split_meta["ensemble_seed_mode"])
-        if "ensemble_train_seeds_per_fold" in split_meta:
-            summary_payload["ensemble_train_seeds_per_fold"] = [
-                int(x) for x in split_meta["ensemble_train_seeds_per_fold"]
-            ]
         summary_path = args.save_path / "multi_run_summary.json"
         summary_path.write_text(
             json.dumps(_sanitize_for_json(summary_payload),
@@ -1412,7 +1391,7 @@ def main() -> None:
             encoding="utf-8"
         )
 
-        if args.train_mode == "ensemble-kfold":
+        if int(split_meta["n_folds"]) > 1:
             n_sets = int(split_meta.get("n_sets", 1))
             sets_map: Dict[int, Dict[str, Any]] = {}
             for row in run_rows:
@@ -1500,7 +1479,7 @@ def main() -> None:
                 set_payload = {
                     "schema_version": 1,
                     "ensemble_type": "kfold_majority_vote",
-                    "train_mode": str(args.train_mode),
+                    "train_mode": str(split_meta["train_mode"]),
                     "split_type": str(args.split_type),
                     "n_folds": int(split_meta["n_folds"]),
                     "set_index": int(entry["set_index"]),
@@ -1549,7 +1528,7 @@ def main() -> None:
                 root_manifest_payload = {
                     "schema_version": 2,
                     "ensemble_type": "kfold_majority_vote",
-                    "train_mode": str(args.train_mode),
+                    "train_mode": str(split_meta["train_mode"]),
                     "split_type": str(args.split_type),
                     "n_folds": int(split_meta["n_folds"]),
                     "n_sets": int(n_sets),

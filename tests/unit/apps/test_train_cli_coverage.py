@@ -89,6 +89,32 @@ def test_train_cli_helper_parsers_and_numeric_summary():
         train_cli._parse_plot_formats("png,jpg")
 
 
+@pytest.mark.parametrize(
+    ("legacy_flag", "legacy_value"),
+    [
+        ("--train-mode", "ensemble-kfold"),
+        ("--fold-seed", "17"),
+        ("--ensemble-train-seeds", "11,12"),
+    ],
+)
+def test_train_ffnn_cli_rejects_removed_legacy_mode_flags(
+    legacy_flag: str, legacy_value: str
+):
+    with pytest.raises(ValueError, match="Legacy train-mode flags are no longer supported"):
+        _run_main(
+            train_cli.main,
+            [
+                "train_ffnn_cli.py",
+                "--embedding-dirs",
+                "dummy_embedding_dir",
+                "--label-shards",
+                "dummy_labels.pt",
+                legacy_flag,
+                legacy_value,
+            ],
+        )
+
+
 def test_train_ffnn_cli_real_no_valid_score_with_val_curve_artifacts():
     case_dir = _mk_case_dir("ffnn_no_valid")
     emb_dir, label_shard = _write_training_artifacts(
@@ -180,8 +206,6 @@ def test_train_ffnn_cli_real_ensemble_manifest_generation():
                 "8",
                 "--dropouts",
                 "0.1",
-                "--train-mode",
-                "ensemble-kfold",
                 "--split-type",
                 "id-family",
                 "--n-folds",

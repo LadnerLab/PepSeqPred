@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pepseqpred"
-version = "1.1.0"
+version = "1.1.1"
 description = "Residue-level epitope prediction pipeline for peptide/protein workflows."
 readme = "README.pypi.md"
 requires-python = ">=3.12"

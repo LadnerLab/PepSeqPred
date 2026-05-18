@@ -52,7 +52,7 @@ The repository profile is the source of truth for reproducing experiments end-to
 Stage 1  normalize dataset inputs (PV1/CWP/BKP) to a shared training contract
 Stage 2  generate ESM-2 per-residue embeddings
 Stage 3  build residue-level label shards
-Stage 4  train FFNN (seeded or ensemble-kfold, DDP-aware)
+Stage 4  train FFNN (unified n-fold interface, DDP-aware)
 Stage 5  optional Optuna tuning (DDP-aware)
 Stage 6  predict residue masks from checkpoint/manifest
 Stage 7  evaluate residue metrics (+ optional Cocci peptide compare)
@@ -62,6 +62,8 @@ Stage 7  evaluate residue metrics (+ optional Cocci peptide compare)
 
 ### Stage 1: Multi-Dataset Prepare (PV1/CWP/BKP)
 
+***Note:** [`data/sample/`](data/sample/) contains the expected dataset sample formats.  
+
 **CLI:** `pepseqpred-prepare-dataset` (`src/pepseqpred/apps/prepare_dataset_cli.py`)
 
 This stage is the recommended entrypoint when training on one or more of:
@@ -70,7 +72,7 @@ This stage is the recommended entrypoint when training on one or more of:
 - CWP/Cocci (fungal)
 - BKP (bacterial)
 
-It normalizes source-specific metadata and FASTA headers into a shared PV1-compatible contract so downstream embedding, label generation, and training CLIs can be reused unchanged.
+It normalizes source-specific metadata and FASTA headers into a shared PV1-compatible contract (i.e., ID=<ID> AC=<AC> OXX=<OXX>) so downstream embedding, label generation, and training CLIs can be reused unchanged.
 
 **Core module**
 
@@ -91,11 +93,11 @@ It normalizes source-specific metadata and FASTA headers into a shared PV1-compa
 
 ```bash
 pepseqpred-prepare-dataset \
-  localdata/PV1/PV1_meta_2020-11-23_cleaned.tsv \
-  localdata/PV1/prepared \
+  data/PV1/PV1_meta_2020-11-23_cleaned.tsv \
+  data/PV1/prepared \
   --dataset-kind pv1 \
-  --protein-fasta localdata/PV1/PV1_targets.fasta \
-  --z-file localdata/PV1/PV1_zscores.tsv
+  --protein-fasta data/PV1/PV1_targets.fasta \
+  --z-file data/PV1/PV1_zscores.tsv
 ```
 
 **CWP/Cocci inputs and command**
@@ -107,12 +109,12 @@ pepseqpred-prepare-dataset \
 
 ```bash
 pepseqpred-prepare-dataset \
-  localdata/Cocci/CWP_metadata.tsv \
-  localdata/Cocci/prepared \
+  data/Cocci/CWP_metadata.tsv \
+  data/Cocci/prepared \
   --dataset-kind cwp \
-  --protein-fasta localdata/Cocci/CWP_targets.faa \
-  --reactive-codes localdata/Cocci/CWP_reactive_Z20N4.tsv \
-  --nonreactive-codes localdata/Cocci/CWP_nonreactive_Z20N4.tsv
+  --protein-fasta data/Cocci/CWP_targets.faa \
+  --reactive-codes data/Cocci/CWP_reactive_Z20N4.tsv \
+  --nonreactive-codes data/Cocci/CWP_nonreactive_Z20N4.tsv
 ```
 
 **BKP inputs and command**
@@ -124,12 +126,12 @@ pepseqpred-prepare-dataset \
 
 ```bash
 pepseqpred-prepare-dataset \
-  localdata/BKP/BKP_metadata.tsv \
-  localdata/BKP/prepared \
+  data/BKP/BKP_metadata.tsv \
+  data/BKP/prepared \
   --dataset-kind bkp \
-  --protein-fasta localdata/BKP/BKP.faa \
-  --reactive-codes localdata/BKP/BKP_reactive_Z20N4.tsv \
-  --nonreactive-codes localdata/BKP/BKP_nonreactive_Z20N4.tsv
+  --protein-fasta data/BKP/BKP.faa \
+  --reactive-codes data/BKP/BKP_reactive_Z20N4.tsv \
+  --nonreactive-codes data/BKP/BKP_nonreactive_Z20N4.tsv
 ```
 
 **Dataset-specific grouping used for leakage-aware splitting (`--split-type id-family`)**
@@ -150,7 +152,7 @@ pepseqpred-prepare-dataset \
 
 **Inputs**
 
-- metadata TSV (PV1-style)
+- metadata TSV
 - z-score TSV
 
 **Core modules**
@@ -190,7 +192,7 @@ pepseqpred-preprocess data/meta.tsv data/zscores.tsv --save
 ```bash
 pepseqpred-esm \
   --fasta-file data/targets.fasta \
-  --out-dir localdata/esm2 \
+  --out-dir data/esm2 \
   --embedding-key-mode id-family \
   --key-delimiter - \
   --model-name esm2_t33_650M_UR50D \
@@ -222,8 +224,8 @@ pepseqpred-esm \
 ```bash
 pepseqpred-labels \
   data/input_data_20_4_10_all.tsv \
-  localdata/labels/labels_shard_000.pt \
-  --emb-dir localdata/esm2/artifacts/pts/shard_000 \
+  data/labels/labels_shard_000.pt \
+  --emb-dir data/esm2/artifacts/pts/shard_000 \
   --restrict-to-embeddings \
   --calc-pos-weight \
   --embedding-key-delim -
@@ -238,10 +240,11 @@ pepseqpred-labels \
 
 **CLI:** `pepseqpred-train-ffnn` (`src/pepseqpred/apps/train_ffnn_cli.py`)
 
-**Modes**
+**Unified run interface**
 
-- `seeded`: split/train seed pairs define runs
-- `ensemble-kfold`: K-fold members per set, optional multiple set seeds
+- `--n-folds 1`: one holdout run per split/train seed pair (uses `--val-frac`)
+- `--n-folds K` (`K > 1`): K-fold members per split/train seed pair set
+- `--split-seeds` and `--train-seeds` are paired by index; if both are omitted, both default to `--seed`
 
 **Core modules**
 
@@ -253,12 +256,12 @@ pepseqpred-labels \
 
 ```bash
 pepseqpred-train-ffnn \
-  --embedding-dirs localdata/esm2/artifacts/pts/shard_000 \
-  --label-shards localdata/labels/labels_shard_000.pt \
+  --embedding-dirs data/esm2/artifacts/pts/shard_000 \
+  --label-shards data/labels/labels_shard_000.pt \
   --epochs 1 \
   --subset 100 \
-  --save-path localdata/models/ffnn_smoke \
-  --results-csv localdata/models/ffnn_smoke/runs.csv
+  --save-path data/models/ffnn_smoke \
+  --results-csv data/models/ffnn_smoke/runs.csv
 ```
 
 **Submit one SLURM training job with multiple datasets (PV1 + CWP + BKP)**
@@ -314,7 +317,7 @@ Notes:
 - run checkpoint(s), usually `fully_connected.pt`
 - per-run CSV (`runs.csv` or `multi_run_results.csv`)
 - aggregate `multi_run_summary.json`
-- ensemble manifest JSON in `ensemble-kfold` mode
+- ensemble manifest JSON when `--n-folds > 1`
 
 ### Stage 5: Optuna Tuning (Optional)
 
@@ -329,13 +332,49 @@ Notes:
 
 ```bash
 pepseqpred-train-ffnn-optuna \
-  --embedding-dirs localdata/esm2/artifacts/pts/shard_000 \
-  --label-shards localdata/labels/labels_shard_000.pt \
+  --embedding-dirs data/esm2/artifacts/pts/shard_000 \
+  --label-shards data/labels/labels_shard_000.pt \
   --n-trials 2 \
   --epochs 1 \
-  --save-path localdata/models/optuna_smoke \
-  --csv-path localdata/models/optuna_smoke/trials.csv
+  --save-path data/models/optuna_smoke \
+  --csv-path data/models/optuna_smoke/trials.csv
 ```
+
+**Current Optuna search space**
+
+The current study samples the following hyperparameters per trial:
+
+| Hyperparameter (`best_params` key) | Type | Search space (current implementation) | Controlled by |
+| --- | --- | --- | --- |
+| `depth` | integer | `[depth_min, depth_max]` | `--depth-min`, `--depth-max` |
+| `width_step` | categorical | `{16, 32, 64}` | fixed in code |
+| `base_width` | integer | `[width_min, width_max]` with `step=width_step` | `--width-min`, `--width-max` |
+| `shape_ratio` | float | `[0.60, 0.95]` | sampled only when `--arch-mode` is `bottleneck` or `pyramid` |
+| `dropout` | float | `[0.00, 0.25]` | fixed in code |
+| `use_layer_norm` | categorical | `{True, False}` | fixed in code |
+| `use_residual` | categorical | `{True, False}` | fixed in code |
+| `learning_rate` | float (log) | `[lr_min, lr_max]` | `--lr-min`, `--lr-max` |
+| `weight_decay` | float (log) | `[wd_min, wd_max]` | `--wd-min`, `--wd-max` |
+| `batch_size` | categorical | values from `--batch-sizes` CSV | `--batch-sizes` |
+
+Architecture shaping behavior:
+
+- `--arch-mode flat`: hidden widths are `[base_width] * depth`
+- `--arch-mode bottleneck`: widths decrease by `shape_ratio` across layers
+- `--arch-mode pyramid`: widths increase by `shape_ratio` across layers
+
+Not tuned by Optuna in the current setup:
+
+- `pos_weight` (fixed for the study via `--pos-weight`, or computed once from label shards if omitted)
+- split strategy and validation fraction (`--split-type`, `--val-frac`)
+- sequence windowing (`--window-size`, `--stride`) and data-loader behavior
+- trial budget/pruning controls (`--n-trials`, `--epochs`, `--pruner-warmup`, `--timeout-s`)
+- optimization target metric selection (`--metric`) is user-selected, then maximized by Optuna
+
+HPC default override note:
+
+- The CLI default for `--batch-sizes` is `32,64,128`.
+- The SLURM wrapper `scripts/hpc/trainffnnoptuna.sh` currently overrides this to `256,512,1024` unless changed via env var.
 
 **Outputs**
 
@@ -362,9 +401,9 @@ pepseqpred-train-ffnn-optuna \
 
 ```bash
 pepseqpred-predict \
-  localdata/models/run_001/fully_connected.pt \
+  data/models/run_001/fully_connected.pt \
   data/inference_targets.fasta \
-  --output-fasta localdata/predictions/predictions.fasta
+  --output-fasta data/predictions/predictions.fasta
 ```
 
 **Output**
@@ -393,10 +432,10 @@ pepseqpred-predict \
 
 ```bash
 pepseqpred-eval-ffnn \
-  localdata/models/run_001/fully_connected.pt \
-  --embedding-dirs localdata/esm2/artifacts/pts/shard_000 \
-  --label-shards localdata/labels/labels_shard_000.pt \
-  --output-json localdata/eval/ffnn_eval_summary.json
+  data/models/run_001/fully_connected.pt \
+  --embedding-dirs data/esm2/artifacts/pts/shard_000 \
+  --label-shards data/labels/labels_shard_000.pt \
+  --output-json data/eval/ffnn_eval_summary.json
 ```
 
 **Output**
@@ -473,7 +512,7 @@ Bundled pretrained registry currently includes:
 | `pepseqpred-preprocess` | `apps/preprocess_cli.py` | metadata + z-score preprocessing |
 | `pepseqpred-esm` | `apps/esm_cli.py` | ESM-2 embedding generation |
 | `pepseqpred-labels` | `apps/labels_cli.py` | residue label shard generation |
-| `pepseqpred-train-ffnn` | `apps/train_ffnn_cli.py` | seeded or ensemble-kfold training |
+| `pepseqpred-train-ffnn` | `apps/train_ffnn_cli.py` | unified holdout/K-fold FFNN training (`--n-folds`) |
 | `pepseqpred-train-ffnn-optuna` | `apps/train_ffnn_optuna_cli.py` | Optuna tuning |
 | `pepseqpred-predict` | `apps/prediction_cli.py` | FASTA inference from checkpoint/manifest |
 | `pepseqpred-eval-ffnn` | `apps/evaluate_ffnn_cli.py` | residue-level evaluation |
@@ -490,7 +529,7 @@ These wrappers are production-facing interfaces and should be treated as first-c
 | `trainffnnoptuna.sh` | Optuna | GPU, `4xa100`, `20` CPU, `448G`, `48:00:00` |
 | `predictepitope.sh` | Predict | GPU, `a100`, `4` CPU, `32G`, `00:30:00` |
 | `evaluateffnn.sh` | End-to-end eval pipeline | GPU, `a100`, `8` CPU, `128G`, `04:00:00` |
-| `evalffnnsweep.sh` | Seeded eval batch submitter | wrapper script (calls `evaluateffnn.sh`) |
+| `evalffnnsweep.sh` | Set-indexed eval batch submitter | wrapper script (calls `evaluateffnn.sh`) |
 | `preprocessdata.sh` | Preprocess helper | local helper, not a SLURM script |
 
 ### Important HPC notes

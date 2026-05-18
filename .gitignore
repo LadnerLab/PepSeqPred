@@ -67,3 +67,8 @@ pytest-*.xml
 !web/public/assets/**/*.svg
 node_modules/
 .next/
+
+# Sample data
+!data/sample/peptide-metadata.tsv
+!data/sample/reactivity-zscore.tsv
+!data/sample/protein-targets.fasta

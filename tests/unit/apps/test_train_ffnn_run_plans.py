@@ -7,13 +7,10 @@ pytestmark = pytest.mark.unit
 
 def _args(**overrides):
     base = argparse.Namespace(
-        train_mode="ensemble-kfold",
         n_folds=2,
         split_seeds=None,
         train_seeds=None,
-        fold_seed=None,
         seed=42,
-        ensemble_train_seeds=None,
         split_type="id-family",
         val_frac=0.5,
     )
@@ -22,9 +19,8 @@ def _args(**overrides):
     return base
 
 
-def test_build_run_plans_ensemble_set_pairs_map_to_full_kfold_sets():
+def test_build_run_plans_kfold_set_pairs_map_to_full_kfold_sets():
     args = _args(
-        train_mode="ensemble-kfold",
         n_folds=2,
         split_seeds="101,202",
         train_seeds="11,22",
@@ -41,6 +37,7 @@ def test_build_run_plans_ensemble_set_pairs_map_to_full_kfold_sets():
     assert meta["n_folds"] == 2
     assert meta["split_seeds"] == [101, 202]
     assert meta["train_seeds"] == [11, 22]
+    assert meta["train_mode"] == "ensemble-kfold"
     assert meta["ensemble_seed_mode"] == "set-paired"
 
     set_1 = [plan for plan in plans if plan.ensemble_set_index == 1]
@@ -70,7 +67,6 @@ def test_build_run_plans_ensemble_set_pairs_map_to_full_kfold_sets():
 
 def test_build_run_plans_ensemble_set_pairs_require_matching_lengths():
     args = _args(
-        train_mode="ensemble-kfold",
         n_folds=2,
         split_seeds="101,202",
         train_seeds="11",
@@ -82,45 +78,36 @@ def test_build_run_plans_ensemble_set_pairs_require_matching_lengths():
         _build_run_plans(args, ids, {})
 
 
-def test_build_run_plans_ensemble_legacy_per_fold_train_seeds():
+def test_build_run_plans_single_fold_keeps_holdout_behavior():
     args = _args(
-        train_mode="ensemble-kfold",
-        n_folds=2,
-        split_seeds=None,
-        train_seeds=None,
-        fold_seed=17,
-        seed=5,
-        ensemble_train_seeds="11,12",
-        split_type="id",
-    )
-    ids = ["p1", "p2", "p3", "p4"]
-
-    plans, meta = _build_run_plans(args, ids, {})
-
-    assert len(plans) == 2
-    assert meta["ensemble_seed_mode"] == "legacy-per-fold-train-seeds"
-    assert meta["ensemble_train_seeds_per_fold"] == [11, 12]
-    assert all(plan.split_seed == 17 for plan in plans)
-    assert [plan.train_seed for plan in plans] == [11, 12]
-    assert [plan.ensemble_set_index for plan in plans] == [1, 1]
-
-
-def test_build_run_plans_seeded_mode_keeps_prior_behavior():
-    args = _args(
-        train_mode="seeded",
+        n_folds=1,
         split_seeds="11,22",
         train_seeds="101,202",
         split_type="id",
-        val_frac=0.5,
     )
     ids = ["p1", "p2", "p3", "p4"]
 
     plans, meta = _build_run_plans(args, ids, {})
 
     assert len(plans) == 2
-    assert [plan.run_index for plan in plans] == [1, 2]
     assert [plan.split_seed for plan in plans] == [11, 22]
     assert [plan.train_seed for plan in plans] == [101, 202]
+    assert all(plan.train_mode == "seeded" for plan in plans)
+    assert all(plan.n_folds == 1 for plan in plans)
+    assert all(plan.fold_index is None for plan in plans)
     assert all(plan.ensemble_set_index is None for plan in plans)
+    assert all(plan.save_dir_name.startswith("run_") for plan in plans)
+    assert all(len(plan.train_ids_all) > 0 for plan in plans)
     assert meta["split_seeds"] == [11, 22]
     assert meta["train_seeds"] == [101, 202]
+    assert meta["n_folds"] == 1
+    assert meta["n_sets"] == 2
+    assert meta["train_mode"] == "seeded"
+
+
+def test_build_run_plans_requires_n_folds_at_least_one():
+    args = _args(n_folds=0, split_type="id")
+    ids = ["p1", "p2", "p3", "p4"]
+
+    with pytest.raises(ValueError, match="--n-folds must be >= 1"):
+        _build_run_plans(args, ids, {})

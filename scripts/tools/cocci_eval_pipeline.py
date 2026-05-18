@@ -65,7 +65,7 @@ def parse_protein_id_from_prediction_header(header: str) -> str:
 
 
 def build_fullname(protein_id: str, oxx: str) -> str:
-    """Builds canonical PV1-style fullname."""
+    """Builds canonical PV1-style fullname (i.e., ID=<ID> AC=<AC> OXX=<OXX>)."""
     return f"ID={protein_id} AC={protein_id} OXX={oxx}"
 
 

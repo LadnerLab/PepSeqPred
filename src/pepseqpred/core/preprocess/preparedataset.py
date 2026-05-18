@@ -3,7 +3,7 @@
 Dataset normalization adapter for multi-source training preparation.
 
 This module converts PV1/CWP/BKP source inputs into a common PV1-compatible
-contract used by existing embedding, label, and training CLIs.
+contract (i.e., ID=<ID> AC=<AC> OXX=<OXX>) used by existing embedding, label, and training CLIs.
 """
 import csv
 import json
@@ -16,7 +16,7 @@ from pepseqpred.core.preprocess.pv1 import preprocess as preprocess_pv1
 
 
 def _build_fullname(protein_id: str, group_numeric: int) -> str:
-    """Builds a PV1-style fullname for normalized outputs."""
+    """Builds a PV1-style fullname (i.e., ID=<ID> AC=<AC> OXX=<OXX>) for normalized outputs."""
     return f"ID={protein_id} AC={protein_id} OXX=0,0,0,{int(group_numeric)}"
 
 
@@ -140,7 +140,7 @@ def _build_nonpv1_fasta_index(fasta_path: Path | str) -> Tuple[Dict[str, str], D
 
 def _build_pv1_fasta_index(fasta_path: Path | str) -> Tuple[Dict[str, str], Dict[str, List[str]]]:
     """
-    Builds PV1 protein_id -> sequence mapping from PV1-style FASTA headers.
+    Builds PV1 protein_id -> sequence mapping from PV1-style FASTA headers (i.e., ID=<ID> AC=<AC> OXX=<OXX>).
     """
     seqs_by_id: Dict[str, List[str]] = {}
     for header, seq in _read_fasta_records(fasta_path):
@@ -620,7 +620,7 @@ def prepare_dataset(
     logger: Optional[logging.Logger] = None
 ) -> Dict[str, Any]:
     """
-    Converts dataset-specific sources into a shared PV1-compatible contract.
+    Converts dataset-specific sources into a shared PV1-compatible contract (i.e., ID=<ID> AC=<AC> OXX=<OXX>).
 
     Outputs under `output_dir`:
         - prepared_targets.fasta

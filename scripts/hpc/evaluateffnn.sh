@@ -28,7 +28,7 @@ usage() {
     echo ""
     echo "Optional environment variables:"
     echo "  USE_SRUN             default: 1 (set 0 to run without srun)"
-    echo "  DATA_DIR             default: /scratch/\$USER/data/CWP"
+    echo "  DATA_DIR             default: /scratch/\$USER/psp_data/CWP"
     echo "  EVAL_MODE            default: combined (reactive|nonreactive|combined)"
     echo "  RUN_ROOT             default: /scratch/\$USER/evals/\${SLURM_JOB_NAME}/\${EVAL_MODE}"
     echo "  SKIP_IF_EXISTS       default: 1 (skip stage when output sentinel already exists)"
@@ -38,6 +38,7 @@ usage() {
     echo "  RUN_PREDICT          default: 1"
     echo "  RUN_EVAL             default: 1"
     echo "  RUN_COMPARE          default: 1"
+    echo "  EVAL_SCRIPT          default: cocci_eval_pipeline.py (resolved from HPC working directory)"
     echo ""
     echo "Embedding/prediction/eval knobs:"
     echo "  MODEL_NAME           default: esm2_t33_650M_UR50D"
@@ -85,7 +86,7 @@ fi
 
 MODEL_ARTIFACT="$1"
 
-DATA_DIR="${DATA_DIR:-/scratch/$USER/data/CWP}"
+DATA_DIR="${DATA_DIR:-/scratch/$USER/psp_data/CWP}"
 EVAL_MODE="${EVAL_MODE:-combined}"
 RUN_ROOT_DEFAULT="/scratch/$USER/evals/${SLURM_JOB_NAME:-evaluate_ffnn}/${EVAL_MODE}"
 RUN_ROOT="${2:-${RUN_ROOT:-$RUN_ROOT_DEFAULT}}"
@@ -97,6 +98,7 @@ RUN_LABELS="${RUN_LABELS:-1}"
 RUN_PREDICT="${RUN_PREDICT:-1}"
 RUN_EVAL="${RUN_EVAL:-1}"
 RUN_COMPARE="${RUN_COMPARE:-1}"
+EVAL_SCRIPT="${EVAL_SCRIPT:-cocci_eval_pipeline.py}"
 
 MODEL_NAME="${MODEL_NAME:-esm2_t33_650M_UR50D}"
 MAX_TOKENS="${MAX_TOKENS:-1022}"
@@ -173,11 +175,22 @@ run_launcher() {
     fi
 }
 
+if [[ "${EVAL_SCRIPT}" = /* ]]; then
+    EVAL_SCRIPT_PATH="${EVAL_SCRIPT}"
+else
+    EVAL_SCRIPT_PATH="${PWD}/${EVAL_SCRIPT}"
+fi
+if [ ! -f "${EVAL_SCRIPT_PATH}" ]; then
+    echo "[evaluateffnn] ERROR: EVAL_SCRIPT not found in HPC_DIR (${PWD}): ${EVAL_SCRIPT}"
+    exit 1
+fi
+
 echo "[evaluateffnn] model_artifact=${MODEL_ARTIFACT}"
 echo "[evaluateffnn] data_dir=${DATA_DIR}"
 echo "[evaluateffnn] eval_mode=${EVAL_MODE}"
 echo "[evaluateffnn] run_root=${RUN_ROOT}"
 echo "[evaluateffnn] ensemble_set_index=${ENSEMBLE_SET_INDEX}"
+echo "[evaluateffnn] eval_script=${EVAL_SCRIPT_PATH}"
 
 if [ -n "${EXPECTED_SET_INDEX}" ] && [ "${EXPECTED_SET_INDEX}" != "${ENSEMBLE_SET_INDEX}" ]; then
     echo "[evaluateffnn] ERROR: EXPECTED_SET_INDEX=${EXPECTED_SET_INDEX} does not match ENSEMBLE_SET_INDEX=${ENSEMBLE_SET_INDEX}"
@@ -188,8 +201,8 @@ if [ "${RUN_PREP}" -eq 1 ]; then
     if [ "${SKIP_IF_EXISTS}" -eq 1 ] && [ -s "${PREP_SUMMARY_JSON}" ]; then
         echo "[prepare] skip existing: ${PREP_SUMMARY_JSON}"
     else
-        echo "[prepare] building reduced Cocci inputs"
-        python -u cocci_eval_pipeline.py prepare \
+        echo "[prepare] building reduced evaluation inputs"
+        python -u "${EVAL_SCRIPT_PATH}" prepare \
             --data-dir "${DATA_DIR}" \
             --output-dir "${PREP_DIR}" \
             --mode "${EVAL_MODE}"
@@ -334,7 +347,7 @@ if [ "${RUN_COMPARE}" -eq 1 ]; then
         echo "[compare] skip existing: ${COMPARE_JSON}"
     else
         echo "[compare] running peptide-level predicted-ones comparison"
-        python -u cocci_eval_pipeline.py compare \
+        python -u "${EVAL_SCRIPT_PATH}" compare \
             --prediction-fasta "${PRED_FASTA}" \
             --metadata-tsv "${PREP_META}" \
             --label-shard "${LABEL_SHARD}" \

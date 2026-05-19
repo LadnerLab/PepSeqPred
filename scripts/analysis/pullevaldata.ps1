@@ -1,6 +1,6 @@
-$Remote = "<USER>@monsoon.hpc.nau.edu"
-$RemoteBase = "/scratch/<USER>/evals/cocci_eval/seeded_runs"
-$LocalBase = "localdata/evals/cocci_eval/seeded_runs"
+$Remote = "jmh2338@monsoon.hpc.nau.edu"
+$RemoteBase = "/scratch/jmh2338/evals/bkp_eval/seeded_runs"
+$LocalBase = "data/evals/bkp_eval/seeded_runs"
 
 $Models = @("flagship1", "flagship2")
 $Sets = 1..10 | ForEach-Object { "set_{0:D2}" -f $_ }

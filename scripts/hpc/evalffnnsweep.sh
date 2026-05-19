@@ -2,7 +2,7 @@
 usage() {
     echo "Usage: $0 <flagship1_manifest> <flagship2_manifest>"
     echo ""
-    echo "Submits seeded Cocci evaluation jobs for two flagship ensemble manifests."
+    echo "Submits seeded evaluation jobs for two flagship ensemble manifests."
     echo "Each set uses shared prepared/embedding/label artifacts and runs:"
     echo "  predict + eval + peptide compare"
     echo ""
@@ -14,7 +14,8 @@ usage() {
     echo "  HPC_DIR      default: /home/\$USER/test"
     echo "  SHARED       default: /scratch/\$USER/evals/cocci_eval/combined"
     echo "  OUT_BASE     default: /scratch/\$USER/evals/cocci_eval/seeded_runs"
-    echo "  DATA_DIR     default: /scratch/\$USER/data/CWP"
+    echo "  DATA_DIR     default: /scratch/\$USER/psp_data/CWP"
+    echo "  EVAL_SCRIPT  default: cocci_eval_pipeline.py (set bkp_eval_pipeline.py for BKP)"
     echo "  SET_START    default: 1"
     echo "  SET_END      default: 10"
     echo "  DRY_RUN      default: 0 (1 = print sbatch commands only)"
@@ -36,7 +37,8 @@ MODEL2="$2"
 HPC_DIR="${HPC_DIR:-/home/$USER/test}"
 SHARED="${SHARED:-/scratch/$USER/evals/cocci_eval/combined}"
 OUT_BASE="${OUT_BASE:-/scratch/$USER/evals/cocci_eval/seeded_runs}"
-DATA_DIR="${DATA_DIR:-/scratch/$USER/data/CWP}"
+DATA_DIR="${DATA_DIR:-/scratch/$USER/psp_data/CWP}"
+EVAL_SCRIPT="${EVAL_SCRIPT:-cocci_eval_pipeline.py}"
 SET_START="${SET_START:-1}"
 SET_END="${SET_END:-10}"
 DRY_RUN="${DRY_RUN:-0}"
@@ -69,13 +71,13 @@ submit_one() {
 
     mkdir -p "${run_root}/prepared" "${run_root}/embeddings/artifacts" "${run_root}/labels"
 
-    # Reuse existing evaluation inputs from the shared combined run.
+    # Reuse existing evaluation inputs from the shared combined run root.
     ln -sfn "${SHARED}/prepared/eval_metadata.tsv" "${run_root}/prepared/eval_metadata.tsv"
     ln -sfn "${SHARED}/prepared/eval_proteins.fasta" "${run_root}/prepared/eval_proteins.fasta"
     ln -sfn "${SHARED}/embeddings/artifacts/pts" "${run_root}/embeddings/artifacts/pts"
     ln -sfn "${SHARED}/labels/labels_eval.pt" "${run_root}/labels/labels_eval.pt"
 
-    local exports="ALL,DATA_DIR=${DATA_DIR},EVAL_MODE=combined,ENSEMBLE_SET_INDEX=${set_index},EXPECTED_SET_INDEX=${set_index},SKIP_IF_EXISTS=0,RUN_PREP=0,RUN_EMBED=0,RUN_LABELS=0,RUN_PREDICT=1,RUN_EVAL=1,RUN_COMPARE=1,EMIT_FOLD_METRICS=1,INCLUDE_CURVES=1,PLOT_DIR=${run_root}/evaluation/plots"
+    local exports="ALL,DATA_DIR=${DATA_DIR},EVAL_SCRIPT=${EVAL_SCRIPT},EVAL_MODE=combined,ENSEMBLE_SET_INDEX=${set_index},EXPECTED_SET_INDEX=${set_index},SKIP_IF_EXISTS=0,RUN_PREP=0,RUN_EMBED=0,RUN_LABELS=0,RUN_PREDICT=1,RUN_EVAL=1,RUN_COMPARE=1,EMIT_FOLD_METRICS=1,INCLUDE_CURVES=1,PLOT_DIR=${run_root}/evaluation/plots"
 
     local cmd=(
         sbatch

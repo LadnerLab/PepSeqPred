@@ -27,6 +27,7 @@ coverage.xml
 htmlcov/
 pytest-*.xml
 *.DS_Store
+localdata/
 
 # Project-generated local data/artifacts
 *.egg-info/

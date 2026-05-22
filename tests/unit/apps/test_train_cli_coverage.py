@@ -67,6 +67,31 @@ def _run_main(entrypoint, argv: list[str]) -> None:
         sys.argv = old_argv
 
 
+def _capture_protein_dataset_calls(monkeypatch, module):
+    calls = []
+    real_dataset = module.ProteinDataset
+
+    def _wrapped_protein_dataset(*args, **kwargs):
+        calls.append(dict(kwargs))
+        return real_dataset(*args, **kwargs)
+
+    monkeypatch.setattr(module, "ProteinDataset", _wrapped_protein_dataset)
+    return calls
+
+
+def _assert_train_window_val_full_protein(calls):
+    train_val_calls = [kwargs for kwargs in calls if "protein_ids" in kwargs]
+    assert len(train_val_calls) == 2
+
+    train_kwargs, val_kwargs = train_val_calls
+    assert train_kwargs["window_size"] == 4
+    assert train_kwargs["stride"] == 2
+    assert train_kwargs["pad_last_window"] is True
+    assert val_kwargs["window_size"] is None
+    assert val_kwargs["stride"] == 1
+    assert val_kwargs["pad_last_window"] is False
+
+
 def test_train_cli_helper_parsers_and_numeric_summary():
     summary_empty = train_cli.summarize_numeric(
         pd.Series([float("nan"), float("inf"), -float("inf")])
@@ -115,12 +140,13 @@ def test_train_ffnn_cli_rejects_removed_legacy_mode_flags(
         )
 
 
-def test_train_ffnn_cli_real_no_valid_score_with_val_curve_artifacts():
+def test_train_ffnn_cli_real_no_valid_score_with_val_curve_artifacts(monkeypatch):
     case_dir = _mk_case_dir("ffnn_no_valid")
     emb_dir, label_shard = _write_training_artifacts(
         case_dir, all_uncertain=True
     )
     save_dir = case_dir / "train_out"
+    dataset_calls = _capture_protein_dataset_calls(monkeypatch, train_cli)
 
     try:
         _run_main(
@@ -137,6 +163,10 @@ def test_train_ffnn_cli_real_no_valid_score_with_val_curve_artifacts():
                 "2",
                 "--num-workers",
                 "0",
+                "--window-size",
+                "4",
+                "--stride",
+                "2",
                 "--hidden-sizes",
                 "8",
                 "--dropouts",
@@ -176,6 +206,7 @@ def test_train_ffnn_cli_real_no_valid_score_with_val_curve_artifacts():
             (save_dir / "multi_run_summary.json").read_text(encoding="utf-8")
         )
         assert int(summary["n_runs"]) == 1
+        _assert_train_window_val_full_protein(dataset_calls)
     finally:
         shutil.rmtree(case_dir, ignore_errors=True)
 
@@ -234,7 +265,7 @@ def test_train_ffnn_cli_real_ensemble_manifest_generation():
         shutil.rmtree(case_dir, ignore_errors=True)
 
 
-def test_train_ffnn_optuna_cli_real_with_storage_and_helpers():
+def test_train_ffnn_optuna_cli_real_with_storage_and_helpers(monkeypatch):
     assert optuna_cli._broadcast_params({"a": 1}, None) == {"a": 1}
 
     study = optuna.create_study(sampler=optuna.samplers.RandomSampler(seed=7))
@@ -286,6 +317,7 @@ def test_train_ffnn_optuna_cli_real_with_storage_and_helpers():
     save_dir = case_dir / "optuna_out"
     csv_path = save_dir / "trials.csv"
     storage_uri = f"sqlite:///{(case_dir / 'study.db').as_posix()}"
+    dataset_calls = _capture_protein_dataset_calls(monkeypatch, optuna_cli)
 
     try:
         _run_main(
@@ -310,6 +342,10 @@ def test_train_ffnn_optuna_cli_real_with_storage_and_helpers():
                 "2",
                 "--num-workers",
                 "0",
+                "--window-size",
+                "4",
+                "--stride",
+                "2",
                 "--metric",
                 "auc",
                 "--arch-mode",
@@ -338,5 +374,6 @@ def test_train_ffnn_optuna_cli_real_with_storage_and_helpers():
         assert best_payload["metric"] == "auc"
         assert csv_path.exists()
         assert (case_dir / "study.db").exists()
+        _assert_train_window_val_full_protein(dataset_calls)
     finally:
         shutil.rmtree(case_dir, ignore_errors=True)

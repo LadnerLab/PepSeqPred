@@ -249,13 +249,13 @@ def main() -> None:
                         dest="window_size",
                         type=int,
                         default=1000,
-                        help="Window size for long protein sequences (<= 0 to disable)")
+                        help="Training window size for long protein sequences (<= 0 to disable; validation uses full proteins)")
     parser.add_argument("--stride",
                         action="store",
                         dest="stride",
                         type=int,
                         default=900,
-                        help="Stride between windows for long proteins")
+                        help="Stride between training windows for long proteins")
     parser.add_argument("--no-collapse-labels",
                         dest="collapse_labels",
                         action="store_false",
@@ -263,7 +263,7 @@ def main() -> None:
     parser.add_argument("--no-pad-last-window",
                         dest="pad_last_window",
                         action="store_false",
-                        help="Disable padding of final short window")
+                        help="Disable padding of final short training window")
     parser.add_argument("--no-cache-label-shard",
                         dest="cache_current_label_shard",
                         action="store_false",
@@ -458,10 +458,10 @@ def main() -> None:
             protein_ids=val_ids,
             label_index=base_dataset.label_index,
             embedding_index=base_dataset.embedding_index,
-            window_size=args.window_size if args.window_size > 0 else None,
-            stride=args.stride,
+            window_size=None,
+            stride=1,
             collapse_labels=args.collapse_labels,
-            pad_last_window=args.pad_last_window,
+            pad_last_window=False,
             return_meta=False,
             cache_current_label_shard=args.cache_current_label_shard,
             drop_label_after_use=args.drop_label_after_use

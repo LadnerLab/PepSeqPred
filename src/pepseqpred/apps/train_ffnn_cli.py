@@ -48,7 +48,10 @@ from pepseqpred.core.train.split import (
     sort_ids_for_locality,
     shuffle_ids_by_group
 )
-from pepseqpred.core.train.weights import pos_weight_from_label_shards
+from pepseqpred.core.train.weights import (
+    compute_pos_neg_counts,
+    global_pos_neg_counts
+)
 from pepseqpred.core.train.embedding import infer_emb_dim
 from pepseqpred.core.train.seed import set_all_seeds
 from pepseqpred.core.io.read import parse_int_csv, parse_float_csv
@@ -867,7 +870,7 @@ def main() -> None:
                         action="store",
                         type=float,
                         default=None,
-                        help="Optionally include a pre-calculated postive class weight")
+                        help="Optional manual positive class weight; omitted means compute from the current training split")
     parser.add_argument("--save-path",
                         action="store",
                         dest="save_path",
@@ -1225,11 +1228,34 @@ def main() -> None:
             val_data, **loader_kwargs) if val_data is not None else None
 
         # compute or store positive weight
-        pos_weight = None
+        pos_weight_source = "cli"
+        train_pos_residues = None
+        train_neg_residues = None
         if args.pos_weight is not None:
             pos_weight = float(args.pos_weight)
         else:
-            pos_weight = pos_weight_from_label_shards(label_shards)
+            local_pos, local_neg = compute_pos_neg_counts(train_loader)
+            train_pos_residues, train_neg_residues = global_pos_neg_counts(
+                local_pos,
+                local_neg,
+                ddp
+            )
+            pos_weight = float(train_neg_residues / max(train_pos_residues, 1))
+            pos_weight_source = "train_loader"
+
+        if rank == 0:
+            logger.info(
+                "pos_weight_resolved",
+                extra={
+                    "extra": {
+                        "run_index": int(run_index),
+                        "source": pos_weight_source,
+                        "train_pos_residues": train_pos_residues,
+                        "train_neg_residues": train_neg_residues,
+                        "pos_weight": float(pos_weight)
+                    }
+                }
+            )
 
         # build our FFNN model
         emb_dim = infer_emb_dim(base_dataset.embedding_index)

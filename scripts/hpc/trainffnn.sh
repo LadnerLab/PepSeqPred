@@ -66,7 +66,7 @@ BATCH_SIZE="${BATCH_SIZE:-256}" # ensure batch size is 4 times what you would do
 LR="${LR:-0.001}"
 WD="${WD:-0.0}"
 VAL_FRAC="${VAL_FRAC:-0.2}"
-POS_WEIGHT="${POS_WEIGHT:-13.18999647945325}" # calculated from previous script
+POS_WEIGHT="${POS_WEIGHT:-}" # optional manual override; empty uses train-only auto-compute
 SAVE_PATH="/scratch/$USER/models/${SLURM_JOB_NAME:-ffnn_job}"
 RESULTS_CSV="${SAVE_PATH}/runs.csv"
 ENSEMBLE_MANIFEST="${ENSEMBLE_MANIFEST:-${SAVE_PATH}/ensemble_manifest.json}"
@@ -111,6 +111,11 @@ if [ "${SAVE_VAL_CURVES}" -eq 1 ]; then
     VAL_CURVE_ARGS+=(--val-plot-formats "$VAL_PLOT_FORMATS")
 fi
 
+POS_WEIGHT_ARGS=()
+if [ -n "$POS_WEIGHT" ]; then
+    POS_WEIGHT_ARGS+=(--pos-weight "$POS_WEIGHT")
+fi
+
 ${LAUNCHER} torchrun --nproc_per_node=4 train_ffnn.pyz \
     --embedding-dirs "${EMBEDDING_DIRS[@]}" \
     --label-shards "${LABEL_SHARDS[@]}" \
@@ -122,7 +127,7 @@ ${LAUNCHER} torchrun --nproc_per_node=4 train_ffnn.pyz \
     --batch-size "$BATCH_SIZE" \
     --lr "$LR" \
     --wd "$WD" \
-    --pos-weight "$POS_WEIGHT" \
+    "${POS_WEIGHT_ARGS[@]}" \
     --best-model-metric "$BEST_MODEL_METRIC" \
     --val-frac "$VAL_FRAC" \
     --split-type "$SPLIT_TYPE" \

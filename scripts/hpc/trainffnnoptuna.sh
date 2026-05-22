@@ -61,7 +61,7 @@ SUBSET="${SUBSET:-0}"
 NUM_WORKERS="${NUM_WORKERS:-1}"
 WINDOW_SIZE="${WINDOW_SIZE:-1000}"
 STRIDE="${STRIDE:-900}"
-POS_WEIGHT="${POS_WEIGHT:-13.18999647945325}" # calculated from other script
+POS_WEIGHT="${POS_WEIGHT:-}" # optional manual override; empty uses train-only auto-compute
 SPLIT_TYPE="${SPLIT_TYPE:-id-family}" # id-family or id
 
 # output paths
@@ -113,6 +113,11 @@ fi
 DDP_TIMEOUT_MIN="${DDP_TIMEOUT_MIN:-60}"
 export PEPSEQPRED_DDP_TIMEOUT_MIN="$DDP_TIMEOUT_MIN"
 
+POS_WEIGHT_ARGS=()
+if [ -n "$POS_WEIGHT" ]; then
+    POS_WEIGHT_ARGS+=(--pos-weight "$POS_WEIGHT")
+fi
+
 ${LAUNCHER} torchrun --nproc_per_node=4 train_ffnn_optuna.pyz \
     --embedding-dirs "${EMBEDDING_DIRS[@]}" \
     --label-shards "${LABEL_SHARDS[@]}" \
@@ -138,7 +143,7 @@ ${LAUNCHER} torchrun --nproc_per_node=4 train_ffnn_optuna.pyz \
     --lr-max "$LR_MAX" \
     --wd-min "$WD_MIN" \
     --wd-max "$WD_MAX" \
-    --pos-weight "$POS_WEIGHT" \
+    "${POS_WEIGHT_ARGS[@]}" \
     --pruner-warmup "$PRUNER_WARMUP" \
     --timeout-s "$TIMEOUT_S" \
     --window-size "$WINDOW_SIZE" \

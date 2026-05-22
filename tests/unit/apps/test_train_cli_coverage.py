@@ -92,6 +92,25 @@ def _assert_train_window_val_full_protein(calls):
     assert val_kwargs["pad_last_window"] is False
 
 
+def _capture_pos_weight_resolution(monkeypatch, module, *, counts: tuple[int, int]):
+    calls = {"count": 0, "global": 0}
+
+    def _compute_pos_neg_counts(loader):
+        assert loader is not None
+        calls["count"] += 1
+        return counts
+
+    def _global_pos_neg_counts(local_pos, local_neg, ddp):
+        _ = ddp
+        calls["global"] += 1
+        assert (local_pos, local_neg) == counts
+        return local_pos, local_neg
+
+    monkeypatch.setattr(module, "compute_pos_neg_counts", _compute_pos_neg_counts)
+    monkeypatch.setattr(module, "global_pos_neg_counts", _global_pos_neg_counts)
+    return calls
+
+
 def test_train_cli_helper_parsers_and_numeric_summary():
     summary_empty = train_cli.summarize_numeric(
         pd.Series([float("nan"), float("inf"), -float("inf")])
@@ -112,6 +131,18 @@ def test_train_cli_helper_parsers_and_numeric_summary():
         train_cli._parse_plot_formats(",,")
     with pytest.raises(ValueError, match="Unsupported"):
         train_cli._parse_plot_formats("png,jpg")
+
+
+def test_hpc_scripts_only_pass_pos_weight_when_env_is_set():
+    for script in [
+        Path("scripts/hpc/trainffnn.sh"),
+        Path("scripts/hpc/trainffnnoptuna.sh")
+    ]:
+        text = script.read_text(encoding="utf-8")
+        assert "13.18999647945325" not in text
+        assert 'POS_WEIGHT="${POS_WEIGHT:-}"' in text
+        assert 'POS_WEIGHT_ARGS+=(--pos-weight "$POS_WEIGHT")' in text
+        assert '"${POS_WEIGHT_ARGS[@]}"' in text
 
 
 @pytest.mark.parametrize(
@@ -147,6 +178,11 @@ def test_train_ffnn_cli_real_no_valid_score_with_val_curve_artifacts(monkeypatch
     )
     save_dir = case_dir / "train_out"
     dataset_calls = _capture_protein_dataset_calls(monkeypatch, train_cli)
+    pos_weight_calls = _capture_pos_weight_resolution(
+        monkeypatch,
+        train_cli,
+        counts=(2, 8)
+    )
 
     try:
         _run_main(
@@ -207,16 +243,23 @@ def test_train_ffnn_cli_real_no_valid_score_with_val_curve_artifacts(monkeypatch
         )
         assert int(summary["n_runs"]) == 1
         _assert_train_window_val_full_protein(dataset_calls)
+        assert pos_weight_calls == {"count": 1, "global": 1}
     finally:
         shutil.rmtree(case_dir, ignore_errors=True)
 
 
-def test_train_ffnn_cli_real_ensemble_manifest_generation():
+def test_train_ffnn_cli_real_ensemble_manifest_generation(monkeypatch):
     case_dir = _mk_case_dir("ffnn_ensemble")
     emb_dir, label_shard = _write_training_artifacts(
         case_dir, all_uncertain=False
     )
     save_dir = case_dir / "ensemble_out"
+
+    def _unexpected_auto_pos_weight(*_args, **_kwargs):
+        raise AssertionError("explicit --pos-weight should bypass automatic counting")
+
+    monkeypatch.setattr(train_cli, "compute_pos_neg_counts", _unexpected_auto_pos_weight)
+    monkeypatch.setattr(train_cli, "global_pos_neg_counts", _unexpected_auto_pos_weight)
 
     try:
         _run_main(
@@ -245,6 +288,8 @@ def test_train_ffnn_cli_real_ensemble_manifest_generation():
                 "17,19",
                 "--train-seeds",
                 "101,202",
+                "--pos-weight",
+                "3.5",
                 "--save-path",
                 str(save_dir),
                 "--results-csv",
@@ -318,6 +363,11 @@ def test_train_ffnn_optuna_cli_real_with_storage_and_helpers(monkeypatch):
     csv_path = save_dir / "trials.csv"
     storage_uri = f"sqlite:///{(case_dir / 'study.db').as_posix()}"
     dataset_calls = _capture_protein_dataset_calls(monkeypatch, optuna_cli)
+    pos_weight_calls = _capture_pos_weight_resolution(
+        monkeypatch,
+        optuna_cli,
+        counts=(3, 12)
+    )
 
     try:
         _run_main(
@@ -375,5 +425,6 @@ def test_train_ffnn_optuna_cli_real_with_storage_and_helpers(monkeypatch):
         assert csv_path.exists()
         assert (case_dir / "study.db").exists()
         _assert_train_window_val_full_protein(dataset_calls)
+        assert pos_weight_calls == {"count": 1, "global": 1}
     finally:
         shutil.rmtree(case_dir, ignore_errors=True)

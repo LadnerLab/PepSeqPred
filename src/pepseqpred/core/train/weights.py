@@ -45,6 +45,37 @@ def compute_pos_neg_counts(loader: DataLoader) -> Tuple[int, int]:
     return pos, neg
 
 
+def global_pos_neg_counts(
+    local_pos: int,
+    local_neg: int,
+    ddp: Dict[str, Any] | None
+) -> Tuple[int, int]:
+    """
+    Aggregate positive/negative residue counts across DDP ranks.
+
+    Parameters
+    ----------
+        local_pos : int
+            Local count of positive residues.
+        local_neg : int
+            Local count of negative residues.
+        ddp : Dict[str, Any] | None
+            DDP metadata dict, or `None` if DDP is disabled.
+
+    Returns
+    -------
+        Tuple[int, int]
+            Global `(pos_count, neg_count)` across ranks when DDP is enabled.
+    """
+    if ddp is None:
+        return int(local_pos), int(local_neg)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    t = torch.tensor([local_pos, local_neg], device=device, dtype=torch.long)
+    dist.all_reduce(t, op=dist.ReduceOp.SUM)
+    return int(t[0].item()), int(t[1].item())
+
+
 def global_pos_weight(local_pos: int, local_neg: int, ddp: Dict[str, Any] | None) -> float:
     """
     Compute global negative/positive class weight across ranks if DDP is running.
@@ -63,12 +94,7 @@ def global_pos_weight(local_pos: int, local_neg: int, ddp: Dict[str, Any] | None
         float
             Ratio of negatives to positives, aggregated across ranks when DDP is enabled.
     """
-    if ddp is None:
-        return float(local_neg / max(local_pos, 1))
-    t = torch.tensor([local_pos, local_neg], device=torch.device("cuda"))
-    dist.all_reduce(t, op=dist.ReduceOp.SUM)
-    pos = int(t[0].item())
-    neg = int(t[1].item())
+    pos, neg = global_pos_neg_counts(local_pos, local_neg, ddp)
     return float(neg / max(pos, 1))
 
 

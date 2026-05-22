@@ -276,18 +276,17 @@ Planning direction:
 
 ## Configuration Surprises
 
-### `--use-pos-weight` in Optuna appears misleading
+### `--use-pos-weight` in Optuna appeared misleading
 
-`train_ffnn_optuna_cli.py` defines `--use-pos-weight`, but the trial runner computes or uses positive weight regardless of that flag.
+Resolved: `--use-pos-weight` has been removed from `train_ffnn_optuna_cli.py`. Positive weighting is automatic when `--pos-weight` is omitted, and `--pos-weight` remains the manual override.
 
 Impact:
 
-- Users may think positive weighting is optional in Optuna when it is effectively always active unless code is changed.
+- Users may have thought positive weighting was optional in Optuna when it was effectively always active unless code was changed.
 
 Planning direction:
 
-- Either honor the flag or remove it.
-- Log whether class weighting is active for every trial.
+- No further action needed for this flag.
 
 ### Threshold minimum precision is not configurable
 

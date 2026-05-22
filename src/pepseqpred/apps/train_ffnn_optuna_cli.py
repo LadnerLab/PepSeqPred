@@ -47,7 +47,10 @@ from pepseqpred.core.train.split import (
     partition_ids_weighted,
     sort_ids_for_locality
 )
-from pepseqpred.core.train.weights import pos_weight_from_label_shards
+from pepseqpred.core.train.weights import (
+    compute_pos_neg_counts,
+    global_pos_neg_counts
+)
 from pepseqpred.core.train.embedding import infer_emb_dim
 from pepseqpred.core.train.seed import set_all_seeds
 
@@ -183,7 +186,7 @@ def main() -> None:
                         action="store",
                         type=float,
                         default=None,
-                        help="Optionally include a pre-calculated postive class weight")
+                        help="Optional manual positive class weight; omitted means compute from the current training split")
     parser.add_argument("--save-path",
                         type=Path,
                         default=Path("checkpoints/ffnn_optuna"),
@@ -233,9 +236,6 @@ def main() -> None:
                         type=float,
                         default=1e-2,
                         help="Max weight decay")
-    parser.add_argument("--use-pos-weight",
-                        action="store_true",
-                        help="Use positive weight to handle positive vs. negative class imbalances.")
     parser.add_argument("--pruner-warmup",
                         type=int,
                         default=2,
@@ -474,6 +474,47 @@ def main() -> None:
     if len(batch_sizes) == 0:
         raise ValueError("No batch sizes provided")
 
+    # resolve positive class weight once from the current training split
+    pos_weight_source = "cli"
+    train_pos_residues = None
+    train_neg_residues = None
+    if args.pos_weight is not None:
+        resolved_pos_weight = float(args.pos_weight)
+    else:
+        count_loader_kwargs = {
+            "batch_size": batch_sizes[0],
+            "shuffle": False,
+            "num_workers": args.num_workers,
+            "pin_memory": pin,
+            "collate_fn": pad_collate
+        }
+        if args.num_workers > 0:
+            count_loader_kwargs["multiprocessing_context"] = "spawn"
+            count_loader_kwargs["prefetch_factor"] = 4
+
+        count_loader = DataLoader(train_data, **count_loader_kwargs)
+        local_pos, local_neg = compute_pos_neg_counts(count_loader)
+        train_pos_residues, train_neg_residues = global_pos_neg_counts(
+            local_pos,
+            local_neg,
+            ddp
+        )
+        resolved_pos_weight = float(train_neg_residues / max(train_pos_residues, 1))
+        pos_weight_source = "train_loader"
+
+    if rank == 0:
+        logger.info(
+            "pos_weight_resolved",
+            extra={
+                "extra": {
+                    "source": pos_weight_source,
+                    "train_pos_residues": train_pos_residues,
+                    "train_neg_residues": train_neg_residues,
+                    "pos_weight": float(resolved_pos_weight)
+                }
+            }
+        )
+
     # setup Optuna study
     emb_dim = infer_emb_dim(base_dataset.embedding_index)
     pruner = optuna.pruners.MedianPruner(n_warmup_steps=args.pruner_warmup)
@@ -571,12 +612,8 @@ def main() -> None:
             model = DDP(model, device_ids=[
                         ddp["local_rank"]], output_device=ddp["local_rank"])
 
-        # compute or store positive weight (like class weight)
-        pos_weight = None
-        if args.pos_weight is not None:
-            pos_weight = float(args.pos_weight)
-        else:
-            pos_weight = pos_weight_from_label_shards(label_shards)
+        # use the train-split positive weight resolved before trial search
+        pos_weight = resolved_pos_weight
 
         # setup config and trainer class
         config = TrainerConfig(epochs=args.epochs,

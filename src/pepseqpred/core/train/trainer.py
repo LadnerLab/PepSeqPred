@@ -140,26 +140,34 @@ class Trainer:
             if mask.shape != y.shape:
                 raise ValueError(
                     f"Expected mask shape {tuple(y.shape)}, got {tuple(mask.shape)}")
-            denom = mask.float().sum()
-            if denom.item() == 0.0:
-                loss = loss_raw.sum() * 0.0
-            else:
-                loss = (loss_raw * mask.float()).sum() / denom
+            mask_float = mask.float()
+            loss_num = (loss_raw * mask_float).sum()
+            n_tensor = mask_float.sum()
         else:
-            loss = loss_raw.mean()
+            loss_num = loss_raw.sum()
+            n_tensor = loss_raw.new_tensor(y.numel())
 
-        n = int(mask.sum().item() if mask is not None else y.numel())
+        if n_tensor.item() == 0.0:
+            loss = loss_num * 0.0
+        else:
+            loss = loss_num / n_tensor
+
+        n = int(n_tensor.item())
 
         # optimize model in training batch
         if train:
             self.optimizer.zero_grad(set_to_none=True)
             # keep DDP ranks aligned before deciding whether to skip backward
-            step_n = ddp_all_reduce_sum(
-                torch.tensor(n, device=y.device, dtype=torch.long))
+            step_stats = ddp_all_reduce_sum(torch.stack((
+                n_tensor.detach().to(dtype=torch.float64),
+                torch.ones((), device=y.device, dtype=torch.float64)
+            )))
             # if no valid windows, return before back-prop
-            if int(step_n.item()) == 0:
+            if int(step_stats[0].item()) == 0:
                 return {"loss": float(loss.item()), "n": n}
-            loss.backward()
+            train_loss = loss_num * (
+                step_stats[1] / step_stats[0]).to(dtype=loss_num.dtype)
+            train_loss.backward()
             self.optimizer.step()
             return {"loss": float(loss.item()), "n": n}
 

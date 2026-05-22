@@ -19,6 +19,15 @@ class BadShapeModel(nn.Module):
         return torch.zeros((x.size(0), x.size(1) + 1), device=x.device) + (self.p * 0.0)
 
 
+class ConstantLogitModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.p = nn.Parameter(torch.tensor(0.0))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return torch.zeros((x.size(0), x.size(1)), device=x.device) + self.p
+
+
 def _make_trainer(model: nn.Module) -> Trainer:
     return Trainer(
         model=model,
@@ -78,7 +87,10 @@ def test_batch_step_zero_local_mask_steps_when_global_valid(monkeypatch):
         step_calls += 1
 
     def _global_valid(t: torch.Tensor) -> torch.Tensor:
-        return torch.tensor(1, device=t.device, dtype=t.dtype)
+        out = t.clone()
+        out[0] = 1
+        out[1] = 2
+        return out
 
     monkeypatch.setattr(trainer.optimizer, "step", _step)
     monkeypatch.setattr(trainer_mod, "ddp_all_reduce_sum", _global_valid)
@@ -87,6 +99,31 @@ def test_batch_step_zero_local_mask_steps_when_global_valid(monkeypatch):
     assert out["n"] == 0
     assert out["loss"] == pytest.approx(0.0, abs=1e-12)
     assert step_calls == 1
+
+
+def test_batch_step_scales_training_loss_by_global_valid_count(monkeypatch):
+    model = ConstantLogitModel()
+    trainer = _make_trainer(model)
+
+    x = torch.randn(1, 2, 4)
+    y = torch.zeros((1, 2), dtype=torch.float32)
+    mask = torch.tensor([[1, 0]], dtype=torch.long)
+
+    def _step():
+        return None
+
+    def _global_stats(t: torch.Tensor) -> torch.Tensor:
+        out = t.clone()
+        out[0] = 4
+        out[1] = 2
+        return out
+
+    monkeypatch.setattr(trainer.optimizer, "step", _step)
+    monkeypatch.setattr(trainer_mod, "ddp_all_reduce_sum", _global_stats)
+
+    out = trainer._batch_step((x, y, mask), train=True)
+    assert out["n"] == 1
+    assert model.p.grad.item() == pytest.approx(0.25, abs=1e-12)
 
 
 def test_batch_step_rejects_invalid_y_dim():

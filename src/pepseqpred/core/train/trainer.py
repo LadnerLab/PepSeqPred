@@ -143,19 +143,24 @@ class Trainer:
             denom = mask.float().sum()
             if denom.item() == 0.0:
                 loss = loss_raw.sum() * 0.0
-                # if train:
-                #     return {"loss": 0.0, "n": 0}
             else:
                 loss = (loss_raw * mask.float()).sum() / denom
         else:
             loss = loss_raw.mean()
 
+        n = int(mask.sum().item() if mask is not None else y.numel())
+
         # optimize model in training batch
         if train:
             self.optimizer.zero_grad(set_to_none=True)
+            # keep DDP ranks aligned before deciding whether to skip backward
+            step_n = ddp_all_reduce_sum(
+                torch.tensor(n, device=y.device, dtype=torch.long))
+            # if no valid windows, return before back-prop
+            if int(step_n.item()) == 0:
+                return {"loss": float(loss.item()), "n": n}
             loss.backward()
             self.optimizer.step()
-            n = int(mask.sum().item() if mask is not None else int(y.numel()))
             return {"loss": float(loss.item()), "n": n}
 
         probs = torch.sigmoid(logits)  # (B, L)

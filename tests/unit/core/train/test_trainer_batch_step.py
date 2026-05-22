@@ -2,6 +2,7 @@ import logging
 import pytest
 import torch
 import torch.nn as nn
+import pepseqpred.core.train.trainer as trainer_mod
 from pepseqpred.core.models.ffnn import PepSeqFFNN
 from pepseqpred.core.train.trainer import Trainer, TrainerConfig
 
@@ -28,7 +29,7 @@ def _make_trainer(model: nn.Module) -> Trainer:
     )
 
 
-def test_batch_step_zero_mask_returns_zero_n():
+def test_batch_step_zero_mask_returns_zero_n(monkeypatch):
     model = PepSeqFFNN(
         emb_dim=4,
         hidden_sizes=(8,),
@@ -42,10 +43,50 @@ def test_batch_step_zero_mask_returns_zero_n():
     x = torch.randn(1, 3, 4)
     y = torch.tensor([[1.0, 0.0, 1.0]], dtype=torch.float32)
     mask = torch.zeros((1, 3), dtype=torch.long)
+    step_calls = 0
+
+    def _step():
+        nonlocal step_calls
+        step_calls += 1
+
+    monkeypatch.setattr(trainer.optimizer, "step", _step)
 
     out = trainer._batch_step((x, y, mask), train=True)
     assert out["n"] == 0
     assert out["loss"] == pytest.approx(0.0, abs=1e-12)
+    assert step_calls == 0
+
+
+def test_batch_step_zero_local_mask_steps_when_global_valid(monkeypatch):
+    model = PepSeqFFNN(
+        emb_dim=4,
+        hidden_sizes=(8,),
+        dropouts=(0.0,),
+        num_classes=1,
+        use_layer_norm=False,
+        use_residual=False
+    )
+    trainer = _make_trainer(model)
+
+    x = torch.randn(1, 3, 4)
+    y = torch.tensor([[1.0, 0.0, 1.0]], dtype=torch.float32)
+    mask = torch.zeros((1, 3), dtype=torch.long)
+    step_calls = 0
+
+    def _step():
+        nonlocal step_calls
+        step_calls += 1
+
+    def _global_valid(t: torch.Tensor) -> torch.Tensor:
+        return torch.tensor(1, device=t.device, dtype=t.dtype)
+
+    monkeypatch.setattr(trainer.optimizer, "step", _step)
+    monkeypatch.setattr(trainer_mod, "ddp_all_reduce_sum", _global_valid)
+
+    out = trainer._batch_step((x, y, mask), train=True)
+    assert out["n"] == 0
+    assert out["loss"] == pytest.approx(0.0, abs=1e-12)
+    assert step_calls == 1
 
 
 def test_batch_step_rejects_invalid_y_dim():

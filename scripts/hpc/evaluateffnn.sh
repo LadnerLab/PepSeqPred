@@ -45,6 +45,8 @@ usage() {
     echo "  MAX_TOKENS           default: 1022"
     echo "  EMBED_BATCH_SIZE     default: 24"
     echo "  THRESHOLD            default: unset"
+    echo "  ENSEMBLE_AGGREGATION default: majority"
+    echo "  ENSEMBLE_THRESHOLD   default: unset"
     echo "  ENSEMBLE_SET_INDEX   default: 1"
     echo "  EXPECTED_SET_INDEX   default: unset (optional guard; fail if resolved set differs)"
     echo "  K_FOLDS              default: unset"
@@ -104,6 +106,8 @@ MODEL_NAME="${MODEL_NAME:-esm2_t33_650M_UR50D}"
 MAX_TOKENS="${MAX_TOKENS:-1022}"
 EMBED_BATCH_SIZE="${EMBED_BATCH_SIZE:-24}"
 THRESHOLD="${THRESHOLD:-}"
+ENSEMBLE_AGGREGATION="${ENSEMBLE_AGGREGATION:-majority}"
+ENSEMBLE_THRESHOLD="${ENSEMBLE_THRESHOLD:-}"
 ENSEMBLE_SET_INDEX="${ENSEMBLE_SET_INDEX:-1}"
 EXPECTED_SET_INDEX="${EXPECTED_SET_INDEX:-}"
 K_FOLDS="${K_FOLDS:-}"
@@ -253,6 +257,8 @@ PREDICT_ARGS=(
     --log-json
 )
 [ -n "${THRESHOLD}" ] && PREDICT_ARGS+=(--threshold "${THRESHOLD}")
+[ -n "${ENSEMBLE_AGGREGATION}" ] && PREDICT_ARGS+=(--ensemble-aggregation "${ENSEMBLE_AGGREGATION}")
+[ -n "${ENSEMBLE_THRESHOLD}" ] && PREDICT_ARGS+=(--ensemble-threshold "${ENSEMBLE_THRESHOLD}")
 [ -n "${ENSEMBLE_SET_INDEX}" ] && PREDICT_ARGS+=(--ensemble-set-index "${ENSEMBLE_SET_INDEX}")
 [ -n "${K_FOLDS}" ] && PREDICT_ARGS+=(--k-folds "${K_FOLDS}")
 [ -n "${EMB_DIM}" ] && PREDICT_ARGS+=(--emb-dim "${EMB_DIM}")
@@ -292,6 +298,8 @@ EVAL_ARGS=(
     --log-json
 )
 [ -n "${THRESHOLD}" ] && EVAL_ARGS+=(--threshold "${THRESHOLD}")
+[ -n "${ENSEMBLE_AGGREGATION}" ] && EVAL_ARGS+=(--ensemble-aggregation "${ENSEMBLE_AGGREGATION}")
+[ -n "${ENSEMBLE_THRESHOLD}" ] && EVAL_ARGS+=(--ensemble-threshold "${ENSEMBLE_THRESHOLD}")
 [ -n "${ENSEMBLE_SET_INDEX}" ] && EVAL_ARGS+=(--ensemble-set-index "${ENSEMBLE_SET_INDEX}")
 [ -n "${K_FOLDS}" ] && EVAL_ARGS+=(--k-folds "${K_FOLDS}")
 [ -n "${SELECT_BEST_SET_RUNS_CSV}" ] && EVAL_ARGS+=(--select-best-set-runs-csv "${SELECT_BEST_SET_RUNS_CSV}")

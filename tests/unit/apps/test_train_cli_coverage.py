@@ -237,11 +237,19 @@ def test_train_ffnn_cli_real_no_valid_score_with_val_curve_artifacts(monkeypatch
         assert int(runs_df.shape[0]) == 1
         assert str(runs_df.iloc[0]["BestMetricKey"]) == "f1"
         assert str(runs_df.iloc[0]["Status"]) == "NO_VALID_SCORE"
+        assert str(runs_df.iloc[0]["ThresholdPolicy"]) == "max-recall-min-precision"
+        assert str(runs_df.iloc[0]["ThresholdStatus"]) == "no_valid_residues"
+        assert float(runs_df.iloc[0]["ThresholdMinPrecision"]) == pytest.approx(0.25)
+        assert float(runs_df.iloc[0]["ThresholdMinRecall"]) == pytest.approx(0.80)
+        assert float(runs_df.iloc[0]["ThresholdFixedValue"]) == pytest.approx(0.50)
 
         summary = json.loads(
             (save_dir / "multi_run_summary.json").read_text(encoding="utf-8")
         )
         assert int(summary["n_runs"]) == 1
+        assert summary["threshold_policy"] == "max-recall-min-precision"
+        assert summary["threshold_min_precision"] == pytest.approx(0.25)
+        assert "ThresholdPredPosFrac" in summary["metrics"]
         _assert_train_window_val_full_protein(dataset_calls)
         assert pos_weight_calls == {"count": 1, "global": 1}
     finally:
@@ -290,6 +298,14 @@ def test_train_ffnn_cli_real_ensemble_manifest_generation(monkeypatch):
                 "101,202",
                 "--pos-weight",
                 "3.5",
+                "--threshold-policy",
+                "fixed",
+                "--threshold-min-precision",
+                "0.33",
+                "--threshold-min-recall",
+                "0.77",
+                "--threshold-fixed-value",
+                "0.49",
                 "--save-path",
                 str(save_dir),
                 "--results-csv",
@@ -304,8 +320,24 @@ def test_train_ffnn_cli_real_ensemble_manifest_generation(monkeypatch):
         )
         assert payload["train_mode"] == "ensemble-kfold"
         assert payload["n_sets"] == 2
+        assert payload["threshold_policy"] == "fixed"
+        assert payload["threshold_min_precision"] == pytest.approx(0.33)
+        assert payload["threshold_min_recall"] == pytest.approx(0.77)
+        assert payload["threshold_fixed_value"] == pytest.approx(0.49)
         assert len(payload["sets"]) == 2
         assert all(int(x["n_members"]) == 2 for x in payload["sets"])
+        assert all(x["threshold_policy"] == "fixed" for x in payload["sets"])
+        set_manifest_path = Path(payload["sets"][0]["manifest_path"])
+        set_payload = json.loads(set_manifest_path.read_text(encoding="utf-8"))
+        assert set_payload["threshold_policy"] == "fixed"
+        assert all(
+            member["threshold_policy"] == "fixed"
+            for member in set_payload["members"]
+        )
+        runs_df = pd.read_csv(save_dir / "runs.csv")
+        assert set(runs_df["ThresholdPolicy"]) == {"fixed"}
+        assert set(runs_df["ThresholdStatus"]) == {"ok"}
+        assert set(runs_df["ThresholdFixedValue"]) == {0.49}
     finally:
         shutil.rmtree(case_dir, ignore_errors=True)
 
@@ -414,6 +446,14 @@ def test_train_ffnn_optuna_cli_real_with_storage_and_helpers(monkeypatch):
                 str(csv_path),
                 "--study-name",
                 "unit_realcov_study",
+                "--threshold-policy",
+                "fixed",
+                "--threshold-min-precision",
+                "0.35",
+                "--threshold-min-recall",
+                "0.75",
+                "--threshold-fixed-value",
+                "0.49",
             ],
         )
 
@@ -422,7 +462,15 @@ def test_train_ffnn_optuna_cli_real_with_storage_and_helpers(monkeypatch):
         )
         assert best_payload["study_name"] == "unit_realcov_study"
         assert best_payload["metric"] == "auc"
+        assert best_payload["threshold_policy"] == "fixed"
+        assert best_payload["threshold_min_precision"] == pytest.approx(0.35)
+        assert best_payload["threshold_min_recall"] == pytest.approx(0.75)
+        assert best_payload["threshold_fixed_value"] == pytest.approx(0.49)
         assert csv_path.exists()
+        trials_df = pd.read_csv(csv_path)
+        assert str(trials_df.iloc[0]["ThresholdPolicy"]) == "fixed"
+        assert float(trials_df.iloc[0]["ThresholdFixedValue"]) == pytest.approx(0.49)
+        assert "ThresholdPredPosFrac" in trials_df.columns
         assert (case_dir / "study.db").exists()
         _assert_train_window_val_full_protein(dataset_calls)
         assert pos_weight_calls == {"count": 1, "global": 1}

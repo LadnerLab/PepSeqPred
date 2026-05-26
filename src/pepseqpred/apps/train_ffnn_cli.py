@@ -52,6 +52,7 @@ from pepseqpred.core.train.weights import (
     compute_pos_neg_counts,
     global_pos_neg_counts
 )
+from pepseqpred.core.train.threshold import THRESHOLD_POLICIES
 from pepseqpred.core.train.embedding import infer_emb_dim
 from pepseqpred.core.train.seed import set_all_seeds
 from pepseqpred.core.io.read import parse_int_csv, parse_float_csv
@@ -953,6 +954,23 @@ def main() -> None:
                         choices=["loss", "precision", "recall",
                                  "f1", "mcc", "auc", "auc10", "pr_auc", "res_balanced_acc"],
                         help="Metric used to choose the best model checkpoint per run")
+    parser.add_argument("--threshold-policy",
+                        type=str,
+                        default="max-recall-min-precision",
+                        choices=list(THRESHOLD_POLICIES),
+                        help="Validation threshold selection policy.")
+    parser.add_argument("--threshold-min-precision",
+                        type=float,
+                        default=0.25,
+                        help="Minimum precision for max-recall-min-precision threshold selection.")
+    parser.add_argument("--threshold-min-recall",
+                        type=float,
+                        default=0.80,
+                        help="Minimum recall for min-recall-max-precision threshold selection.")
+    parser.add_argument("--threshold-fixed-value",
+                        type=float,
+                        default=0.50,
+                        help="Fixed threshold used when --threshold-policy=fixed.")
     parser.add_argument("--results-csv",
                         type=Path,
                         default=None,
@@ -996,6 +1014,12 @@ def main() -> None:
         )
     if len(unknown) > 0:
         parser.error(f"unrecognized arguments: {' '.join(unknown)}")
+    if args.threshold_min_precision < 0.0 or args.threshold_min_precision > 1.0:
+        raise ValueError("--threshold-min-precision must be in [0.0, 1.0]")
+    if args.threshold_min_recall < 0.0 or args.threshold_min_recall > 1.0:
+        raise ValueError("--threshold-min-recall must be in [0.0, 1.0]")
+    if args.threshold_fixed_value <= 0.0 or args.threshold_fixed_value >= 1.0:
+        raise ValueError("--threshold-fixed-value must be between (0.0, 1.0)")
     logger = setup_logger(json_lines=True,
                           json_indent=2,
                           name="train_ffnn_cli")
@@ -1283,7 +1307,11 @@ def main() -> None:
                                learning_rate=args.lr,
                                weight_decay=args.weight_decay,
                                device="cuda" if torch.cuda.is_available() else "cpu",
-                               pos_weight=pos_weight)
+                               pos_weight=pos_weight,
+                               threshold_policy=args.threshold_policy,
+                               threshold_min_precision=args.threshold_min_precision,
+                               threshold_min_recall=args.threshold_min_recall,
+                               threshold_fixed_value=args.threshold_fixed_value)
         trainer = Trainer(model=model,
                           train_loader=train_loader,
                           logger=logger,
@@ -1366,6 +1394,16 @@ def main() -> None:
                 "BestEpoch": best_epoch,
                 "BestValLoss": best_val_loss,
                 "Threshold": threshold,
+                "ThresholdPolicy": str(best_metrics.get("threshold_policy", args.threshold_policy)),
+                "ThresholdStatus": str(best_metrics.get("threshold_status", "")),
+                "ThresholdMinPrecision": _finite_or_none(
+                    best_metrics.get("threshold_min_precision", float("nan"))),
+                "ThresholdMinRecall": _finite_or_none(
+                    best_metrics.get("threshold_min_recall", float("nan"))),
+                "ThresholdFixedValue": _finite_or_none(
+                    best_metrics.get("threshold_fixed_value", float("nan"))),
+                "ThresholdPredPosFrac": _finite_or_none(
+                    best_metrics.get("threshold_pred_pos_frac", float("nan"))),
                 "PR_AUC": _finite_or_none(best_metrics.get("pr_auc", float("nan"))),
                 "F1": _finite_or_none(best_metrics.get("f1", float("nan"))),
                 "MCC": _finite_or_none(best_metrics.get("mcc", float("nan"))),
@@ -1389,10 +1427,16 @@ def main() -> None:
             "train_mode": str(split_meta["train_mode"]),
             "split_type": str(args.split_type),
             "best_model_metric": str(args.best_model_metric),
+            "threshold_policy": str(args.threshold_policy),
+            "threshold_min_precision": float(args.threshold_min_precision),
+            "threshold_min_recall": float(args.threshold_min_recall),
+            "threshold_fixed_value": float(args.threshold_fixed_value),
             "split_seeds": [int(x) for x in split_meta["split_seeds"]],
             "train_seeds": [int(x) for x in split_meta["train_seeds"]],
             "metrics": {
                 "BestMetricValue": summarize_numeric(df_runs["BestMetricValue"]),
+                "Threshold": summarize_numeric(df_runs["Threshold"]),
+                "ThresholdPredPosFrac": summarize_numeric(df_runs["ThresholdPredPosFrac"]),
                 "PR_AUC": summarize_numeric(df_runs["PR_AUC"]),
                 "F1": summarize_numeric(df_runs["F1"]),
                 "MCC": summarize_numeric(df_runs["MCC"]),
@@ -1447,6 +1491,11 @@ def main() -> None:
                     "train_seed": int(row["TrainSeed"]),
                     "checkpoint": row.get("CheckpointPath"),
                     "threshold": row.get("Threshold"),
+                    "threshold_policy": row.get("ThresholdPolicy"),
+                    "threshold_status": row.get("ThresholdStatus"),
+                    "threshold_min_precision": row.get("ThresholdMinPrecision"),
+                    "threshold_min_recall": row.get("ThresholdMinRecall"),
+                    "threshold_fixed_value": row.get("ThresholdFixedValue"),
                     "status": row.get("Status"),
                     "best_metric_value": row.get("BestMetricValue")
                 })
@@ -1512,6 +1561,10 @@ def main() -> None:
                     "split_seed": int(entry["split_seed"]),
                     "train_seed": int(entry["train_seed"]),
                     "best_model_metric": str(args.best_model_metric),
+                    "threshold_policy": str(args.threshold_policy),
+                    "threshold_min_precision": float(args.threshold_min_precision),
+                    "threshold_min_recall": float(args.threshold_min_recall),
+                    "threshold_fixed_value": float(args.threshold_fixed_value),
                     "n_members": int(len(members)),
                     "n_valid_members": int(len(valid_members)),
                     "voting": {
@@ -1562,6 +1615,10 @@ def main() -> None:
                         split_meta.get("ensemble_seed_mode", "set-paired")
                     ),
                     "best_model_metric": str(args.best_model_metric),
+                    "threshold_policy": str(args.threshold_policy),
+                    "threshold_min_precision": float(args.threshold_min_precision),
+                    "threshold_min_recall": float(args.threshold_min_recall),
+                    "threshold_fixed_value": float(args.threshold_fixed_value),
                     "sets": set_payloads
                 }
                 root_manifest_path = args.ensemble_manifest or (

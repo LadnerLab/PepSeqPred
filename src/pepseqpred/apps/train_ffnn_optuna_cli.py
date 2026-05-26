@@ -51,6 +51,7 @@ from pepseqpred.core.train.weights import (
     compute_pos_neg_counts,
     global_pos_neg_counts
 )
+from pepseqpred.core.train.threshold import THRESHOLD_POLICIES
 from pepseqpred.core.train.embedding import infer_emb_dim
 from pepseqpred.core.train.seed import set_all_seeds
 
@@ -164,6 +165,23 @@ def main() -> None:
                         choices=["precision", "recall",
                                  "f1", "mcc", "auc", "pr_auc"],
                         help="Metric to maximize")
+    parser.add_argument("--threshold-policy",
+                        type=str,
+                        default="max-recall-min-precision",
+                        choices=list(THRESHOLD_POLICIES),
+                        help="Validation threshold selection policy.")
+    parser.add_argument("--threshold-min-precision",
+                        type=float,
+                        default=0.25,
+                        help="Minimum precision for max-recall-min-precision threshold selection.")
+    parser.add_argument("--threshold-min-recall",
+                        type=float,
+                        default=0.80,
+                        help="Minimum recall for min-recall-max-precision threshold selection.")
+    parser.add_argument("--threshold-fixed-value",
+                        type=float,
+                        default=0.50,
+                        help="Fixed threshold used when --threshold-policy=fixed.")
     parser.add_argument("--val-frac",
                         type=float,
                         default=0.2,
@@ -273,6 +291,12 @@ def main() -> None:
                         action="store_false",
                         help="Keep labels in memory after each protein is processed")
     args = parser.parse_args()
+    if args.threshold_min_precision < 0.0 or args.threshold_min_precision > 1.0:
+        raise ValueError("--threshold-min-precision must be in [0.0, 1.0]")
+    if args.threshold_min_recall < 0.0 or args.threshold_min_recall > 1.0:
+        raise ValueError("--threshold-min-recall must be in [0.0, 1.0]")
+    if args.threshold_fixed_value <= 0.0 or args.threshold_fixed_value >= 1.0:
+        raise ValueError("--threshold-fixed-value must be between (0.0, 1.0)")
 
     args.save_path.mkdir(parents=True, exist_ok=True)
     logger = setup_logger(json_lines=True, json_indent=2,
@@ -621,7 +645,11 @@ def main() -> None:
                                learning_rate=lr,
                                weight_decay=wd,
                                device="cuda" if torch.cuda.is_available() else "cpu",
-                               pos_weight=pos_weight)
+                               pos_weight=pos_weight,
+                               threshold_policy=args.threshold_policy,
+                               threshold_min_precision=args.threshold_min_precision,
+                               threshold_min_recall=args.threshold_min_recall,
+                               threshold_fixed_value=args.threshold_fixed_value)
 
         trial_dir = None
         if rank == 0 and trial is not None:
@@ -673,8 +701,12 @@ def main() -> None:
                 "AUC10": float(best_metrics.get("auc10", float("nan"))),
                 "PR_AUC": float(best_metrics.get("pr_auc", float("nan"))),
                 "Threshold": float(best_metrics.get("threshold", float("nan"))),
+                "ThresholdPolicy": str(best_metrics.get("threshold_policy", args.threshold_policy)),
                 "ThresholdStatus": str(best_metrics.get("threshold_status", "")),
                 "ThresholdMinPrecision": float(best_metrics.get("threshold_min_precision", float("nan"))),
+                "ThresholdMinRecall": float(best_metrics.get("threshold_min_recall", float("nan"))),
+                "ThresholdFixedValue": float(best_metrics.get("threshold_fixed_value", float("nan"))),
+                "ThresholdPredPosFrac": float(best_metrics.get("threshold_pred_pos_frac", float("nan"))),
                 "ScoreKey": args.metric,
                 "ScoreValue": float(best_score),
                 "ElapsedSec": float(elapsed),
@@ -735,7 +767,11 @@ def main() -> None:
                         "best_value": float(best.value),
                         "best_params": dict(best.params),
                         "best_user_attrs": dict(best.user_attrs),
-                        "metric": args.metric}
+                        "metric": args.metric,
+                        "threshold_policy": str(args.threshold_policy),
+                        "threshold_min_precision": float(args.threshold_min_precision),
+                        "threshold_min_recall": float(args.threshold_min_recall),
+                        "threshold_fixed_value": float(args.threshold_fixed_value)}
         best_trial_json.write_text(json.dumps(best_payload, indent=2))
 
         best_trial_dir = Path(best.user_attrs["trial_dir"])

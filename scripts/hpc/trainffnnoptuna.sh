@@ -18,6 +18,10 @@ usage() {
     echo "Usage: $0 <embedding_dirs...> -- <label_shards...>"
     echo "  embedding_dirs: one or more directories containing per-protein embeddings (.pt)"
     echo "  label_shards: one or more label shard .pt files"
+    echo "  THRESHOLD_POLICY default: max-recall-min-precision"
+    echo "  THRESHOLD_MIN_PRECISION default: 0.25"
+    echo "  THRESHOLD_MIN_RECALL default: 0.80"
+    echo "  THRESHOLD_FIXED_VALUE default: 0.50"
     echo ""
     echo "Example:"
     echo "  $0 /scratch/$USER/embeddings/shard1 /scratch/$USER/embeddings/shard2 -- /scratch/$USER/labels/labels_00.pt /scratch/$USER/labels/labels_01.pt"
@@ -56,6 +60,10 @@ N_TRIALS="${N_TRIALS:-20}"
 EPOCHS="${EPOCHS:-15}"
 SEED="${SEED:-42}"
 METRIC="${METRIC:-pr_auc}"
+THRESHOLD_POLICY="${THRESHOLD_POLICY:-max-recall-min-precision}"
+THRESHOLD_MIN_PRECISION="${THRESHOLD_MIN_PRECISION:-0.25}"
+THRESHOLD_MIN_RECALL="${THRESHOLD_MIN_RECALL:-0.80}"
+THRESHOLD_FIXED_VALUE="${THRESHOLD_FIXED_VALUE:-0.50}"
 VAL_FRAC="${VAL_FRAC:-0.2}"
 SUBSET="${SUBSET:-0}"
 NUM_WORKERS="${NUM_WORKERS:-1}"
@@ -127,6 +135,10 @@ ${LAUNCHER} torchrun --nproc_per_node=4 train_ffnn_optuna.pyz \
     --epochs "$EPOCHS" \
     --seed "$SEED" \
     --metric "$METRIC" \
+    --threshold-policy "$THRESHOLD_POLICY" \
+    --threshold-min-precision "$THRESHOLD_MIN_PRECISION" \
+    --threshold-min-recall "$THRESHOLD_MIN_RECALL" \
+    --threshold-fixed-value "$THRESHOLD_FIXED_VALUE" \
     --val-frac "$VAL_FRAC" \
     --split-type "$SPLIT_TYPE" \
     --subset "$SUBSET" \

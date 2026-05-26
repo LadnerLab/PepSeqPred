@@ -125,6 +125,8 @@ def test_predict_ensemble_from_embedding_uses_majority_vote():
     assert out["binary_mask"] == "1110"
     assert out["n_members"] == 3
     assert out["votes_needed"] == 2
+    assert out["ensemble_aggregation"] == "majority"
+    assert out["ensemble_threshold"] is None
 
 
 def test_predict_ensemble_from_embedding_even_tie_is_negative():
@@ -141,6 +143,26 @@ def test_predict_ensemble_from_embedding_even_tie_is_negative():
     )
     assert out["binary_mask"] == "00"
     assert out["votes_needed"] == 2
+
+
+def test_predict_ensemble_from_embedding_mean_prob_thresholding():
+    emb = torch.zeros((2, 3), dtype=torch.float32)
+    models = [
+        _ConstantLogitModel([2.0, -2.0]),
+        _ConstantLogitModel([-2.0, 2.0]),
+    ]
+    out = predict_ensemble_from_embedding(
+        psp_models=models,
+        protein_emb=emb,
+        device="cpu",
+        thresholds=[0.5, 0.5],
+        aggregation="mean-prob",
+        ensemble_threshold=0.49
+    )
+    assert out["binary_mask"] == "11"
+    assert out["votes_needed"] is None
+    assert out["ensemble_aggregation"] == "mean-prob"
+    assert out["ensemble_threshold"] == pytest.approx(0.49)
 
 
 def test_predict_ensemble_from_embedding_k1_matches_single():

@@ -158,6 +158,60 @@ def test_prediction_cli_manifest_v1_majority_vote(monkeypatch, tmp_path: Path):
     assert lines[1] == "000000"
 
 
+def test_prediction_cli_manifest_mean_prob_aggregation(monkeypatch, tmp_path: Path):
+    fake_pretrained = types.SimpleNamespace(
+        fake_model=lambda: (FakeESMModel(), FakeAlphabet())
+    )
+    monkeypatch.setattr(prediction_cli.esm, "pretrained", fake_pretrained)
+
+    ckpt_1 = tmp_path / "fold_1.pt"
+    ckpt_2 = tmp_path / "fold_2.pt"
+    ckpt_3 = tmp_path / "fold_3.pt"
+    _write_checkpoint(ckpt_1, threshold=0.6)
+    _write_checkpoint(ckpt_2, threshold=0.6)
+    _write_checkpoint(ckpt_3, threshold=0.4)
+
+    manifest = {
+        "schema_version": 1,
+        "members": [
+            {"member_index": 1, "fold_index": 1, "status": "OK", "checkpoint": str(ckpt_1), "threshold": 0.6},
+            {"member_index": 2, "fold_index": 2, "status": "OK", "checkpoint": str(ckpt_2), "threshold": 0.6},
+            {"member_index": 3, "fold_index": 3, "status": "OK", "checkpoint": str(ckpt_3), "threshold": 0.4},
+        ]
+    }
+    manifest_path = tmp_path / "ensemble_manifest.json"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    fasta = tmp_path / "input.fasta"
+    fasta.write_text(">protein_1\nACDEFG\n", encoding="utf-8")
+    output_fasta = tmp_path / "predictions.fasta"
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "prediction_cli.py",
+            str(manifest_path),
+            str(fasta),
+            "--output-fasta",
+            str(output_fasta),
+            "--model-name",
+            "fake_model",
+            "--ensemble-aggregation",
+            "mean-prob",
+            "--ensemble-threshold",
+            "0.49",
+        ],
+    )
+
+    prediction_cli.main()
+
+    lines = [line.strip() for line in output_fasta.read_text(
+        encoding="utf-8").splitlines() if line.strip()]
+    assert lines[0] == ">protein_1"
+    assert lines[1] == "111111"
+
+
 def test_prediction_cli_manifest_v2_set_index_and_k_folds(monkeypatch, tmp_path: Path):
     fake_pretrained = types.SimpleNamespace(
         fake_model=lambda: (FakeESMModel(), FakeAlphabet())

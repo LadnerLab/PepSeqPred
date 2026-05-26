@@ -19,7 +19,7 @@ import numpy as np
 import optuna
 from .ddp import ddp_rank, ddp_all_reduce_sum, ddp_gather_all_1d
 from .metrics import compute_eval_metrics
-from .threshold import find_threshold_max_recall_min_precision
+from .threshold import select_threshold, threshold_diagnostic_grid
 from .curveartifacts import write_validation_curve_artifacts
 
 
@@ -34,6 +34,10 @@ class TrainerConfig:
     # should only train using GPUs (but can be changed to "cpu")
     device: str = "cuda"
     pos_weight: Optional[float] = None
+    threshold_policy: str = "max-recall-min-precision"
+    threshold_min_precision: float = 0.25
+    threshold_min_recall: float = 0.80
+    threshold_fixed_value: float = 0.50
 
 
 @dataclass(frozen=True)
@@ -102,7 +106,11 @@ class Trainer:
                                  "weight_decay": self.config.weight_decay,
                                  "num_params": num_params,
                                  "has_val_loader": self.val_loader is not None,
-                                 "pos_weight": self.config.pos_weight
+                                 "pos_weight": self.config.pos_weight,
+                                 "threshold_policy": self.config.threshold_policy,
+                                 "threshold_min_precision": self.config.threshold_min_precision,
+                                 "threshold_min_recall": self.config.threshold_min_recall,
+                                 "threshold_fixed_value": self.config.threshold_fixed_value
                              }})
 
     def _batch_step(self, batch: torch.Tensor, train: bool = True) -> Dict[str, Any]:
@@ -321,14 +329,37 @@ class Trainer:
                         "auc10": float("nan"),
                         "pr_auc": float("nan"),
                         "threshold": float("nan"),
+                        "threshold_policy": str(self.config.threshold_policy),
                         "threshold_status": "no_valid_residues",
-                        "threshold_min_precision": 0.25
+                        "threshold_min_precision": float(self.config.threshold_min_precision),
+                        "threshold_min_recall": float(self.config.threshold_min_recall),
+                        "threshold_fixed_value": float(self.config.threshold_fixed_value),
+                        "threshold_precision": float("nan"),
+                        "threshold_recall": float("nan"),
+                        "threshold_f1": float("nan"),
+                        "threshold_mcc": float("nan"),
+                        "threshold_tp": 0,
+                        "threshold_fp": 0,
+                        "threshold_tn": 0,
+                        "threshold_fn": 0,
+                        "threshold_support_pos": 0,
+                        "threshold_support_neg": 0,
+                        "threshold_pred_pos_residues": 0,
+                        "threshold_pred_neg_residues": 0,
+                        "threshold_pred_pos_frac": float("nan"),
+                        "threshold_grid": []
                     }
                     avg_acc = float("nan")
                 else:
                     # compute predictions at most optimal threshold calculated
-                    thresh_out = find_threshold_max_recall_min_precision(
-                        y_true, y_prob, min_precision=0.25)
+                    thresh_out = select_threshold(
+                        y_true,
+                        y_prob,
+                        policy=self.config.threshold_policy,
+                        min_precision=self.config.threshold_min_precision,
+                        min_recall=self.config.threshold_min_recall,
+                        fixed_threshold=self.config.threshold_fixed_value
+                    )
                     best_thresh = float(thresh_out["threshold"])
                     y_pred = (y_prob >= best_thresh).astype(np.int64)
 
@@ -345,8 +376,31 @@ class Trainer:
 
                     eval_metrics = compute_eval_metrics(y_true, y_pred, y_prob)
                     eval_metrics["threshold"] = best_thresh
+                    eval_metrics["threshold_policy"] = thresh_out["policy"]
                     eval_metrics["threshold_status"] = thresh_out["status"]
                     eval_metrics["threshold_min_precision"] = thresh_out["min_precision"]
+                    eval_metrics["threshold_min_recall"] = thresh_out["min_recall"]
+                    eval_metrics["threshold_fixed_value"] = thresh_out["fixed_threshold"]
+                    eval_metrics["threshold_precision"] = thresh_out["precision"]
+                    eval_metrics["threshold_recall"] = thresh_out["recall"]
+                    eval_metrics["threshold_f1"] = thresh_out["f1"]
+                    eval_metrics["threshold_mcc"] = thresh_out["mcc"]
+                    eval_metrics["threshold_tp"] = int(thresh_out["tp"])
+                    eval_metrics["threshold_fp"] = int(thresh_out["fp"])
+                    eval_metrics["threshold_tn"] = int(thresh_out["tn"])
+                    eval_metrics["threshold_fn"] = int(thresh_out["fn"])
+                    eval_metrics["threshold_support_pos"] = int(
+                        thresh_out["support_pos"])
+                    eval_metrics["threshold_support_neg"] = int(
+                        thresh_out["support_neg"])
+                    eval_metrics["threshold_pred_pos_residues"] = int(
+                        thresh_out["pred_pos"])
+                    eval_metrics["threshold_pred_neg_residues"] = int(
+                        thresh_out["pred_neg"])
+                    eval_metrics["threshold_pred_pos_frac"] = float(
+                        thresh_out["pred_pos_frac"])
+                    eval_metrics["threshold_grid"] = list(
+                        threshold_diagnostic_grid(y_true, y_prob))
 
         # log confusion matrix
         if (not train and cm is not None
@@ -364,8 +418,12 @@ class Trainer:
                                  "balanced_acc": balanced_acc,
                                  "per_class_acc": per_class_acc.tolist(),
                                  "threshold": eval_metrics["threshold"],
+                                 "threshold_policy": eval_metrics["threshold_policy"],
                                  "threshold_status": eval_metrics["threshold_status"],
                                  "threshold_min_precision": eval_metrics["threshold_min_precision"],
+                                 "threshold_min_recall": eval_metrics["threshold_min_recall"],
+                                 "threshold_fixed_value": eval_metrics["threshold_fixed_value"],
+                                 "threshold_pred_pos_frac": eval_metrics["threshold_pred_pos_frac"],
                                  "precision": eval_metrics["precision"],
                                  "recall": eval_metrics["recall"],
                                  "f1": eval_metrics["f1"],

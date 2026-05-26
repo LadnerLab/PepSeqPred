@@ -26,6 +26,10 @@ usage() {
     echo "  N_FOLDS               default: 1 (1=single holdout, >1=K-fold ensemble)"
     echo "  SPLIT_SEEDS           default: 11,22,33,44,55"
     echo "  TRAIN_SEEDS           default: 101,202,303,404,505"
+    echo "  THRESHOLD_POLICY      default: max-recall-min-precision"
+    echo "  THRESHOLD_MIN_PRECISION default: 0.25"
+    echo "  THRESHOLD_MIN_RECALL  default: 0.80"
+    echo "  THRESHOLD_FIXED_VALUE default: 0.50"
 }
 
 # require at least one embedding dir, separator (--), one label shard
@@ -59,6 +63,10 @@ HIDDEN_SIZES="${HIDDEN_SIZES:-150,120,45}"
 DROPOUTS="${DROPOUTS:-0.1,0.1,0.1}"
 EPOCHS="${EPOCHS:-10}"
 BEST_MODEL_METRIC="${BEST_MODEL_METRIC:-pr_auc}"
+THRESHOLD_POLICY="${THRESHOLD_POLICY:-max-recall-min-precision}"
+THRESHOLD_MIN_PRECISION="${THRESHOLD_MIN_PRECISION:-0.25}"
+THRESHOLD_MIN_RECALL="${THRESHOLD_MIN_RECALL:-0.80}"
+THRESHOLD_FIXED_VALUE="${THRESHOLD_FIXED_VALUE:-0.50}"
 SPLIT_SEEDS="${SPLIT_SEEDS:-11,22,33,44,55}"
 TRAIN_SEEDS="${TRAIN_SEEDS:-101,202,303,404,505}"
 N_FOLDS="${N_FOLDS:-1}"
@@ -129,6 +137,10 @@ ${LAUNCHER} torchrun --nproc_per_node=4 train_ffnn.pyz \
     --wd "$WD" \
     "${POS_WEIGHT_ARGS[@]}" \
     --best-model-metric "$BEST_MODEL_METRIC" \
+    --threshold-policy "$THRESHOLD_POLICY" \
+    --threshold-min-precision "$THRESHOLD_MIN_PRECISION" \
+    --threshold-min-recall "$THRESHOLD_MIN_RECALL" \
+    --threshold-fixed-value "$THRESHOLD_FIXED_VALUE" \
     --val-frac "$VAL_FRAC" \
     --split-type "$SPLIT_TYPE" \
     --save-path "$SAVE_PATH" \

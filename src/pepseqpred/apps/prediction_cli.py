@@ -301,6 +301,19 @@ def main() -> None:
                         type=float,
                         default=None,
                         help="Optional global threshold override within (0.0, 1.0).")
+    parser.add_argument("--ensemble-aggregation",
+                        action="store",
+                        dest="ensemble_aggregation",
+                        type=str,
+                        choices=["majority", "mean-prob"],
+                        default="majority",
+                        help="Ensemble aggregation rule for manifest predictions.")
+    parser.add_argument("--ensemble-threshold",
+                        action="store",
+                        dest="ensemble_threshold",
+                        type=float,
+                        default=None,
+                        help="Optional threshold for mean-prob ensemble aggregation.")
     parser.add_argument("--ensemble-set-index",
                         action="store",
                         dest="ensemble_set_index",
@@ -392,6 +405,10 @@ def main() -> None:
         raise ValueError("--k-folds must be >= 1")
     if args.threshold is not None and (args.threshold <= 0.0 or args.threshold >= 1.0):
         raise ValueError("--threshold must be between (0.0, 1.0)")
+    if args.ensemble_threshold is not None and (
+        args.ensemble_threshold <= 0.0 or args.ensemble_threshold >= 1.0
+    ):
+        raise ValueError("--ensemble-threshold must be between (0.0, 1.0)")
 
     json_indent = 2 if args.log_json else None
     logger = setup_logger(log_dir=args.log_dir,
@@ -454,6 +471,18 @@ def main() -> None:
             f"All ensemble members must share emb_dim for shared-embedding inference, got {sorted(emb_dims)}"
         )
 
+    resolved_ensemble_threshold = None
+    if len(psp_models) > 1 and args.ensemble_aggregation == "mean-prob":
+        resolved_ensemble_threshold = (
+            float(args.ensemble_threshold)
+            if args.ensemble_threshold is not None
+            else (
+                float(args.threshold)
+                if args.threshold is not None
+                else float(sum(member_thresholds) / len(member_thresholds))
+            )
+        )
+
     first_cfg = member_model_cfgs[0]
     logger.info("prediction_init",
                 extra={"extra": {
@@ -469,6 +498,8 @@ def main() -> None:
                     ),
                     "threshold": float(member_thresholds[0]) if len(member_thresholds) == 1 else None,
                     "member_thresholds": [float(x) for x in member_thresholds],
+                    "ensemble_aggregation": str(args.ensemble_aggregation),
+                    "ensemble_threshold": resolved_ensemble_threshold,
                     "device": device,
                     "model_cfg_src": str(member_model_cfg_srcs[0]) if len(set(member_model_cfg_srcs)) == 1 else "mixed",
                     "emb_dim": int(first_cfg.emb_dim),
@@ -507,7 +538,9 @@ def main() -> None:
                         psp_models=psp_models,
                         protein_emb=protein_emb,
                         device=device,
-                        thresholds=member_thresholds
+                        thresholds=member_thresholds,
+                        aggregation=args.ensemble_aggregation,
+                        ensemble_threshold=resolved_ensemble_threshold
                     )
                 out_f.write(f">{header}\n{pred['binary_mask']}\n")
 
@@ -538,7 +571,9 @@ def main() -> None:
                     "processed": processed,
                     "failed": failed,
                     "total_residues": total_residues,
-                    "total_epitopes": total_epitopes
+                    "total_epitopes": total_epitopes,
+                    "ensemble_aggregation": str(args.ensemble_aggregation),
+                    "ensemble_threshold": resolved_ensemble_threshold
                 }})
 
 

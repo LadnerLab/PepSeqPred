@@ -279,6 +279,23 @@ def test_predict_ensemble_and_predict_protein_edge_cases(monkeypatch):
             device="cpu",
             thresholds=[1.0]
         )
+    with pytest.raises(ValueError, match="aggregation must be one of"):
+        inf.predict_ensemble_from_embedding(
+            psp_models=[_GoodShapeModel()],
+            protein_emb=torch.zeros((3, 3), dtype=torch.float32),
+            device="cpu",
+            thresholds=[0.5],
+            aggregation="bad"
+        )
+    with pytest.raises(ValueError, match="ensemble_threshold"):
+        inf.predict_ensemble_from_embedding(
+            psp_models=[_GoodShapeModel(), _GoodShapeModel()],
+            protein_emb=torch.zeros((3, 3), dtype=torch.float32),
+            device="cpu",
+            thresholds=[0.5, 0.5],
+            aggregation="mean-prob",
+            ensemble_threshold=1.0
+        )
 
     model_a = _GoodShapeModel()
     model_b = _GoodShapeModel()

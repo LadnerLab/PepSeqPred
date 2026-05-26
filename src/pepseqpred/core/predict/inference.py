@@ -439,10 +439,12 @@ def predict_ensemble_from_embedding(
     psp_models: Sequence[PepSeqFFNN],
     protein_emb: torch.Tensor,
     device: str,
-    thresholds: Sequence[float]
+    thresholds: Sequence[float],
+    aggregation: str = "majority",
+    ensemble_threshold: float | None = None
 ) -> Dict[str, Any]:
     """
-    Predict residue-level mask using strict majority vote across model members.
+    Predict residue-level mask from an ensemble of model members.
 
     Parameters
     ----------
@@ -454,6 +456,13 @@ def predict_ensemble_from_embedding(
             Device type: `"cuda"` for GPUs, otherwise `"cpu"`.
         thresholds : Sequence[float]
             A sequence of thresholds between `0.0` and `1.0`, that determine the cutoff for non-epitope vs definite epitope. Default is `0.5`.
+        aggregation : str
+            Ensemble aggregation rule. `"majority"` thresholds each member and
+            applies strict majority vote. `"mean-prob"` thresholds the mean
+            probability across members.
+        ensemble_threshold : float or None
+            Threshold used for `"mean-prob"` aggregation. If omitted, the mean
+            of member thresholds is used.
 
     Returns
     -------
@@ -464,9 +473,13 @@ def predict_ensemble_from_embedding(
     ------
         ValueError
             If no models are provided, if number of models and thresholds differs,
-            if any threshold is outside `(0.0, 1.0)`, if member probability shapes
-            are invalid, or if member output lengths are inconsistent.
+            if any threshold is outside `(0.0, 1.0)`, if aggregation is invalid,
+            if member probability shapes are invalid, or if member output lengths
+            are inconsistent.
     """
+    aggregation = str(aggregation).strip().lower()
+    if aggregation not in {"majority", "mean-prob"}:
+        raise ValueError("aggregation must be one of: majority, mean-prob")
     if len(psp_models) < 1:
         raise ValueError(
             "At least one model is required for ensemble prediction")
@@ -497,19 +510,40 @@ def predict_ensemble_from_embedding(
         raise ValueError(
             "All ensemble members must produce the same sequence length")
 
-    vote_sum = torch.stack(member_masks, dim=0).sum(dim=0)
     n_members = int(len(member_masks))
-    votes_needed = int((n_members // 2) + 1)
-    majority_mask = (vote_sum >= votes_needed).to(torch.int64)
     mean_probs = torch.stack(member_probs, dim=0).mean(dim=0)
+    votes_needed: int | None = None
+    if aggregation == "majority":
+        vote_sum = torch.stack(member_masks, dim=0).sum(dim=0)
+        votes_needed = int((n_members // 2) + 1)
+        mask = (vote_sum >= votes_needed).to(torch.int64)
+        payload_threshold = float("nan")
+        resolved_ensemble_threshold = None
+    else:
+        resolved_ensemble_threshold = (
+            float(ensemble_threshold)
+            if ensemble_threshold is not None
+            else float(sum(float(x) for x in thresholds) / len(thresholds))
+        )
+        if resolved_ensemble_threshold <= 0.0 or resolved_ensemble_threshold >= 1.0:
+            raise ValueError("ensemble_threshold must be in (0.0, 1.0)")
+        mask = (mean_probs >= resolved_ensemble_threshold).to(torch.int64)
+        payload_threshold = float(resolved_ensemble_threshold)
+
     out = _build_prediction_payload(
         probs=mean_probs,
-        mask=majority_mask,
-        threshold=float("nan")
+        mask=mask,
+        threshold=payload_threshold
     )
     out["n_members"] = n_members
     out["votes_needed"] = votes_needed
     out["member_thresholds"] = [float(x) for x in thresholds]
+    out["ensemble_aggregation"] = aggregation
+    out["ensemble_threshold"] = (
+        float(resolved_ensemble_threshold)
+        if resolved_ensemble_threshold is not None
+        else None
+    )
     return out
 
 

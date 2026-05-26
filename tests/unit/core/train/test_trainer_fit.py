@@ -62,6 +62,10 @@ def test_fit_with_validation_saves_checkpoint(tmp_path: Path):
     assert summary["best_epoch"] >= 0
     assert (tmp_path / "fully_connected.pt").exists()
     assert isinstance(summary["best_metrics"], dict)
+    metrics = summary["best_metrics"]
+    assert metrics["threshold_policy"] == "max-recall-min-precision"
+    assert metrics["threshold_min_precision"] == pytest.approx(0.25)
+    assert isinstance(metrics["threshold_grid"], list)
 
 
 def test_fit_without_validation_saves_no_val_checkpoint(tmp_path: Path):
@@ -103,6 +107,21 @@ def test_run_epoch_eval_no_valid_residues():
 
     out = trainer._run_epoch(0, train=False)
     assert out["eval_metrics"]["threshold_status"] == "no_valid_residues"
+    assert out["eval_metrics"]["threshold_policy"] == "max-recall-min-precision"
+
+
+def test_run_epoch_eval_records_configured_threshold_policy():
+    train_loader = _make_batches(n_batches=1, mask_value=1)
+    val_loader = _make_batches(n_batches=1, mask_value=1)
+    trainer = _make_trainer(train_loader, val_loader, emb_dim=4, epochs=1)
+    trainer.config.threshold_policy = "fixed"
+    trainer.config.threshold_fixed_value = 0.5
+
+    out = trainer._run_epoch(0, train=False)
+    metrics = out["eval_metrics"]
+    assert metrics["threshold_policy"] == "fixed"
+    assert metrics["threshold"] == pytest.approx(0.5)
+    assert metrics["threshold_status"] == "ok"
 
 
 class _AlwaysPruneTrial:

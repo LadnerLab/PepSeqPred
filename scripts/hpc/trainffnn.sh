@@ -26,6 +26,8 @@ usage() {
     echo "  N_FOLDS               default: 1 (1=single holdout, >1=K-fold ensemble)"
     echo "  SPLIT_SEEDS           default: 11,22,33,44,55"
     echo "  TRAIN_SEEDS           default: 101,202,303,404,505"
+    echo "  SPLIT_STRATEGY        default: size-balanced"
+    echo "  SPLIT_REPORT_JSON     default: unset (<save-path>/split_report.json)"
     echo "  THRESHOLD_POLICY      default: max-recall-min-precision"
     echo "  THRESHOLD_MIN_PRECISION default: 0.25"
     echo "  THRESHOLD_MIN_RECALL  default: 0.80"
@@ -69,6 +71,8 @@ THRESHOLD_MIN_RECALL="${THRESHOLD_MIN_RECALL:-0.80}"
 THRESHOLD_FIXED_VALUE="${THRESHOLD_FIXED_VALUE:-0.50}"
 SPLIT_SEEDS="${SPLIT_SEEDS:-11,22,33,44,55}"
 TRAIN_SEEDS="${TRAIN_SEEDS:-101,202,303,404,505}"
+SPLIT_STRATEGY="${SPLIT_STRATEGY:-size-balanced}"
+SPLIT_REPORT_JSON="${SPLIT_REPORT_JSON:-}"
 N_FOLDS="${N_FOLDS:-1}"
 BATCH_SIZE="${BATCH_SIZE:-256}" # ensure batch size is 4 times what you would do for one GPU (for example. 256 = 64 * 4)
 LR="${LR:-0.001}"
@@ -124,6 +128,11 @@ if [ -n "$POS_WEIGHT" ]; then
     POS_WEIGHT_ARGS+=(--pos-weight "$POS_WEIGHT")
 fi
 
+SPLIT_REPORT_ARGS=()
+if [ -n "$SPLIT_REPORT_JSON" ]; then
+    SPLIT_REPORT_ARGS+=(--split-report-json "$SPLIT_REPORT_JSON")
+fi
+
 ${LAUNCHER} torchrun --nproc_per_node=4 train_ffnn.pyz \
     --embedding-dirs "${EMBEDDING_DIRS[@]}" \
     --label-shards "${LABEL_SHARDS[@]}" \
@@ -143,6 +152,8 @@ ${LAUNCHER} torchrun --nproc_per_node=4 train_ffnn.pyz \
     --threshold-fixed-value "$THRESHOLD_FIXED_VALUE" \
     --val-frac "$VAL_FRAC" \
     --split-type "$SPLIT_TYPE" \
+    --split-strategy "$SPLIT_STRATEGY" \
+    "${SPLIT_REPORT_ARGS[@]}" \
     --save-path "$SAVE_PATH" \
     --results-csv "$RESULTS_CSV" \
     --num-workers "$NUM_WORKERS" \

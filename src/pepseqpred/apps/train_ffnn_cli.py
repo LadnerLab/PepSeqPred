@@ -40,10 +40,15 @@ from pepseqpred.core.train.trainer import (
 )
 from pepseqpred.core.train.ddp import init_ddp
 from pepseqpred.core.train.split import (
+    SPLIT_STRATEGIES,
     split_ids,
     split_ids_grouped,
+    split_ids_label_stratified,
     build_kfold_splits,
     build_grouped_kfold_splits,
+    build_label_stratified_kfold_splits,
+    build_label_support_by_id,
+    build_split_report,
     partition_ids_weighted,
     sort_ids_for_locality,
     shuffle_ids_by_group
@@ -107,6 +112,21 @@ def _finite_or_none(value: Any) -> float | None:
     except (TypeError, ValueError):
         return None
     return num if math.isfinite(num) else None
+
+
+def _split_summary_csv_fields(
+    prefix: str,
+    summary: Mapping[str, Any] | None
+) -> Dict[str, Any]:
+    """Flattens split report summary fields for run CSV artifacts."""
+    summary = summary or {}
+    return {
+        f"{prefix}Proteins": _finite_or_none(summary.get("protein_count")),
+        f"{prefix}ValidResidues": _finite_or_none(summary.get("valid_residues")),
+        f"{prefix}PosResidues": _finite_or_none(summary.get("positive_residues")),
+        f"{prefix}NegResidues": _finite_or_none(summary.get("negative_residues")),
+        f"{prefix}PositiveRate": _finite_or_none(summary.get("positive_rate")),
+    }
 
 
 def _parse_plot_formats(raw: str) -> Tuple[str, ...]:
@@ -674,11 +694,27 @@ def _check_family_leakage(train_ids: List[str], val_ids: List[str], family_group
 def _build_run_plans(
     args: argparse.Namespace,
     protein_ids: List[str],
-    family_groups: Dict[str, str]
+    split_groups: Dict[str, str] | None = None,
+    family_groups: Dict[str, str] | None = None,
+    label_support_by_id: Mapping[str, Mapping[str, Any]] | None = None
 ) -> Tuple[List[RunPlan], Dict[str, Any]]:
     """Builds run plans from unified seed lists and n-folds configuration."""
     if len(protein_ids) == 0:
         raise ValueError("No proteins found to train on")
+
+    split_strategy = str(getattr(args, "split_strategy", "size-balanced"))
+    # Backward-compatibility: legacy callers pass family_groups as the third
+    # positional argument, which now maps to split_groups.
+    if family_groups is None and str(args.split_type) == "id-family" and split_groups is not None:
+        family_groups = dict(split_groups)
+    family_groups = family_groups or {}
+    if split_groups is None:
+        split_groups = (
+            family_groups
+            if str(args.split_type) == "id-family"
+            else {protein_id: protein_id for protein_id in protein_ids}
+        )
+    label_support_by_id = label_support_by_id or {}
 
     n_folds = int(args.n_folds)
     if n_folds < 1:
@@ -706,7 +742,18 @@ def _build_run_plans(
     if n_folds == 1:
         run_plans: List[RunPlan] = []
         for run_index, (split_seed, train_seed) in enumerate(zip(split_seeds, train_seeds), start=1):
-            if args.split_type == "id-family":
+            if split_strategy == "label-stratified":
+                train_ids_all, val_ids_all = split_ids_label_stratified(
+                    protein_ids,
+                    args.val_frac,
+                    split_seed,
+                    split_groups,
+                    label_support_by_id,
+                )
+                if args.split_type == "id-family":
+                    _check_family_leakage(
+                        train_ids_all, val_ids_all, family_groups)
+            elif args.split_type == "id-family":
                 train_ids_all, val_ids_all = split_ids_grouped(
                     protein_ids, args.val_frac, split_seed, family_groups
                 )
@@ -737,6 +784,7 @@ def _build_run_plans(
             "train_seeds": [int(x) for x in train_seeds],
             "n_folds": 1,
             "n_sets": int(n_sets),
+            "split_strategy": split_strategy,
             "train_mode": train_mode
         }
 
@@ -746,7 +794,15 @@ def _build_run_plans(
         zip(split_seeds, train_seeds),
         start=1
     ):
-        if args.split_type == "id-family":
+        if split_strategy == "label-stratified":
+            fold_splits = build_label_stratified_kfold_splits(
+                protein_ids,
+                n_folds=n_folds,
+                seed=int(set_split_seed),
+                groups=split_groups,
+                support_by_id=label_support_by_id,
+            )
+        elif args.split_type == "id-family":
             fold_splits = build_grouped_kfold_splits(
                 protein_ids, n_folds=n_folds, seed=int(set_split_seed), groups=family_groups
             )
@@ -798,6 +854,7 @@ def _build_run_plans(
         "n_folds": int(n_folds),
         "n_sets": int(n_sets),
         "ensemble_seed_mode": "set-paired",
+        "split_strategy": split_strategy,
         "train_mode": train_mode
     }
 
@@ -895,6 +952,15 @@ def main() -> None:
                         default="id-family",
                         choices=["id", "id-family"],
                         help="Data partition type, use ID only or ID and taxonomic family.")
+    parser.add_argument("--split-strategy",
+                        type=str,
+                        default="size-balanced",
+                        choices=list(SPLIT_STRATEGIES),
+                        help="Split assignment strategy. Default preserves existing size-balanced behavior.")
+    parser.add_argument("--split-report-json",
+                        type=Path,
+                        default=None,
+                        help="Optional split report JSON path. Defaults to <save-path>/split_report.json.")
     parser.add_argument("--num-workers",
                         action="store",
                         dest="num_workers",
@@ -1076,18 +1142,37 @@ def main() -> None:
     if args.subset > 0:
         protein_ids = protein_ids[:args.subset]
 
-    # parition data by ID + family or just ID
+    split_report_json = args.split_report_json or (
+        args.save_path / "split_report.json")
+
+    # partition data by ID + family or just ID
     family_groups: Dict[str, str] = {}
     missing_family_ids = 0
-    if args.split_type == "id-family":
-        for protein_id in protein_ids:
-            family = base_dataset.embedding_family_by_id.get(protein_id)
-            if family is None or str(family).strip() == "":
-                # singleton group when family missing fallback
-                family_groups[protein_id] = f"__missing_family__:{protein_id}"
-                missing_family_ids += 1
-            else:
-                family_groups[protein_id] = str(family)
+    for protein_id in protein_ids:
+        family = base_dataset.embedding_family_by_id.get(protein_id)
+        if family is None or str(family).strip() == "":
+            # singleton group when family missing fallback
+            family_groups[protein_id] = f"__missing_family__:{protein_id}"
+            missing_family_ids += 1
+        else:
+            family_groups[protein_id] = str(family)
+    split_groups = (
+        family_groups
+        if args.split_type == "id-family"
+        else {protein_id: protein_id for protein_id in protein_ids}
+    )
+
+    if ddp is None or rank == 0:
+        label_support_by_id = build_label_support_by_id(
+            protein_ids,
+            base_dataset.label_index,
+        )
+    else:
+        label_support_by_id = {}
+    if ddp is not None:
+        obj = [label_support_by_id]
+        dist.broadcast_object_list(obj, src=0)
+        label_support_by_id = obj[0]
 
     # estimate relative workload without tensor I/O by using embedding file size.
     id_weights: Dict[str, float] = {}
@@ -1106,12 +1191,52 @@ def main() -> None:
         for protein_id in protein_ids
     }
 
-    run_plans, split_meta = _build_run_plans(args, protein_ids, family_groups)
+    run_plans, split_meta = _build_run_plans(
+        args,
+        protein_ids,
+        split_groups,
+        family_groups,
+        label_support_by_id,
+    )
+    split_summary_by_run: Dict[int, Mapping[str, Any]] = {}
     if rank == 0:
+        split_report_payload = build_split_report(
+            run_splits=[
+                {
+                    "run_index": plan.run_index,
+                    "train_mode": plan.train_mode,
+                    "split_seed": plan.split_seed,
+                    "train_seed": plan.train_seed,
+                    "fold_index": plan.fold_index,
+                    "n_folds": plan.n_folds,
+                    "ensemble_set_index": plan.ensemble_set_index,
+                    "train_ids": plan.train_ids_all,
+                    "val_ids": plan.val_ids_all,
+                }
+                for plan in run_plans
+            ],
+            support_by_id=label_support_by_id,
+            families_by_id=family_groups,
+            split_type=str(args.split_type),
+            split_strategy=str(args.split_strategy),
+        )
+        split_report_json.parent.mkdir(parents=True, exist_ok=True)
+        split_report_json.write_text(
+            json.dumps(_sanitize_for_json(split_report_payload),
+                       indent=2, allow_nan=False),
+            encoding="utf-8",
+        )
+        split_summary_by_run = {
+            int(entry["run_index"]): entry
+            for entry in split_report_payload["runs"]
+            if entry.get("run_index") is not None
+        }
         logger.info("run_plan_init", extra={"extra": {
             "train_mode": str(split_meta["train_mode"]),
             "n_runs": len(run_plans),
             "split_type": args.split_type,
+            "split_strategy": args.split_strategy,
+            "split_report_json": str(split_report_json),
             "missing_family_ids": missing_family_ids,
             "n_folds": int(split_meta["n_folds"]) if "n_folds" in split_meta else None,
             "n_sets": int(split_meta["n_sets"]) if "n_sets" in split_meta else None,
@@ -1372,6 +1497,9 @@ def main() -> None:
                     "best_val_loss": best_val_loss,
                     "best_score_value": best_score_value
                 }})
+            split_entry = split_summary_by_run.get(int(run_index), {})
+            train_split_summary = split_entry.get("train", {})
+            val_split_summary = split_entry.get("validation", {})
             row = {
                 "RunIndex": run_index,
                 "TrainMode": run_plan.train_mode,
@@ -1387,6 +1515,10 @@ def main() -> None:
                 "NFolds": run_plan.n_folds,
                 "SplitSeed": split_seed,
                 "TrainSeed": train_seed,
+                "SplitStrategy": str(args.split_strategy),
+                "SplitReportJson": str(split_report_json),
+                **_split_summary_csv_fields("Train", train_split_summary),
+                **_split_summary_csv_fields("Val", val_split_summary),
                 "RunSaveDir": str(run_save_dir) if run_save_dir is not None else None,
                 "CheckpointPath": str(checkpoint_path) if checkpoint_path is not None else None,
                 "BestMetricKey": args.best_model_metric,
@@ -1426,6 +1558,8 @@ def main() -> None:
             "n_runs": int(len(run_rows)),
             "train_mode": str(split_meta["train_mode"]),
             "split_type": str(args.split_type),
+            "split_strategy": str(args.split_strategy),
+            "split_report_json": str(split_report_json),
             "best_model_metric": str(args.best_model_metric),
             "threshold_policy": str(args.threshold_policy),
             "threshold_min_precision": float(args.threshold_min_precision),
@@ -1435,6 +1569,8 @@ def main() -> None:
             "train_seeds": [int(x) for x in split_meta["train_seeds"]],
             "metrics": {
                 "BestMetricValue": summarize_numeric(df_runs["BestMetricValue"]),
+                "TrainPositiveRate": summarize_numeric(df_runs["TrainPositiveRate"]),
+                "ValPositiveRate": summarize_numeric(df_runs["ValPositiveRate"]),
                 "Threshold": summarize_numeric(df_runs["Threshold"]),
                 "ThresholdPredPosFrac": summarize_numeric(df_runs["ThresholdPredPosFrac"]),
                 "PR_AUC": summarize_numeric(df_runs["PR_AUC"]),
@@ -1556,6 +1692,8 @@ def main() -> None:
                     "ensemble_type": "kfold_majority_vote",
                     "train_mode": str(split_meta["train_mode"]),
                     "split_type": str(args.split_type),
+                    "split_strategy": str(args.split_strategy),
+                    "split_report_json": str(split_report_json),
                     "n_folds": int(split_meta["n_folds"]),
                     "set_index": int(entry["set_index"]),
                     "split_seed": int(entry["split_seed"]),
@@ -1609,6 +1747,8 @@ def main() -> None:
                     "ensemble_type": "kfold_majority_vote",
                     "train_mode": str(split_meta["train_mode"]),
                     "split_type": str(args.split_type),
+                    "split_strategy": str(args.split_strategy),
+                    "split_report_json": str(split_report_json),
                     "n_folds": int(split_meta["n_folds"]),
                     "n_sets": int(n_sets),
                     "ensemble_seed_mode": str(

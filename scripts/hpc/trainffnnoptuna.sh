@@ -18,6 +18,8 @@ usage() {
     echo "Usage: $0 <embedding_dirs...> -- <label_shards...>"
     echo "  embedding_dirs: one or more directories containing per-protein embeddings (.pt)"
     echo "  label_shards: one or more label shard .pt files"
+    echo "  SPLIT_STRATEGY default: size-balanced"
+    echo "  SPLIT_REPORT_JSON default: unset (<save-path>/split_report.json)"
     echo "  THRESHOLD_POLICY default: max-recall-min-precision"
     echo "  THRESHOLD_MIN_PRECISION default: 0.25"
     echo "  THRESHOLD_MIN_RECALL default: 0.80"
@@ -65,6 +67,8 @@ THRESHOLD_MIN_PRECISION="${THRESHOLD_MIN_PRECISION:-0.25}"
 THRESHOLD_MIN_RECALL="${THRESHOLD_MIN_RECALL:-0.80}"
 THRESHOLD_FIXED_VALUE="${THRESHOLD_FIXED_VALUE:-0.50}"
 VAL_FRAC="${VAL_FRAC:-0.2}"
+SPLIT_STRATEGY="${SPLIT_STRATEGY:-size-balanced}"
+SPLIT_REPORT_JSON="${SPLIT_REPORT_JSON:-}"
 SUBSET="${SUBSET:-0}"
 NUM_WORKERS="${NUM_WORKERS:-1}"
 WINDOW_SIZE="${WINDOW_SIZE:-1000}"
@@ -126,6 +130,11 @@ if [ -n "$POS_WEIGHT" ]; then
     POS_WEIGHT_ARGS+=(--pos-weight "$POS_WEIGHT")
 fi
 
+SPLIT_REPORT_ARGS=()
+if [ -n "$SPLIT_REPORT_JSON" ]; then
+    SPLIT_REPORT_ARGS+=(--split-report-json "$SPLIT_REPORT_JSON")
+fi
+
 ${LAUNCHER} torchrun --nproc_per_node=4 train_ffnn_optuna.pyz \
     --embedding-dirs "${EMBEDDING_DIRS[@]}" \
     --label-shards "${LABEL_SHARDS[@]}" \
@@ -141,6 +150,8 @@ ${LAUNCHER} torchrun --nproc_per_node=4 train_ffnn_optuna.pyz \
     --threshold-fixed-value "$THRESHOLD_FIXED_VALUE" \
     --val-frac "$VAL_FRAC" \
     --split-type "$SPLIT_TYPE" \
+    --split-strategy "$SPLIT_STRATEGY" \
+    "${SPLIT_REPORT_ARGS[@]}" \
     --subset "$SUBSET" \
     --num-workers "$NUM_WORKERS" \
     --save-path "$SAVE_PATH" \

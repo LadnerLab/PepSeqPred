@@ -25,6 +25,7 @@ Usage
 
 import argparse
 import json
+import math
 import time
 import random
 from pathlib import Path
@@ -42,8 +43,12 @@ from pepseqpred.core.models.ffnn import PepSeqFFNN
 from pepseqpred.core.train.trainer import Trainer, TrainerConfig
 from pepseqpred.core.train.ddp import init_ddp
 from pepseqpred.core.train.split import (
+    SPLIT_STRATEGIES,
     split_ids,
     split_ids_grouped,
+    split_ids_label_stratified,
+    build_label_support_by_id,
+    build_split_report,
     partition_ids_weighted,
     sort_ids_for_locality
 )
@@ -63,6 +68,30 @@ def _broadcast_params(params: Dict[str, Any], ddp: Dict[str, Any] | None) -> Dic
     obj = [params]
     dist.broadcast_object_list(obj, src=0)
     return obj[0]
+
+
+def _finite_or_none(value: Any) -> float | None:
+    """Tries to convert number to float if finite, otherwise returns None."""
+    try:
+        num = float(value)
+    except (TypeError, ValueError):
+        return None
+    return num if math.isfinite(num) else None
+
+
+def _split_summary_csv_fields(
+    prefix: str,
+    summary: Dict[str, Any] | None
+) -> Dict[str, Any]:
+    """Flattens split report summary fields for trial CSV artifacts."""
+    summary = summary or {}
+    return {
+        f"{prefix}Proteins": _finite_or_none(summary.get("protein_count")),
+        f"{prefix}ValidResidues": _finite_or_none(summary.get("valid_residues")),
+        f"{prefix}PosResidues": _finite_or_none(summary.get("positive_residues")),
+        f"{prefix}NegResidues": _finite_or_none(summary.get("negative_residues")),
+        f"{prefix}PositiveRate": _finite_or_none(summary.get("positive_rate")),
+    }
 
 
 def build_hidden_sizes(trial: optuna.trial.Trial,
@@ -195,6 +224,15 @@ def main() -> None:
                         default="id-family",
                         choices=["id", "id-family"],
                         help="Data partition type, use ID only or ID and taxonomic family.")
+    parser.add_argument("--split-strategy",
+                        type=str,
+                        default="size-balanced",
+                        choices=list(SPLIT_STRATEGIES),
+                        help="Split assignment strategy. Default preserves existing size-balanced behavior.")
+    parser.add_argument("--split-report-json",
+                        type=Path,
+                        default=None,
+                        help="Optional split report JSON path. Defaults to <save-path>/split_report.json.")
     parser.add_argument("--num-workers",
                         type=int,
                         default=4,
@@ -342,24 +380,55 @@ def main() -> None:
     if args.subset > 0:
         protein_ids = protein_ids[:args.subset]
 
-    # parition data by ID + family or just ID
-    if args.split_type == "id-family":
-        family_groups: Dict[str, str] = {}
-        missing_family_ids = 0
+    split_report_json = args.split_report_json or (
+        args.save_path / "split_report.json")
 
-        for protein_id in protein_ids:
-            family = base_dataset.embedding_family_by_id.get(protein_id)
-            if family is None or str(family).strip() == "":
-                # singleton group when family missing fallback
-                family_groups[protein_id] = f"__missing_family__:{protein_id}"
-                missing_family_ids += 1
-            else:
-                family_groups[protein_id] = str(family)
+    # partition data by ID + family or just ID
+    family_groups: Dict[str, str] = {}
+    missing_family_ids = 0
+    for protein_id in protein_ids:
+        family = base_dataset.embedding_family_by_id.get(protein_id)
+        if family is None or str(family).strip() == "":
+            family_groups[protein_id] = f"__missing_family__:{protein_id}"
+            missing_family_ids += 1
+        else:
+            family_groups[protein_id] = str(family)
+    split_groups = (
+        family_groups
+        if args.split_type == "id-family"
+        else {protein_id: protein_id for protein_id in protein_ids}
+    )
 
+    if ddp is None or rank == 0:
+        label_support_by_id = build_label_support_by_id(
+            protein_ids,
+            base_dataset.label_index,
+        )
+    else:
+        label_support_by_id = {}
+    if ddp is not None:
+        obj = [label_support_by_id]
+        dist.broadcast_object_list(obj, src=0)
+        label_support_by_id = obj[0]
+
+    if args.split_strategy == "label-stratified":
+        train_ids_all, val_ids_all = split_ids_label_stratified(
+            protein_ids,
+            args.val_frac,
+            seed,
+            split_groups,
+            label_support_by_id,
+        )
+    elif args.split_type == "id-family":
         train_ids_all, val_ids_all = split_ids_grouped(
             protein_ids, args.val_frac, seed, family_groups
         )
+    else:
+        train_ids_all, val_ids_all = split_ids(
+            protein_ids, args.val_frac, seed
+        )
 
+    if args.split_type == "id-family":
         train_families = {family_groups[pid] for pid in train_ids_all}
         val_families = {family_groups[pid] for pid in val_ids_all}
         overlap = train_families & val_families
@@ -367,23 +436,53 @@ def main() -> None:
             raise RuntimeError(
                 f"Family leakage detected for split_type='id-family': n_overlap={len(overlap)}"
             )
-
-        if rank == 0:
-            logger.info("family_split_summary",
-                        extra={"extra": {
-                            "split_type": args.split_type,
-                            "train_ids": len(train_ids_all),
-                            "val_ids": len(val_ids_all),
-                            "val_families": len(val_families),
-                            "missing_family_ids": missing_family_ids
-                        }})
     else:
-        train_ids_all, val_ids_all = split_ids(
-            protein_ids, args.val_frac, seed
-        )
+        val_families = set()
 
     if len(train_ids_all) == 0:
         raise ValueError("Global split produced 0 train IDs")
+
+    split_report_payload = None
+    train_split_summary: Dict[str, Any] = {}
+    val_split_summary: Dict[str, Any] = {}
+    if rank == 0:
+        split_report_payload = build_split_report(
+            run_splits=[
+                {
+                    "run_index": 1,
+                    "train_mode": "optuna-holdout",
+                    "split_seed": int(seed),
+                    "train_seed": int(seed),
+                    "fold_index": None,
+                    "n_folds": 1,
+                    "ensemble_set_index": None,
+                    "train_ids": train_ids_all,
+                    "val_ids": val_ids_all,
+                }
+            ],
+            support_by_id=label_support_by_id,
+            families_by_id=family_groups,
+            split_type=str(args.split_type),
+            split_strategy=str(args.split_strategy),
+        )
+        split_report_json.parent.mkdir(parents=True, exist_ok=True)
+        split_report_json.write_text(
+            json.dumps(split_report_payload, indent=2, allow_nan=False),
+            encoding="utf-8",
+        )
+        split_entry = split_report_payload["runs"][0]
+        train_split_summary = dict(split_entry["train"])
+        val_split_summary = dict(split_entry["validation"])
+        logger.info("family_split_summary",
+                    extra={"extra": {
+                        "split_type": args.split_type,
+                        "split_strategy": args.split_strategy,
+                        "split_report_json": str(split_report_json),
+                        "train_ids": len(train_ids_all),
+                        "val_ids": len(val_ids_all),
+                        "val_families": len(val_families),
+                        "missing_family_ids": missing_family_ids
+                    }})
 
     # weight by embedding file size to reduce I/O
     id_weights: Dict[str, float] = {}
@@ -690,6 +789,10 @@ def main() -> None:
                 "WeightDecay": float(wd),
                 "PosWeight": float(pos_weight) if pos_weight else 1.0,
                 "Epochs": int(args.epochs),
+                "SplitStrategy": str(args.split_strategy),
+                "SplitReportJson": str(split_report_json),
+                **_split_summary_csv_fields("Train", train_split_summary),
+                **_split_summary_csv_fields("Val", val_split_summary),
                 "BestValLossAtScore": float(best_val_loss_at_score),
                 "BestEpoch": int(best_epoch),
                 "Precision": float(best_metrics.get("precision", float("nan"))),
@@ -768,6 +871,8 @@ def main() -> None:
                         "best_params": dict(best.params),
                         "best_user_attrs": dict(best.user_attrs),
                         "metric": args.metric,
+                        "split_strategy": str(args.split_strategy),
+                        "split_report_json": str(split_report_json),
                         "threshold_policy": str(args.threshold_policy),
                         "threshold_min_precision": float(args.threshold_min_precision),
                         "threshold_min_recall": float(args.threshold_min_recall),

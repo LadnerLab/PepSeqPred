@@ -12,11 +12,23 @@ def _args(**overrides):
         train_seeds=None,
         seed=42,
         split_type="id-family",
+        split_strategy="size-balanced",
         val_frac=0.5,
     )
     for key, value in overrides.items():
         setattr(base, key, value)
     return base
+
+
+def _label_support(ids, family_groups):
+    return {
+        protein_id: {
+            "valid_residues": 10,
+            "positive_residues": 10 if family_groups[protein_id] in {"A", "C"} else 0,
+            "negative_residues": 0 if family_groups[protein_id] in {"A", "C"} else 10,
+        }
+        for protein_id in ids
+    }
 
 
 def test_build_run_plans_kfold_set_pairs_map_to_full_kfold_sets():
@@ -39,6 +51,7 @@ def test_build_run_plans_kfold_set_pairs_map_to_full_kfold_sets():
     assert meta["train_seeds"] == [11, 22]
     assert meta["train_mode"] == "ensemble-kfold"
     assert meta["ensemble_seed_mode"] == "set-paired"
+    assert meta["split_strategy"] == "size-balanced"
 
     set_1 = [plan for plan in plans if plan.ensemble_set_index == 1]
     assert len(set_1) == 2
@@ -103,6 +116,7 @@ def test_build_run_plans_single_fold_keeps_holdout_behavior():
     assert meta["n_folds"] == 1
     assert meta["n_sets"] == 2
     assert meta["train_mode"] == "seeded"
+    assert meta["split_strategy"] == "size-balanced"
 
 
 def test_build_run_plans_requires_n_folds_at_least_one():
@@ -111,3 +125,69 @@ def test_build_run_plans_requires_n_folds_at_least_one():
 
     with pytest.raises(ValueError, match="--n-folds must be >= 1"):
         _build_run_plans(args, ids, {})
+
+
+def test_build_run_plans_label_stratified_single_fold_uses_support():
+    args = _args(
+        n_folds=1,
+        split_seeds="7",
+        train_seeds="77",
+        split_type="id-family",
+        split_strategy="label-stratified",
+    )
+    ids = ["a1", "a2", "b1", "b2", "c1", "c2", "d1", "d2"]
+    family_groups = {protein_id: protein_id[0].upper() for protein_id in ids}
+    support = _label_support(ids, family_groups)
+
+    plans, meta = _build_run_plans(
+        args,
+        ids,
+        split_groups=family_groups,
+        family_groups=family_groups,
+        label_support_by_id=support,
+    )
+
+    assert len(plans) == 1
+    plan = plans[0]
+    train_families = {family_groups[i] for i in plan.train_ids_all}
+    val_families = {family_groups[i] for i in plan.val_ids_all}
+    assert train_families.isdisjoint(val_families)
+    val_pos = sum(support[i]["positive_residues"] for i in plan.val_ids_all)
+    val_valid = sum(support[i]["valid_residues"] for i in plan.val_ids_all)
+    assert val_valid > 0
+    assert (val_pos / val_valid) == pytest.approx(0.5)
+    assert meta["split_strategy"] == "label-stratified"
+    assert meta["n_folds"] == 1
+
+
+def test_build_run_plans_label_stratified_kfold_uses_support():
+    args = _args(
+        n_folds=2,
+        split_seeds="7",
+        train_seeds="77",
+        split_type="id-family",
+        split_strategy="label-stratified",
+    )
+    ids = ["a1", "a2", "b1", "b2", "c1", "c2", "d1", "d2"]
+    family_groups = {protein_id: protein_id[0].upper() for protein_id in ids}
+    support = _label_support(ids, family_groups)
+
+    plans, meta = _build_run_plans(
+        args,
+        ids,
+        split_groups=family_groups,
+        family_groups=family_groups,
+        label_support_by_id=support,
+    )
+
+    assert len(plans) == 2
+    assert meta["split_strategy"] == "label-stratified"
+    assert meta["n_folds"] == 2
+    for plan in plans:
+        train_families = {family_groups[i] for i in plan.train_ids_all}
+        val_families = {family_groups[i] for i in plan.val_ids_all}
+        assert train_families.isdisjoint(val_families)
+        val_pos = sum(support[i]["positive_residues"] for i in plan.val_ids_all)
+        val_valid = sum(support[i]["valid_residues"] for i in plan.val_ids_all)
+        assert val_valid > 0
+        assert (val_pos / val_valid) == pytest.approx(0.5)

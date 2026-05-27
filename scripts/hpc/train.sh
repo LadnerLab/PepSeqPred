@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=ffnn_v1.0
+#SBATCH --job-name=pepseqpred_train
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=20
@@ -7,8 +7,8 @@
 #SBATCH --gpus-per-node=a100:4
 #SBATCH --mem=256G
 #SBATCH --time=12:00:00
-#SBATCH --output=/scratch/%u/train_ffnn_slurm/output/%x_%j.out
-#SBATCH --error=/scratch/%u/train_ffnn_slurm/error/%x_%j.err
+#SBATCH --output=/scratch/%u/train_slurm/output/%x_%j.out
+#SBATCH --error=/scratch/%u/train_slurm/error/%x_%j.err
 
 # for testing
 USE_SRUN="${USE_SRUN:-1}"
@@ -32,6 +32,7 @@ usage() {
     echo "  THRESHOLD_MIN_PRECISION default: 0.25"
     echo "  THRESHOLD_MIN_RECALL  default: 0.80"
     echo "  THRESHOLD_FIXED_VALUE default: 0.50"
+    echo "  MODEL_HEAD            default: ffnn (ffnn or conv1d)"
 }
 
 # require at least one embedding dir, separator (--), one label shard
@@ -63,6 +64,11 @@ fi
 
 HIDDEN_SIZES="${HIDDEN_SIZES:-150,120,45}"
 DROPOUTS="${DROPOUTS:-0.1,0.1,0.1}"
+MODEL_HEAD="${MODEL_HEAD:-ffnn}"
+CONV_CHANNELS="${CONV_CHANNELS:-64}"
+CONV_LAYERS="${CONV_LAYERS:-2}"
+CONV_KERNEL_SIZE="${CONV_KERNEL_SIZE:-9}"
+CONV_DROPOUT="${CONV_DROPOUT:-0.1}"
 EPOCHS="${EPOCHS:-10}"
 BEST_MODEL_METRIC="${BEST_MODEL_METRIC:-pr_auc}"
 THRESHOLD_POLICY="${THRESHOLD_POLICY:-max-recall-min-precision}"
@@ -79,7 +85,7 @@ LR="${LR:-0.001}"
 WD="${WD:-0.0}"
 VAL_FRAC="${VAL_FRAC:-0.2}"
 POS_WEIGHT="${POS_WEIGHT:-}" # optional manual override; empty uses train-only auto-compute
-SAVE_PATH="/scratch/$USER/models/${SLURM_JOB_NAME:-ffnn_job}"
+SAVE_PATH="/scratch/$USER/models/${SLURM_JOB_NAME:-train_job}"
 RESULTS_CSV="${SAVE_PATH}/runs.csv"
 ENSEMBLE_MANIFEST="${ENSEMBLE_MANIFEST:-${SAVE_PATH}/ensemble_manifest.json}"
 NUM_WORKERS="${NUM_WORKERS:-1}"
@@ -133,12 +139,17 @@ if [ -n "$SPLIT_REPORT_JSON" ]; then
     SPLIT_REPORT_ARGS+=(--split-report-json "$SPLIT_REPORT_JSON")
 fi
 
-${LAUNCHER} torchrun --nproc_per_node=4 train_ffnn.pyz \
+${LAUNCHER} torchrun --nproc_per_node=4 train.pyz \
     --embedding-dirs "${EMBEDDING_DIRS[@]}" \
     --label-shards "${LABEL_SHARDS[@]}" \
     --label-cache-mode "$LABEL_CACHE_MODE" \
     --hidden-sizes "$HIDDEN_SIZES" \
     --dropouts "$DROPOUTS" \
+    --model-head "$MODEL_HEAD" \
+    --conv-channels "$CONV_CHANNELS" \
+    --conv-layers "$CONV_LAYERS" \
+    --conv-kernel-size "$CONV_KERNEL_SIZE" \
+    --conv-dropout "$CONV_DROPOUT" \
     --epochs "$EPOCHS" \
     "${TRAIN_ARGS[@]}" \
     --batch-size "$BATCH_SIZE" \
@@ -161,4 +172,4 @@ ${LAUNCHER} torchrun --nproc_per_node=4 train_ffnn.pyz \
     --stride "$STRIDE" \
     "${VAL_CURVE_ARGS[@]}"
 
-# USAGE: sbatch trainffnn.sh /scratch/$USER/esm2/artifacts/pts/shard_000 /scratch/$USER/esm2/artifacts/pts/shard_001 /scratch/$USER/esm2/artifacts/pts/shard_002 /scratch/$USER/esm2/artifacts/pts/shard_003 -- /scratch/$USER/labels/labels_shard_000.pt /scratch/$USER/labels/labels_shard_001.pt /scratch/$USER/labels/labels_shard_002.pt /scratch/$USER/labels/labels_shard_003.pt
+# USAGE: sbatch train.sh /scratch/$USER/esm2/artifacts/pts/shard_000 /scratch/$USER/esm2/artifacts/pts/shard_001 /scratch/$USER/esm2/artifacts/pts/shard_002 /scratch/$USER/esm2/artifacts/pts/shard_003 -- /scratch/$USER/labels/labels_shard_000.pt /scratch/$USER/labels/labels_shard_001.pt /scratch/$USER/labels/labels_shard_002.pt /scratch/$USER/labels/labels_shard_003.pt

@@ -1,6 +1,6 @@
 import argparse
 import pytest
-from pepseqpred.apps.train_ffnn_cli import _build_run_plans
+from pepseqpred.apps.train_cli import _build_run_plans
 
 pytestmark = pytest.mark.unit
 

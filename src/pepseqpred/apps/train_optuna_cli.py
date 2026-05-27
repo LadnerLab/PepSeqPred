@@ -1,9 +1,9 @@
-"""train_ffnn_optuna_cli.py
+"""train_optuna_cli.py
 
-This CLI is very similar to `train_ffnn_cli.py`, except it optimizes for the best possible hyperparameters
-within the user-defined ranges in the shell script `scripts/hpc/trainffnnoptuna.sh`.
+This CLI is very similar to `train_cli.py`, except it optimizes for the best possible hyperparameters
+within the user-defined ranges in the shell script `scripts/hpc/trainoptuna.sh`.
 
-Handles end-to-end training, evaluation, and hyperparameter optimization of a PepSeqPredFFNN with the goal 
+Handles end-to-end training, evaluation, and hyperparameter optimization of a PepSeqPred model head with the goal 
 to predict the locations of antibody epitopes within a protein sequence downstream. The resulting model 
 will make binary predictions: definite epitope or not epitope, it handles residues labeled uncertain through
 a masking process.
@@ -17,8 +17,8 @@ recommend several hours to a few days are allocated per Optuna study session.
 
 Usage
 -----
->>> # from scripts/hpc/trainffnnoptuna.sh (see shell script for CLI config)
->>> sbatch trainffnnoptuna.sh /path/to/emb_shard_dir0 ... /path/to/emb_shard_dirN -- \\ 
+>>> # from scripts/hpc/trainoptuna.sh (see shell script for CLI config)
+>>> sbatch trainoptuna.sh /path/to/emb_shard_dir0 ... /path/to/emb_shard_dirN -- \\ 
                               /path/to/label_shard0.pt ... /path/to/label_shardN.pt
 """
 
@@ -39,7 +39,13 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from pepseqpred.core.io.logger import setup_logger
 from pepseqpred.core.io.write import append_csv_row
 from pepseqpred.core.data.proteindataset import ProteinDataset, pad_collate
-from pepseqpred.core.models.ffnn import PepSeqFFNN
+from pepseqpred.core.models.factory import (
+    MODEL_HEADS,
+    PepSeqModelConfig,
+    build_pepseq_model,
+    model_config_to_dict,
+    validate_model_config,
+)
 from pepseqpred.core.train.trainer import Trainer, TrainerConfig
 from pepseqpred.core.train.ddp import init_ddp
 from pepseqpred.core.train.split import (
@@ -77,6 +83,22 @@ def _finite_or_none(value: Any) -> float | None:
     except (TypeError, ValueError):
         return None
     return num if math.isfinite(num) else None
+
+
+def _parse_int_choices(raw: str, flag: str) -> Tuple[int, ...]:
+    """Parse a comma-separated list of integer choices."""
+    values: list[int] = []
+    for token in str(raw).split(","):
+        token = token.strip()
+        if not token:
+            continue
+        try:
+            values.append(int(token))
+        except ValueError as e:
+            raise ValueError(f"{flag} must contain only integers") from e
+    if len(values) < 1:
+        raise ValueError(f"{flag} must include at least one value")
+    return tuple(values)
 
 
 def _split_summary_csv_fields(
@@ -157,7 +179,7 @@ def build_hidden_sizes(trial: optuna.trial.Trial,
 def main() -> None:
     """Parses CLI arguments and runs Optuna study."""
     parser = argparse.ArgumentParser(
-        description="Optuna tuning CLI for PepSeqPredFFNN.")
+        description="Optuna tuning CLI for PepSeqPred model heads.")
     parser.add_argument("--embedding-dirs",
                         nargs="+",
                         required=True,
@@ -194,6 +216,13 @@ def main() -> None:
                         choices=["precision", "recall",
                                  "f1", "mcc", "auc", "pr_auc"],
                         help="Metric to maximize")
+    parser.add_argument("--model-head",
+                        action="store",
+                        dest="model_head",
+                        type=str,
+                        choices=list(MODEL_HEADS),
+                        default="ffnn",
+                        help="Classifier head to tune.")
     parser.add_argument("--threshold-policy",
                         type=str,
                         default="max-recall-min-precision",
@@ -276,6 +305,30 @@ def main() -> None:
                         type=str,
                         default="32,64,128",
                         help="Comma separated batch sizes")
+    parser.add_argument("--conv-channel-choices",
+                        type=str,
+                        default="32,64,128",
+                        help="Comma-separated Conv1d channel choices used when --model-head=conv1d.")
+    parser.add_argument("--conv-layers-min",
+                        type=int,
+                        default=1,
+                        help="Minimum Conv1d layers used when --model-head=conv1d.")
+    parser.add_argument("--conv-layers-max",
+                        type=int,
+                        default=3,
+                        help="Maximum Conv1d layers used when --model-head=conv1d.")
+    parser.add_argument("--conv-kernel-size-choices",
+                        type=str,
+                        default="3,5,9,15",
+                        help="Comma-separated odd Conv1d kernel choices used when --model-head=conv1d.")
+    parser.add_argument("--conv-dropout-min",
+                        type=float,
+                        default=0.0,
+                        help="Minimum Conv1d dropout used when --model-head=conv1d.")
+    parser.add_argument("--conv-dropout-max",
+                        type=float,
+                        default=0.25,
+                        help="Maximum Conv1d dropout used when --model-head=conv1d.")
     parser.add_argument("--lr-min",
                         type=float,
                         default=1e-4,
@@ -335,10 +388,18 @@ def main() -> None:
         raise ValueError("--threshold-min-recall must be in [0.0, 1.0]")
     if args.threshold_fixed_value <= 0.0 or args.threshold_fixed_value >= 1.0:
         raise ValueError("--threshold-fixed-value must be between (0.0, 1.0)")
+    if args.conv_layers_min < 1:
+        raise ValueError("--conv-layers-min must be >= 1")
+    if args.conv_layers_max < args.conv_layers_min:
+        raise ValueError("--conv-layers-max must be >= --conv-layers-min")
+    if args.conv_dropout_min < 0.0 or args.conv_dropout_min > 1.0:
+        raise ValueError("--conv-dropout-min must be in [0.0, 1.0]")
+    if args.conv_dropout_max < args.conv_dropout_min or args.conv_dropout_max > 1.0:
+        raise ValueError("--conv-dropout-max must be in [--conv-dropout-min, 1.0]")
 
     args.save_path.mkdir(parents=True, exist_ok=True)
     logger = setup_logger(json_lines=True, json_indent=2,
-                          name="optuna_train_ffnn")
+                          name="train_optuna_cli")
 
     ddp = init_ddp()
     rank = ddp["rank"] if ddp is not None else 0
@@ -596,6 +657,19 @@ def main() -> None:
                    for x in args.batch_sizes.split(",") if x.strip()]
     if len(batch_sizes) == 0:
         raise ValueError("No batch sizes provided")
+    conv_channel_choices = _parse_int_choices(
+        args.conv_channel_choices,
+        "--conv-channel-choices",
+    )
+    conv_kernel_size_choices = _parse_int_choices(
+        args.conv_kernel_size_choices,
+        "--conv-kernel-size-choices",
+    )
+    bad_kernels = [x for x in conv_kernel_size_choices if x < 1 or x % 2 != 1]
+    if bad_kernels:
+        raise ValueError(
+            "--conv-kernel-size-choices must contain only positive odd integers"
+        )
 
     # resolve positive class weight once from the current training split
     pos_weight_source = "cli"
@@ -680,13 +754,42 @@ def main() -> None:
         wd = trial.suggest_float(
             "weight_decay", args.wd_min, args.wd_max, log=True)
         batch_size = trial.suggest_categorical("batch_size", batch_sizes)
+        if args.model_head == "conv1d":
+            conv_channels = trial.suggest_categorical(
+                "conv_channels",
+                list(conv_channel_choices),
+            )
+            conv_layers = trial.suggest_int(
+                "conv_layers",
+                args.conv_layers_min,
+                args.conv_layers_max,
+            )
+            conv_kernel_size = trial.suggest_categorical(
+                "conv_kernel_size",
+                list(conv_kernel_size_choices),
+            )
+            conv_dropout = trial.suggest_float(
+                "conv_dropout",
+                args.conv_dropout_min,
+                args.conv_dropout_max,
+            )
+        else:
+            conv_channels = int(conv_channel_choices[0])
+            conv_layers = int(args.conv_layers_min)
+            conv_kernel_size = int(conv_kernel_size_choices[0])
+            conv_dropout = float(args.conv_dropout_min)
 
         return {
+            "model_head": str(args.model_head),
             "hidden_sizes": hidden_sizes,
             "dropouts": dropouts,
             "depth": depth,
             "use_layer_norm": use_layer_norm,
             "use_residual": use_residual,
+            "conv_channels": int(conv_channels),
+            "conv_layers": int(conv_layers),
+            "conv_kernel_size": int(conv_kernel_size),
+            "conv_dropout": float(conv_dropout),
             "learning_rate": lr,
             "weight_decay": wd,
             "batch_size": batch_size
@@ -701,6 +804,10 @@ def main() -> None:
         depth = int(params["depth"])
         use_layer_norm = bool(params["use_layer_norm"])
         use_residual = bool(params["use_residual"])
+        conv_channels = int(params["conv_channels"])
+        conv_layers = int(params["conv_layers"])
+        conv_kernel_size = int(params["conv_kernel_size"])
+        conv_dropout = float(params["conv_dropout"])
         lr = float(params["learning_rate"])
         wd = float(params["weight_decay"])
         batch_size = int(params["batch_size"])
@@ -721,12 +828,22 @@ def main() -> None:
         val_loader = DataLoader(
             val_data, **loader_kwargs) if val_data is not None else None
 
-        model = PepSeqFFNN(emb_dim=emb_dim,
-                           hidden_sizes=hidden_sizes,
-                           dropouts=dropouts,
-                           use_layer_norm=use_layer_norm,
-                           use_residual=use_residual,
-                           num_classes=1)
+        model_config = validate_model_config(
+            PepSeqModelConfig(
+                emb_dim=emb_dim,
+                hidden_sizes=hidden_sizes,
+                dropouts=dropouts,
+                num_classes=1,
+                use_layer_norm=use_layer_norm,
+                use_residual=use_residual,
+                model_head=str(params["model_head"]),
+                conv_channels=conv_channels,
+                conv_layers=conv_layers,
+                conv_kernel_size=conv_kernel_size,
+                conv_dropout=conv_dropout,
+            )
+        )
+        model = build_pepseq_model(model_config)
 
         device = torch.device(f"cuda:{ddp['local_rank']}") if ddp is not None else torch.device(
             "cuda" if torch.cuda.is_available() else "cpu")
@@ -760,7 +877,8 @@ def main() -> None:
                           train_loader=train_loader,
                           logger=logger,
                           val_loader=val_loader,
-                          config=config)
+                          config=config,
+                          model_config=model_config)
 
         # start and time trial
         start = time.time()
@@ -776,7 +894,8 @@ def main() -> None:
             row: Dict[str, Any] = {
                 "RunID": f"{args.study_name}_trial_{trial.number:04d}",
                 "Timestamp": pd.Timestamp.utcnow().isoformat(),
-                "ModelVersion": "ffnn_optuna",
+                "ModelVersion": "train_optuna",
+                "ModelHead": str(model_config.model_head),
                 "NumParameters": int(sum(p.numel() for p in model.parameters())),
                 "HiddenLayers": int(depth),
                 "HiddenSizes": ",".join(str(x) for x in hidden_sizes),
@@ -784,6 +903,10 @@ def main() -> None:
                 "Dropout": float(dropouts[0]) if len(dropouts) else 0.0,
                 "UseLayerNorm": bool(use_layer_norm),
                 "UseResidual": bool(use_residual),
+                "ConvChannels": int(model_config.conv_channels),
+                "ConvLayers": int(model_config.conv_layers),
+                "ConvKernelSize": int(model_config.conv_kernel_size),
+                "ConvDropout": float(model_config.conv_dropout),
                 "BatchSize": int(batch_size),
                 "LearningRate": float(lr),
                 "WeightDecay": float(wd),
@@ -822,6 +945,7 @@ def main() -> None:
             trial.set_user_attr("best_val_loss_at_score",
                                 float(best_val_loss_at_score))
             trial.set_user_attr("best_metrics", best_metrics)
+            trial.set_user_attr("model_config", model_config_to_dict(model_config))
 
         return float(best_score)
 
@@ -871,6 +995,7 @@ def main() -> None:
                         "best_params": dict(best.params),
                         "best_user_attrs": dict(best.user_attrs),
                         "metric": args.metric,
+                        "model_head": str(args.model_head),
                         "split_strategy": str(args.split_strategy),
                         "split_report_json": str(split_report_json),
                         "threshold_policy": str(args.threshold_policy),
@@ -880,9 +1005,23 @@ def main() -> None:
         best_trial_json.write_text(json.dumps(best_payload, indent=2))
 
         best_trial_dir = Path(best.user_attrs["trial_dir"])
-        src = best_trial_dir / "best_model_by_score.pt"
-        if src.exists():
+        src = next(
+            (
+                path for path in (
+                    best_trial_dir / "best_model_by_score.pt",
+                    best_trial_dir / "fully_connected_by_score.pt",
+                )
+                if path.exists()
+            ),
+            None,
+        )
+        if src is not None:
             best_ckpt_path.write_bytes(src.read_bytes())
+        else:
+            logger.warning(
+                "best_checkpoint_missing",
+                extra={"extra": {"trial_dir": str(best_trial_dir)}}
+            )
 
         logger.info("best_results", extra={"extra": best_payload})
 

@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=ffnn_optuna
+#SBATCH --job-name=pepseqpred_optuna
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=20
@@ -7,8 +7,8 @@
 #SBATCH --gpus-per-node=a100:4
 #SBATCH --mem=448G
 #SBATCH --time=48:00:00
-#SBATCH --output=/scratch/%u/optuna_ffnn/%j/%x.out
-#SBATCH --error=/scratch/%u/optuna_ffnn/%j/%x.err
+#SBATCH --output=/scratch/%u/optuna_train/%j/%x.out
+#SBATCH --error=/scratch/%u/optuna_train/%j/%x.err
 
 # for testing
 USE_SRUN="${USE_SRUN:-1}"
@@ -57,7 +57,7 @@ if [ "${#EMBEDDING_DIRS[@]}" -eq 0 ] || [ "${#LABEL_SHARDS[@]}" -eq 0 ]; then
 fi
 
 # tuning controls
-STUDY_NAME="${STUDY_NAME:-ffnn_optuna_v1}"
+STUDY_NAME="${STUDY_NAME:-train_optuna_v1}"
 N_TRIALS="${N_TRIALS:-20}"
 EPOCHS="${EPOCHS:-15}"
 SEED="${SEED:-42}"
@@ -84,11 +84,18 @@ CSV_PATH="${CSV_PATH:-/scratch/$USER/optuna/${STUDY_NAME}_trials.csv}"
 STORAGE="${STORAGE:-sqlite:////scratch/$USER/optuna/${STUDY_NAME}.db}"
 
 # architecture search space
+MODEL_HEAD="${MODEL_HEAD:-ffnn}" # ffnn or conv1d
 ARCH_MODE="${ARCH_MODE:-flat}" # flat, bottleneck, pyramid
 DEPTH_MIN="${DEPTH_MIN:-2}"
 DEPTH_MAX="${DEPTH_MAX:-6}"
 WIDTH_MIN="${WIDTH_MIN:-64}"
 WIDTH_MAX="${WIDTH_MAX:-512}"
+CONV_CHANNEL_CHOICES="${CONV_CHANNEL_CHOICES:-32,64,128}"
+CONV_LAYERS_MIN="${CONV_LAYERS_MIN:-1}"
+CONV_LAYERS_MAX="${CONV_LAYERS_MAX:-3}"
+CONV_KERNEL_SIZE_CHOICES="${CONV_KERNEL_SIZE_CHOICES:-3,5,9,15}"
+CONV_DROPOUT_MIN="${CONV_DROPOUT_MIN:-0.0}"
+CONV_DROPOUT_MAX="${CONV_DROPOUT_MAX:-0.25}"
 
 # optimizer search space
 LR_MIN="${LR_MIN:-1e-4}"
@@ -105,7 +112,7 @@ TIMEOUT_S="${TIMEOUT_S:-0}" # timeout in seconds
 mkdir -p "$SAVE_PATH"
 mkdir -p "$(dirname "$CSV_PATH")"
 mkdir -p "/scratch/$USER/optuna"
-mkdir -p "/scratch/$USER/optuna_ffnn/$SLURM_JOB_ID"
+mkdir -p "/scratch/$USER/optuna_train/$SLURM_JOB_ID"
 
 # load Python Conda environment
 module purge
@@ -135,7 +142,7 @@ if [ -n "$SPLIT_REPORT_JSON" ]; then
     SPLIT_REPORT_ARGS+=(--split-report-json "$SPLIT_REPORT_JSON")
 fi
 
-${LAUNCHER} torchrun --nproc_per_node=4 train_ffnn_optuna.pyz \
+${LAUNCHER} torchrun --nproc_per_node=4 train_optuna.pyz \
     --embedding-dirs "${EMBEDDING_DIRS[@]}" \
     --label-shards "${LABEL_SHARDS[@]}" \
     --study-name "$STUDY_NAME" \
@@ -144,6 +151,7 @@ ${LAUNCHER} torchrun --nproc_per_node=4 train_ffnn_optuna.pyz \
     --epochs "$EPOCHS" \
     --seed "$SEED" \
     --metric "$METRIC" \
+    --model-head "$MODEL_HEAD" \
     --threshold-policy "$THRESHOLD_POLICY" \
     --threshold-min-precision "$THRESHOLD_MIN_PRECISION" \
     --threshold-min-recall "$THRESHOLD_MIN_RECALL" \
@@ -161,6 +169,12 @@ ${LAUNCHER} torchrun --nproc_per_node=4 train_ffnn_optuna.pyz \
     --depth-max "$DEPTH_MAX" \
     --width-min "$WIDTH_MIN" \
     --width-max "$WIDTH_MAX" \
+    --conv-channel-choices "$CONV_CHANNEL_CHOICES" \
+    --conv-layers-min "$CONV_LAYERS_MIN" \
+    --conv-layers-max "$CONV_LAYERS_MAX" \
+    --conv-kernel-size-choices "$CONV_KERNEL_SIZE_CHOICES" \
+    --conv-dropout-min "$CONV_DROPOUT_MIN" \
+    --conv-dropout-max "$CONV_DROPOUT_MAX" \
     --batch-sizes "$BATCH_SIZES" \
     --lr-min "$LR_MIN" \
     --lr-max "$LR_MAX" \
@@ -172,4 +186,4 @@ ${LAUNCHER} torchrun --nproc_per_node=4 train_ffnn_optuna.pyz \
     --window-size "$WINDOW_SIZE" \
     --stride "$STRIDE"
 
-# USAGE: sbatch trainffnnoptuna.sh /scratch/$USER/esm2/artifacts/pts/shard_000 /scratch/$USER/esm2/artifacts/pts/shard_001 /scratch/$USER/esm2/artifacts/pts/shard_002 /scratch/$USER/esm2/artifacts/pts/shard_003 -- /scratch/$USER/labels/labels_shard_000.pt /scratch/$USER/labels/labels_shard_001.pt /scratch/$USER/labels/labels_shard_002.pt /scratch/$USER/labels/labels_shard_003.pt
+# USAGE: sbatch trainoptuna.sh /scratch/$USER/esm2/artifacts/pts/shard_000 /scratch/$USER/esm2/artifacts/pts/shard_001 /scratch/$USER/esm2/artifacts/pts/shard_002 /scratch/$USER/esm2/artifacts/pts/shard_003 -- /scratch/$USER/labels/labels_shard_000.pt /scratch/$USER/labels/labels_shard_001.pt /scratch/$USER/labels/labels_shard_002.pt /scratch/$USER/labels/labels_shard_003.pt

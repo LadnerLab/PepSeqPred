@@ -5,6 +5,11 @@ from pathlib import Path
 import pytest
 import torch
 import pepseqpred.apps.prediction_cli as prediction_cli
+from pepseqpred.core.models.factory import (
+    PepSeqModelConfig,
+    build_pepseq_model,
+    model_config_to_dict,
+)
 from pepseqpred.core.models.ffnn import PepSeqFFNN
 
 pytestmark = pytest.mark.integration
@@ -65,6 +70,34 @@ def _write_checkpoint(path: Path, threshold: float = 0.5) -> None:
     )
 
 
+def _write_conv_checkpoint(path: Path, threshold: float = 0.5) -> None:
+    cfg = PepSeqModelConfig(
+        emb_dim=4,
+        hidden_sizes=(3,),
+        dropouts=(0.0,),
+        num_classes=1,
+        use_layer_norm=False,
+        use_residual=False,
+        model_head="conv1d",
+        conv_channels=3,
+        conv_layers=1,
+        conv_kernel_size=3,
+        conv_dropout=0.0,
+    )
+    model = build_pepseq_model(cfg)
+    for param in model.parameters():
+        torch.nn.init.constant_(param, 0.0)
+
+    torch.save(
+        {
+            "model_state_dict": model.state_dict(),
+            "model_config": model_config_to_dict(cfg),
+            "metrics": {"threshold": float(threshold)},
+        },
+        path,
+    )
+
+
 def test_prediction_cli_smoke(monkeypatch, tmp_path: Path):
     fake_pretrained = types.SimpleNamespace(
         fake_model=lambda: (FakeESMModel(), FakeAlphabet())
@@ -106,6 +139,40 @@ def test_prediction_cli_smoke(monkeypatch, tmp_path: Path):
     assert lines[2] == ">protein_2"
     assert len(lines[3]) == 5
     assert set(lines[3]).issubset({"0", "1"})
+
+
+def test_prediction_cli_loads_conv_checkpoint_metadata(monkeypatch, tmp_path: Path):
+    fake_pretrained = types.SimpleNamespace(
+        fake_model=lambda: (FakeESMModel(), FakeAlphabet())
+    )
+    monkeypatch.setattr(prediction_cli.esm, "pretrained", fake_pretrained)
+
+    checkpoint = tmp_path / "conv_model.pt"
+    _write_conv_checkpoint(checkpoint)
+
+    fasta = tmp_path / "input.fasta"
+    fasta.write_text(">protein_1\nACDEFG\n", encoding="utf-8")
+    output_fasta = tmp_path / "predictions.fasta"
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "prediction_cli.py",
+            str(checkpoint),
+            str(fasta),
+            "--output-fasta",
+            str(output_fasta),
+            "--model-name",
+            "fake_model",
+        ],
+    )
+
+    prediction_cli.main()
+
+    lines = [line.strip() for line in output_fasta.read_text(
+        encoding="utf-8").splitlines() if line.strip()]
+    assert lines == [">protein_1", "111111"]
 
 
 def test_prediction_cli_manifest_v1_majority_vote(monkeypatch, tmp_path: Path):

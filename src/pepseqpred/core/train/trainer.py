@@ -21,6 +21,7 @@ from .ddp import ddp_rank, ddp_all_reduce_sum, ddp_gather_all_1d
 from .metrics import compute_eval_metrics
 from .threshold import select_threshold, threshold_diagnostic_grid
 from .curveartifacts import write_validation_curve_artifacts
+from pepseqpred.core.models.factory import PepSeqModelConfig, model_config_to_dict
 
 
 @dataclass
@@ -70,11 +71,13 @@ class Trainer:
                  train_loader: DataLoader,
                  logger: logging.Logger,
                  val_loader: Optional[DataLoader] = None,
-                 config: TrainerConfig = TrainerConfig()):
+                 config: TrainerConfig = TrainerConfig(),
+                 model_config: Optional[PepSeqModelConfig] = None):
         self.model = model
         self.train_loader = train_loader
         self.val_loader = val_loader
         self.config = config
+        self.model_config = model_config
         self.logger = logger
 
         self.device = torch.device(
@@ -622,6 +625,11 @@ class Trainer:
                  "optim_state_dict": self.optimizer.state_dict(),
                  "epoch": epoch,
                  "config": self.config.__dict__,
+                 "model_config": (
+                     model_config_to_dict(self.model_config)
+                     if self.model_config is not None
+                     else None
+                 ),
                  "best_loss": loss,
                  "metrics": metrics}
         torch.save(state, path)

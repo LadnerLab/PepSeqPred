@@ -18,6 +18,7 @@ from sklearn.metrics import average_precision_score, precision_recall_curve, roc
 from pepseqpred.core.io.logger import setup_logger
 from pepseqpred.core.io.read import parse_float_csv, parse_int_csv
 from pepseqpred.core.data.proteindataset import ProteinDataset, pad_collate
+from pepseqpred.core.models.factory import MODEL_HEADS
 from pepseqpred.core.predict.inference import (
     FFNNModelConfig,
     build_model_from_checkpoint,
@@ -160,6 +161,11 @@ def _resolve_best_set_index(
 
 def _build_cli_model_config(args: argparse.Namespace) -> FFNNModelConfig | None:
     """Builds the model configuration from explicit CLI architecture flags."""
+    model_head_arg = getattr(args, "model_head", None)
+    conv_channels_arg = getattr(args, "conv_channels", None)
+    conv_layers_arg = getattr(args, "conv_layers", None)
+    conv_kernel_size_arg = getattr(args, "conv_kernel_size", None)
+    conv_dropout_arg = getattr(args, "conv_dropout", None)
     any_explicit = any(
         arg is not None
         for arg in (
@@ -168,7 +174,12 @@ def _build_cli_model_config(args: argparse.Namespace) -> FFNNModelConfig | None:
             args.dropouts,
             args.use_layer_norm,
             args.use_residual,
-            args.num_classes
+            args.num_classes,
+            model_head_arg,
+            conv_channels_arg,
+            conv_layers_arg,
+            conv_kernel_size_arg,
+            conv_dropout_arg
         )
     )
     if not any_explicit:
@@ -185,6 +196,16 @@ def _build_cli_model_config(args: argparse.Namespace) -> FFNNModelConfig | None:
         missing.append("--use-layer-norm/--no-use-layer-norm")
     if args.use_residual is None:
         missing.append("--use-residual/--no-use-residual")
+    model_head = str(model_head_arg or "ffnn")
+    if model_head == "conv1d":
+        if conv_channels_arg is None:
+            missing.append("--conv-channels")
+        if conv_layers_arg is None:
+            missing.append("--conv-layers")
+        if conv_kernel_size_arg is None:
+            missing.append("--conv-kernel-size")
+        if conv_dropout_arg is None:
+            missing.append("--conv-dropout")
     if missing:
         raise ValueError(
             "When using explicit architecture flags, provide all required values: "
@@ -204,7 +225,12 @@ def _build_cli_model_config(args: argparse.Namespace) -> FFNNModelConfig | None:
         dropouts=tuple(dropouts),
         num_classes=num_classes,
         use_layer_norm=bool(args.use_layer_norm),
-        use_residual=bool(args.use_residual)
+        use_residual=bool(args.use_residual),
+        model_head=model_head,
+        conv_channels=int(conv_channels_arg) if conv_channels_arg is not None else 64,
+        conv_layers=int(conv_layers_arg) if conv_layers_arg is not None else 2,
+        conv_kernel_size=int(conv_kernel_size_arg) if conv_kernel_size_arg is not None else 9,
+        conv_dropout=float(conv_dropout_arg) if conv_dropout_arg is not None else 0.1
     )
 
 
@@ -1542,6 +1568,47 @@ def main() -> None:
         help="Explicit output classes (binary=1)."
     )
     parser.add_argument(
+        "--model-head",
+        action="store",
+        dest="model_head",
+        type=str,
+        choices=list(MODEL_HEADS),
+        default=None,
+        help="Explicit model head used in training."
+    )
+    parser.add_argument(
+        "--conv-channels",
+        action="store",
+        dest="conv_channels",
+        type=int,
+        default=None,
+        help="Explicit Conv1d channels used in training."
+    )
+    parser.add_argument(
+        "--conv-layers",
+        action="store",
+        dest="conv_layers",
+        type=int,
+        default=None,
+        help="Explicit Conv1d layer count used in training."
+    )
+    parser.add_argument(
+        "--conv-kernel-size",
+        action="store",
+        dest="conv_kernel_size",
+        type=int,
+        default=None,
+        help="Explicit Conv1d kernel size used in training."
+    )
+    parser.add_argument(
+        "--conv-dropout",
+        action="store",
+        dest="conv_dropout",
+        type=float,
+        default=None,
+        help="Explicit Conv1d dropout used in training."
+    )
+    parser.add_argument(
         "--use-layer-norm",
         action="store_true",
         dest="use_layer_norm",
@@ -1764,10 +1831,15 @@ def main() -> None:
                     if len(set(member_model_cfg_srcs)) == 1
                     else "mixed"
                 ),
+                "model_head": str(first_cfg.model_head),
                 "emb_dim": int(first_cfg.emb_dim),
                 "hidden_sizes": [int(x) for x in first_cfg.hidden_sizes],
                 "use_layer_norm": bool(first_cfg.use_layer_norm),
                 "use_residual": bool(first_cfg.use_residual),
+                "conv_channels": int(first_cfg.conv_channels),
+                "conv_layers": int(first_cfg.conv_layers),
+                "conv_kernel_size": int(first_cfg.conv_kernel_size),
+                "conv_dropout": float(first_cfg.conv_dropout),
                 "num_classes": int(first_cfg.num_classes),
                 "emit_fold_metrics": bool(args.emit_fold_metrics),
                 "include_curves": bool(args.include_curves),
@@ -1868,10 +1940,15 @@ def main() -> None:
             if len(set(member_model_cfg_srcs)) == 1
             else "mixed"
         ),
+        "model_head": str(first_cfg.model_head),
         "emb_dim": int(first_cfg.emb_dim),
         "hidden_sizes": [int(x) for x in first_cfg.hidden_sizes],
         "use_layer_norm": bool(first_cfg.use_layer_norm),
         "use_residual": bool(first_cfg.use_residual),
+        "conv_channels": int(first_cfg.conv_channels),
+        "conv_layers": int(first_cfg.conv_layers),
+        "conv_kernel_size": int(first_cfg.conv_kernel_size),
+        "conv_dropout": float(first_cfg.conv_dropout),
         "num_classes": int(first_cfg.num_classes),
         "evaluation": eval_out
     }

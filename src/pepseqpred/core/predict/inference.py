@@ -1,11 +1,16 @@
-from dataclasses import dataclass
 import math
 import re
 from typing import Tuple, Dict, Any, Mapping, List, Optional, Sequence
 import esm
 import torch
 import numpy as np
-from pepseqpred.core.models.ffnn import PepSeqFFNN
+from pepseqpred.core.models.factory import (
+    MODEL_HEAD_FFNN,
+    PepSeqModelConfig,
+    build_pepseq_model,
+    model_config_from_mapping,
+    validate_model_config,
+)
 from pepseqpred.core.embeddings.esm2 import clean_seq, compute_window_embedding, append_seq_len
 
 _HIDDEN_LAYER_RE = re.compile(r"^ff_model\.(\d+)\.linear\.weight$")
@@ -14,14 +19,7 @@ _LAYER_NORM_RE = re.compile(r"^ff_model\.\d+\.layer_norm\.weight$")
 _SKIP_LINEAR_RE = re.compile(r"^ff_model\.\d+\.skip\.weight$")
 
 
-@dataclass
-class FFNNModelConfig:
-    emb_dim: int
-    hidden_sizes: Tuple[int, ...]
-    dropouts: Tuple[float, ...]
-    num_classes: int
-    use_layer_norm: bool
-    use_residual: bool
+FFNNModelConfig = PepSeqModelConfig
 
 
 def normalize_state_dict_keys(state: Mapping[str, Any]) -> Dict[str, Any]:
@@ -47,7 +45,7 @@ def normalize_state_dict_keys(state: Mapping[str, Any]) -> Dict[str, Any]:
     return out_dict
 
 
-def infer_model_config_from_state(state: Mapping[str, Any]) -> FFNNModelConfig:
+def infer_model_config_from_state(state: Mapping[str, Any]) -> PepSeqModelConfig:
     """
     Infer PepSeqFFNN architecture directly from checkpoint `model_state_dict`.
 
@@ -58,7 +56,7 @@ def infer_model_config_from_state(state: Mapping[str, Any]) -> FFNNModelConfig:
 
     Returns
     -------
-        FFNNModelConfig
+        PepSeqModelConfig
             A fully populated model configuration dataclass to be used in model building.
 
     Raises
@@ -137,21 +135,22 @@ def infer_model_config_from_state(state: Mapping[str, Any]) -> FFNNModelConfig:
     # dropout is not stored in state_dict
     dropouts = tuple(0.0 for _ in hidden_sizes)
 
-    return FFNNModelConfig(
+    return PepSeqModelConfig(
         emb_dim=emb_dim,
         hidden_sizes=hidden_sizes,
         dropouts=dropouts,
         num_classes=num_classes,
         use_layer_norm=use_layer_norm,
-        use_residual=use_residual
+        use_residual=use_residual,
+        model_head=MODEL_HEAD_FFNN,
     )
 
 
 def build_model_from_checkpoint(
     checkpoint: Mapping[str, Any],
     device: str = "cpu",
-    model_config: Optional[FFNNModelConfig] = None
-) -> Tuple[PepSeqFFNN, FFNNModelConfig, str]:
+    model_config: Optional[PepSeqModelConfig] = None
+) -> Tuple[torch.nn.Module, PepSeqModelConfig, str]:
     """
     Builds and loads model exactly from training checkpoint.
 
@@ -161,22 +160,22 @@ def build_model_from_checkpoint(
             State dictionary obtained from saved trained model checkpoint.
         device : str
             Device type to use for building model checkpoint, default is `"cpu"`, `"cuda"` if accepted if GPUs are available.
-        model_config : FFNNModelConfig or None
+        model_config : PepSeqModelConfig or None
             A fully populated model configuration dataclass to be used in model building.
 
     Returns
     -------
-        PepSeqFFNN
+        torch.nn.Module
             Fully populated PepSeqPred model ready to use in inference.
-        FFNNModelConfig
+        PepSeqModelConfig
             Model configuration dataclass returned for logging/tracking purposes.
         str
-            The model configuration source, either `"cli"` if passed explicitly or `"state_dict"` if inferred from the state dictionary.
+            The model configuration source: `"cli"`, `"checkpoint"`, or `"state_dict"`.
 
     Raises
     ------
         ValueError
-            If `checkpoint` is not of type `Mapping` or `"model_state_dict"` is not a key in `checkpoint`. If `state` is not of type `Mapping`. If the number of output classes is not 1 (binary), if the embedding dimension is <= 0, or if the number hidden layer sizes is not the same as the number of dropouts. If the checkpoint weights are incompatible with the model architecture provided. 
+            If `checkpoint` is not of type `Mapping` or `"model_state_dict"` is not a key in `checkpoint`. If `state` is not of type `Mapping`. If the model config is invalid or if the checkpoint weights are incompatible with the model architecture provided.
     """
     if not isinstance(checkpoint, Mapping) or "model_state_dict" not in checkpoint:
         raise ValueError(
@@ -189,35 +188,22 @@ def build_model_from_checkpoint(
 
     # can either pass config directly or infer from the state dict
     if model_config is not None:
-        config = model_config
+        config = validate_model_config(model_config)
         config_src = "cli"
+    elif isinstance(checkpoint.get("model_config"), Mapping):
+        config = model_config_from_mapping(checkpoint["model_config"])
+        config_src = "checkpoint"
     else:
         config = infer_model_config_from_state(state)
         config_src = "state_dict"
 
-    # validate config
-    if config.num_classes != 1:
-        raise ValueError(
-            f"Inference expects binary residue model (num_classes=1), got {config.num_classes}")
-    if config.emb_dim <= 0:
-        raise ValueError("emb_dim must be > 0")
-    if len(config.hidden_sizes) != len(config.dropouts):
-        raise ValueError("hidden_sizes and dropouts must have the same length")
-
-    model = PepSeqFFNN(
-        emb_dim=config.emb_dim,
-        hidden_sizes=config.hidden_sizes,
-        dropouts=config.dropouts,
-        num_classes=config.num_classes,
-        use_layer_norm=config.use_layer_norm,
-        use_residual=config.use_residual
-    )
+    model = build_pepseq_model(config)
     try:
         model.load_state_dict(state, strict=True)
     except RuntimeError as e:
         raise ValueError(
             "Checkpoint weights are incompatible with the provided model architecture. "
-            "Check --emb-dim/--hidden-sizes/--dropouts/--use-layer-norm/--use-residual"
+            "Check --model-head and architecture flags."
         ) from e
     model.eval().to(device)
     return model, config, config_src
@@ -352,7 +338,7 @@ def embed_protein_seq(protein_seq: str,
 
 
 def predict_member_probabilities_from_embedding(
-    psp_model: PepSeqFFNN,
+    psp_model: torch.nn.Module,
     protein_emb: torch.Tensor,
     device: str
 ) -> torch.Tensor:
@@ -361,7 +347,7 @@ def predict_member_probabilities_from_embedding(
 
     Parameters
     ----------
-        psp_model : PepSeqFFNN
+        psp_model : torch.nn.Module
             The PepSeqPred model to use for predicting member probabilities.
         protein_emb : torch.Tensor
             Protein embedding to pass through model.
@@ -394,7 +380,7 @@ def predict_member_probabilities_from_embedding(
         return torch.sigmoid(logits)[0].detach().cpu()
 
 
-def predict_from_embedding(psp_model: PepSeqFFNN,
+def predict_from_embedding(psp_model: torch.nn.Module,
                            protein_emb: torch.Tensor,
                            device: str,
                            threshold: float = 0.5) -> Dict[str, Any]:
@@ -403,7 +389,7 @@ def predict_from_embedding(psp_model: PepSeqFFNN,
 
     Parameters
     ----------
-        psp_model : PepSeqFFNN
+        psp_model : torch.nn.Module
             The PepSeqPred model to use for predicting member probabilities.
         protein_emb : torch.Tensor
             Protein embedding to pass through model.
@@ -436,7 +422,7 @@ def predict_from_embedding(psp_model: PepSeqFFNN,
 
 
 def predict_ensemble_from_embedding(
-    psp_models: Sequence[PepSeqFFNN],
+    psp_models: Sequence[torch.nn.Module],
     protein_emb: torch.Tensor,
     device: str,
     thresholds: Sequence[float],
@@ -448,7 +434,7 @@ def predict_ensemble_from_embedding(
 
     Parameters
     ----------
-        psp_models : Sequence[PepSeqFFNN]
+        psp_models : Sequence[torch.nn.Module]
             A sequence of PepSeqPred models to use for majority vote prediction of member probabilities.
         protein_emb : torch.Tensor
             Protein embedding to pass through models.
@@ -547,7 +533,7 @@ def predict_ensemble_from_embedding(
     return out
 
 
-def predict_protein(psp_model: PepSeqFFNN,
+def predict_protein(psp_model: torch.nn.Module,
                     esm_model: torch.nn.Module,
                     layer: int,
                     batch_converter: esm.data.BatchConverter,
@@ -560,7 +546,7 @@ def predict_protein(psp_model: PepSeqFFNN,
 
     Parameters
     ----------
-        psp_model : PepSeqFFNN
+        psp_model : torch.nn.Module
             The PepSeqPred model to use for predicting member probabilities.
         esm_model : torch.nn.Module
             The ESM-2 model to use for embedding generation.

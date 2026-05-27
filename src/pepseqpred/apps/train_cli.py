@@ -1,6 +1,6 @@
-"""train_ffnn_cli.py
+"""train_cli.py
 
-Handles end-to-end training and evaluation of a PepSeqPredFFNN with the goal to predict the locations
+Handles end-to-end training and evaluation of PepSeqPred model heads with the goal to predict the locations
 of antibody epitopes within a protein sequence downstream. The resulting model will make binary predictions:
 definite epitope or not epitope, it handles residues labeled uncertain through a masking process.
 
@@ -11,8 +11,8 @@ from 3 to 5 hours.
 
 Usage
 -----
->>> # from scripts/hpc/trainffnn.sh (see shell script for CLI config)
->>> sbatch trainffnn.sh /path/to/emb_shard_dir0 ... /path/to/emb_shard_dirN -- \\ 
+>>> # from scripts/hpc/train.sh (see shell script for CLI config)
+>>> sbatch train.sh /path/to/emb_shard_dir0 ... /path/to/emb_shard_dirN -- \\ 
                         /path/to/label_shard0.pt ... /path/to/label_shardN.pt
 """
 
@@ -32,7 +32,13 @@ import pandas as pd
 from pepseqpred.core.io.logger import setup_logger
 from pepseqpred.core.io.write import append_csv_row
 from pepseqpred.core.data.proteindataset import ProteinDataset, pad_collate
-from pepseqpred.core.models.ffnn import PepSeqFFNN
+from pepseqpred.core.models.factory import (
+    MODEL_HEADS,
+    PepSeqModelConfig,
+    build_pepseq_model,
+    model_config_to_dict,
+    validate_model_config,
+)
 from pepseqpred.core.train.trainer import (
     Trainer,
     TrainerConfig,
@@ -860,9 +866,9 @@ def _build_run_plans(
 
 
 def main() -> None:
-    """Handles command-line argument parsing and high-level execution of the Train FFNN program."""
+    """Handles command-line argument parsing and high-level execution of training."""
     parser = argparse.ArgumentParser(
-        description="Train PepSeqPred FFNN on protein ESM-2 embeddings for binary residue-level epitope prediction.")
+        description="Train a PepSeqPred model head on protein ESM-2 embeddings for binary residue-level epitope prediction.")
     parser.add_argument("--embedding-dirs",
                         nargs="+",
                         required=True,
@@ -893,6 +899,37 @@ def main() -> None:
                         action="store_true",
                         dest="use_residual",
                         help="If set, residuals are used in feed-forward calculation")
+    parser.add_argument("--model-head",
+                        action="store",
+                        dest="model_head",
+                        type=str,
+                        choices=list(MODEL_HEADS),
+                        default="ffnn",
+                        help="Classifier head to train.")
+    parser.add_argument("--conv-channels",
+                        action="store",
+                        dest="conv_channels",
+                        type=int,
+                        default=64,
+                        help="Number of local Conv1d channels when --model-head=conv1d.")
+    parser.add_argument("--conv-layers",
+                        action="store",
+                        dest="conv_layers",
+                        type=int,
+                        default=2,
+                        help="Number of Conv1d layers when --model-head=conv1d.")
+    parser.add_argument("--conv-kernel-size",
+                        action="store",
+                        dest="conv_kernel_size",
+                        type=int,
+                        default=9,
+                        help="Odd Conv1d kernel size when --model-head=conv1d.")
+    parser.add_argument("--conv-dropout",
+                        action="store",
+                        dest="conv_dropout",
+                        type=float,
+                        default=0.1,
+                        help="Dropout applied after each Conv1d activation when --model-head=conv1d.")
     parser.add_argument("--epochs",
                         action="store",
                         dest="epochs",
@@ -1088,7 +1125,7 @@ def main() -> None:
         raise ValueError("--threshold-fixed-value must be between (0.0, 1.0)")
     logger = setup_logger(json_lines=True,
                           json_indent=2,
-                          name="train_ffnn_cli")
+                          name="train_cli")
 
     ddp = init_ddp()
     rank = ddp["rank"] if ddp is not None else 0
@@ -1257,6 +1294,28 @@ def main() -> None:
         raise ValueError(
             "--hidden-sizes and --dropouts must be the same length"
         )
+    emb_dim = infer_emb_dim(base_dataset.embedding_index)
+    model_config = validate_model_config(
+        PepSeqModelConfig(
+            emb_dim=emb_dim,
+            hidden_sizes=hidden_sizes,
+            dropouts=dropouts,
+            num_classes=1,
+            use_layer_norm=bool(args.use_layer_norm),
+            use_residual=bool(args.use_residual),
+            model_head=str(args.model_head),
+            conv_channels=int(args.conv_channels),
+            conv_layers=int(args.conv_layers),
+            conv_kernel_size=int(args.conv_kernel_size),
+            conv_dropout=float(args.conv_dropout),
+        )
+    )
+    model_config_payload = model_config_to_dict(model_config)
+    if rank == 0:
+        logger.info(
+            "model_config_resolved",
+            extra={"extra": model_config_payload}
+        )
 
     # per-run loop
     for run_plan in run_plans:
@@ -1406,14 +1465,7 @@ def main() -> None:
                 }
             )
 
-        # build our FFNN model
-        emb_dim = infer_emb_dim(base_dataset.embedding_index)
-        model = PepSeqFFNN(emb_dim=emb_dim,
-                           hidden_sizes=hidden_sizes,
-                           dropouts=dropouts,
-                           use_layer_norm=args.use_layer_norm,
-                           use_residual=args.use_residual,
-                           num_classes=1)
+        model = build_pepseq_model(model_config)
 
         if ddp is not None:
             device = torch.device(f"cuda:{ddp['local_rank']}")
@@ -1441,7 +1493,8 @@ def main() -> None:
                           train_loader=train_loader,
                           logger=logger,
                           val_loader=val_loader,
-                          config=config)
+                          config=config,
+                          model_config=model_config)
 
         # run training, only save if rank 0 or single rank run
         if ddp is None or rank == 0:
@@ -1517,6 +1570,11 @@ def main() -> None:
                 "TrainSeed": train_seed,
                 "SplitStrategy": str(args.split_strategy),
                 "SplitReportJson": str(split_report_json),
+                "ModelHead": str(model_config.model_head),
+                "ConvChannels": int(model_config.conv_channels),
+                "ConvLayers": int(model_config.conv_layers),
+                "ConvKernelSize": int(model_config.conv_kernel_size),
+                "ConvDropout": float(model_config.conv_dropout),
                 **_split_summary_csv_fields("Train", train_split_summary),
                 **_split_summary_csv_fields("Val", val_split_summary),
                 "RunSaveDir": str(run_save_dir) if run_save_dir is not None else None,
@@ -1560,6 +1618,7 @@ def main() -> None:
             "split_type": str(args.split_type),
             "split_strategy": str(args.split_strategy),
             "split_report_json": str(split_report_json),
+            "model_config": model_config_payload,
             "best_model_metric": str(args.best_model_metric),
             "threshold_policy": str(args.threshold_policy),
             "threshold_min_precision": float(args.threshold_min_precision),
@@ -1694,6 +1753,7 @@ def main() -> None:
                     "split_type": str(args.split_type),
                     "split_strategy": str(args.split_strategy),
                     "split_report_json": str(split_report_json),
+                    "model_config": model_config_payload,
                     "n_folds": int(split_meta["n_folds"]),
                     "set_index": int(entry["set_index"]),
                     "split_seed": int(entry["split_seed"]),
@@ -1749,6 +1809,7 @@ def main() -> None:
                     "split_type": str(args.split_type),
                     "split_strategy": str(args.split_strategy),
                     "split_report_json": str(split_report_json),
+                    "model_config": model_config_payload,
                     "n_folds": int(split_meta["n_folds"]),
                     "n_sets": int(n_sets),
                     "ensemble_seed_mode": str(

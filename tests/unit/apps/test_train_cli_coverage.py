@@ -9,8 +9,8 @@ import pandas as pd
 import pytest
 import torch
 
-import pepseqpred.apps.train_ffnn_cli as train_cli
-import pepseqpred.apps.train_ffnn_optuna_cli as optuna_cli
+import pepseqpred.apps.train_cli as train_cli
+import pepseqpred.apps.train_optuna_cli as optuna_cli
 
 pytestmark = pytest.mark.unit
 
@@ -135,8 +135,8 @@ def test_train_cli_helper_parsers_and_numeric_summary():
 
 def test_hpc_scripts_only_pass_pos_weight_when_env_is_set():
     for script in [
-        Path("scripts/hpc/trainffnn.sh"),
-        Path("scripts/hpc/trainffnnoptuna.sh")
+        Path("scripts/hpc/train.sh"),
+        Path("scripts/hpc/trainoptuna.sh")
     ]:
         text = script.read_text(encoding="utf-8")
         assert "13.18999647945325" not in text
@@ -153,14 +153,14 @@ def test_hpc_scripts_only_pass_pos_weight_when_env_is_set():
         ("--ensemble-train-seeds", "11,12"),
     ],
 )
-def test_train_ffnn_cli_rejects_removed_legacy_mode_flags(
+def test_train_cli_rejects_removed_legacy_mode_flags(
     legacy_flag: str, legacy_value: str
 ):
     with pytest.raises(ValueError, match="Legacy train-mode flags are no longer supported"):
         _run_main(
             train_cli.main,
             [
-                "train_ffnn_cli.py",
+                "train_cli.py",
                 "--embedding-dirs",
                 "dummy_embedding_dir",
                 "--label-shards",
@@ -171,7 +171,7 @@ def test_train_ffnn_cli_rejects_removed_legacy_mode_flags(
         )
 
 
-def test_train_ffnn_cli_real_no_valid_score_with_val_curve_artifacts(monkeypatch):
+def test_train_cli_real_no_valid_score_with_val_curve_artifacts(monkeypatch):
     case_dir = _mk_case_dir("ffnn_no_valid")
     emb_dir, label_shard = _write_training_artifacts(
         case_dir, all_uncertain=True
@@ -188,7 +188,7 @@ def test_train_ffnn_cli_real_no_valid_score_with_val_curve_artifacts(monkeypatch
         _run_main(
             train_cli.main,
             [
-                "train_ffnn_cli.py",
+                "train_cli.py",
                 "--embedding-dirs",
                 str(emb_dir),
                 "--label-shards",
@@ -262,7 +262,7 @@ def test_train_ffnn_cli_real_no_valid_score_with_val_curve_artifacts(monkeypatch
         shutil.rmtree(case_dir, ignore_errors=True)
 
 
-def test_train_ffnn_cli_real_ensemble_manifest_generation(monkeypatch):
+def test_train_cli_real_ensemble_manifest_generation(monkeypatch):
     case_dir = _mk_case_dir("ffnn_ensemble")
     emb_dir, label_shard = _write_training_artifacts(
         case_dir, all_uncertain=False
@@ -279,7 +279,7 @@ def test_train_ffnn_cli_real_ensemble_manifest_generation(monkeypatch):
         _run_main(
             train_cli.main,
             [
-                "train_ffnn_cli.py",
+                "train_cli.py",
                 "--embedding-dirs",
                 str(emb_dir),
                 "--label-shards",
@@ -356,7 +356,7 @@ def test_train_ffnn_cli_real_ensemble_manifest_generation(monkeypatch):
         shutil.rmtree(case_dir, ignore_errors=True)
 
 
-def test_train_ffnn_optuna_cli_real_with_storage_and_helpers(monkeypatch):
+def test_train_optuna_cli_real_with_storage_and_helpers(monkeypatch):
     assert optuna_cli._broadcast_params({"a": 1}, None) == {"a": 1}
 
     study = optuna.create_study(sampler=optuna.samplers.RandomSampler(seed=7))
@@ -419,7 +419,7 @@ def test_train_ffnn_optuna_cli_real_with_storage_and_helpers(monkeypatch):
         _run_main(
             optuna_cli.main,
             [
-                "train_ffnn_optuna_cli.py",
+                "train_optuna_cli.py",
                 "--embedding-dirs",
                 str(emb_dir),
                 "--label-shards",

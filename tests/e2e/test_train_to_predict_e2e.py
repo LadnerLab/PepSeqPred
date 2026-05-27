@@ -62,7 +62,7 @@ def test_train_then_predict_e2e(training_artifacts, tmp_path: Path, monkeypatch)
     train_cmd = [
         sys.executable,
         "-m",
-        "pepseqpred.apps.train_ffnn_cli",
+        "pepseqpred.apps.train_cli",
         "--embedding-dirs",
         str(training_artifacts["embedding_dir"]),
         "--label-shards",

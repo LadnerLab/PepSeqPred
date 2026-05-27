@@ -8,8 +8,8 @@ No code edits were made during the investigation. The review focused on likely t
 
 Primary files inspected:
 
-- `src/pepseqpred/apps/train_ffnn_cli.py`
-- `src/pepseqpred/apps/train_ffnn_optuna_cli.py`
+- `src/pepseqpred/apps/train_cli.py`
+- `src/pepseqpred/apps/train_optuna_cli.py`
 - `src/pepseqpred/apps/evaluate_ffnn_cli.py`
 - `src/pepseqpred/core/models/ffnn.py`
 - `src/pepseqpred/core/train/trainer.py`
@@ -20,8 +20,8 @@ Primary files inspected:
 - `src/pepseqpred/core/data/proteindataset.py`
 - `src/pepseqpred/core/labels/builder.py`
 - `src/pepseqpred/core/preprocess/preparedataset.py`
-- `scripts/hpc/trainffnn.sh`
-- `scripts/hpc/trainffnnoptuna.sh`
+- `scripts/hpc/train.sh`
+- `scripts/hpc/trainoptuna.sh`
 - `scripts/hpc/evaluateffnn.sh`
 - related tests under `tests/unit`, `tests/integration`, and `tests/e2e`
 
@@ -84,7 +84,7 @@ Evidence:
 - `src/pepseqpred/core/train/trainer.py`
   - Loss is `(loss_raw * mask).sum() / mask.sum()` per local batch.
   - DDP then averages gradients across ranks equally.
-- `src/pepseqpred/apps/train_ffnn_cli.py`
+- `src/pepseqpred/apps/train_cli.py`
   - IDs are partitioned across ranks by estimated embedding file size, not by valid positive/negative residue count.
 
 Why this can hurt:
@@ -107,7 +107,7 @@ Evidence:
 
 - `src/pepseqpred/core/data/proteindataset.py`
   - `_iter_windows` supports `window_size` and `stride`.
-- `scripts/hpc/trainffnn.sh`
+- `scripts/hpc/train.sh`
   - `WINDOW_SIZE=1000`
   - `STRIDE=900`
 - `src/pepseqpred/apps/evaluate_ffnn_cli.py`
@@ -132,12 +132,12 @@ HPC scripts hard-code a positive class weight. When auto-computed, the weight is
 
 Evidence:
 
-- `scripts/hpc/trainffnn.sh`
+- `scripts/hpc/train.sh`
   - `POS_WEIGHT="${POS_WEIGHT:-13.18999647945325}"`
   - The script always passes `--pos-weight "$POS_WEIGHT"`.
-- `scripts/hpc/trainffnnoptuna.sh`
+- `scripts/hpc/trainoptuna.sh`
   - Same hard-coded default positive weight.
-- `src/pepseqpred/apps/train_ffnn_cli.py`
+- `src/pepseqpred/apps/train_cli.py`
   - If `--pos-weight` is absent, `pos_weight_from_label_shards(label_shards)` uses all provided label shard totals.
 - `docs/pv1_cwp_bkp_merge_split_and_pos_weight.md`
   - Already notes that automatic train-time `pos_weight` uses shard-level totals, not train-only IDs.
@@ -230,6 +230,12 @@ Planning direction:
 - First fix diagnostics, objective, and weighting before changing architecture.
 - Then consider light local context heads, such as 1D convolution, CRF-like smoothing, or pooling over peptide windows.
 
+Implementation status:
+
+- A generic training CLI now supports `--model-head ffnn` and `--model-head conv1d`.
+- `ffnn` remains the default to preserve previous dense-head behavior.
+- New checkpoints record explicit model-head metadata so prediction and evaluation can reload conv checkpoints without architecture flags.
+
 ### 9. Raw protein sequence length is appended as an unnormalized feature
 
 The embedding pipeline appends the original sequence length as an additional scalar feature to every residue embedding.
@@ -255,30 +261,31 @@ Planning direction:
 
 ### Optuna best checkpoint copy path mismatch
 
+Resolved: `train_optuna_cli.py` now accepts both the legacy copied filename and the trainer's `fully_connected_by_score.pt` when writing the root-level `best_model_by_score.pt`.
+
 Optuna trial training saves trial checkpoints using one filename, but the CLI later tries to copy a different filename.
 
 Evidence:
 
 - `src/pepseqpred/core/train/trainer.py`
   - `fit_optuna` saves `fully_connected_by_score.pt`.
-- `src/pepseqpred/apps/train_ffnn_optuna_cli.py`
-  - Later tries to copy `best_model_by_score.pt` from the best trial directory.
+- `src/pepseqpred/apps/train_optuna_cli.py`
+  - Copies `fully_connected_by_score.pt` from the best trial directory, with fallback support for a preexisting `best_model_by_score.pt`.
 
 Impact:
 
 - The root-level `best_model_by_score.pt` may never be written.
 - Users may accidentally evaluate stale or missing artifacts after Optuna.
 
-Planning direction:
+Test coverage:
 
-- Align checkpoint filenames between trainer and Optuna CLI.
-- Add a test asserting that the best Optuna checkpoint is copied to the expected root path.
+- `tests/integration/test_train_clis_inprocess.py` asserts that the root-level best Optuna checkpoint is copied and carries model-head metadata.
 
 ## Configuration Surprises
 
 ### `--use-pos-weight` in Optuna appeared misleading
 
-Resolved: `--use-pos-weight` has been removed from `train_ffnn_optuna_cli.py`. Positive weighting is automatic when `--pos-weight` is omitted, and `--pos-weight` remains the manual override.
+Resolved: `--use-pos-weight` has been removed from `train_optuna_cli.py`. Positive weighting is automatic when `--pos-weight` is omitted, and `--pos-weight` remains the manual override.
 
 Impact:
 

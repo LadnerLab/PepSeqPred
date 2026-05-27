@@ -23,7 +23,7 @@ For lightweight inference usage and API quickstart, use [README.pypi.md](README.
 PepSeqPred supports two usage profiles:
 
 - **PyPI quickstart profile (`pip install pepseqpred`)**: user-facing inference API with bundled pretrained artifacts and artifact-path inference helpers.
-- **Repository developer profile (`pip install -e .[dev]`)**: full source tree for preprocessing, embeddings, label generation, FFNN training, Optuna tuning, prediction, evaluation, and HPC orchestration.
+- **Repository developer profile (`pip install -e .[dev]`)**: full source tree for preprocessing, embeddings, label generation, model-head training, Optuna tuning, prediction, evaluation, and HPC orchestration.
 
 The repository profile is the source of truth for reproducing experiments end-to-end.
 
@@ -52,7 +52,7 @@ The repository profile is the source of truth for reproducing experiments end-to
 Stage 1  normalize dataset inputs (PV1/CWP/BKP) to a shared training contract
 Stage 2  generate ESM-2 per-residue embeddings
 Stage 3  build residue-level label shards
-Stage 4  train FFNN (unified n-fold interface, DDP-aware)
+Stage 4  train model head (unified n-fold interface, DDP-aware)
 Stage 5  optional Optuna tuning (DDP-aware)
 Stage 6  predict residue masks from checkpoint/manifest
 Stage 7  evaluate residue metrics (+ optional Cocci peptide compare)
@@ -236,15 +236,17 @@ pepseqpred-labels \
 - label shard `.pt` with protein label tensors and peptide metadata
 - optional `class_stats` payload when `--calc-pos-weight` is enabled
 
-### Stage 4: Train FFNN
+### Stage 4: Train Model Head
 
-**CLI:** `pepseqpred-train-ffnn` (`src/pepseqpred/apps/train_ffnn_cli.py`)
+**CLI:** `pepseqpred-train` (`src/pepseqpred/apps/train_cli.py`)
 
 **Unified run interface**
 
 - `--n-folds 1`: one holdout run per split/train seed pair (uses `--val-frac`)
 - `--n-folds K` (`K > 1`): K-fold members per split/train seed pair set
 - `--split-seeds` and `--train-seeds` are paired by index; if both are omitted, both default to `--seed`
+- `--model-head ffnn` is the default and preserves existing dense-head behavior
+- `--model-head conv1d` adds a local Conv1d feature stack before the dense residue classifier
 
 **Core modules**
 
@@ -255,18 +257,21 @@ pepseqpred-labels \
 **Command (smoke)**
 
 ```bash
-pepseqpred-train-ffnn \
+pepseqpred-train \
   --embedding-dirs data/esm2/artifacts/pts/shard_000 \
   --label-shards data/labels/labels_shard_000.pt \
   --epochs 1 \
+  --model-head ffnn \
   --subset 100 \
   --save-path data/models/ffnn_smoke \
   --results-csv data/models/ffnn_smoke/runs.csv
 ```
 
+For a local sequence head, use `--model-head conv1d` and optionally tune `--conv-channels`, `--conv-layers`, `--conv-kernel-size`, and `--conv-dropout`.
+
 **Submit one SLURM training job with multiple datasets (PV1 + CWP + BKP)**
 
-`scripts/hpc/trainffnn.sh` accepts multiple embedding directories and multiple label shards in one call:
+`scripts/hpc/train.sh` accepts multiple embedding directories and multiple label shards in one call:
 
 - all embedding dirs first
 - separator `--`
@@ -304,7 +309,7 @@ LABEL_SHARDS=(
   /scratch/$USER/labels/bkp/labels_shard_003.pt
 )
 
-sbatch trainffnn.sh "${EMB_DIRS[@]}" -- "${LABEL_SHARDS[@]}"
+sbatch train.sh "${EMB_DIRS[@]}" -- "${LABEL_SHARDS[@]}"
 ```
 
 Notes:
@@ -321,7 +326,7 @@ Notes:
 
 ### Stage 5: Optuna Tuning (Optional)
 
-**CLI:** `pepseqpred-train-ffnn-optuna` (`src/pepseqpred/apps/train_ffnn_optuna_cli.py`)
+**CLI:** `pepseqpred-train-optuna` (`src/pepseqpred/apps/train_optuna_cli.py`)
 
 **Core modules**
 
@@ -331,7 +336,7 @@ Notes:
 **Command (smoke)**
 
 ```bash
-pepseqpred-train-ffnn-optuna \
+pepseqpred-train-optuna \
   --embedding-dirs data/esm2/artifacts/pts/shard_000 \
   --label-shards data/labels/labels_shard_000.pt \
   --n-trials 2 \
@@ -342,10 +347,11 @@ pepseqpred-train-ffnn-optuna \
 
 **Current Optuna search space**
 
-The current study samples the following hyperparameters per trial:
+Optuna is fixed-head per study. `--model-head ffnn` samples the dense-head space. `--model-head conv1d` samples the same dense/optimizer settings plus convolutional head settings.
 
 | Hyperparameter (`best_params` key) | Type | Search space (current implementation) | Controlled by |
 | --- | --- | --- | --- |
+| `model_head` | fixed | `ffnn` or `conv1d` | `--model-head` |
 | `depth` | integer | `[depth_min, depth_max]` | `--depth-min`, `--depth-max` |
 | `width_step` | categorical | `{16, 32, 64}` | fixed in code |
 | `base_width` | integer | `[width_min, width_max]` with `step=width_step` | `--width-min`, `--width-max` |
@@ -353,6 +359,10 @@ The current study samples the following hyperparameters per trial:
 | `dropout` | float | `[0.00, 0.25]` | fixed in code |
 | `use_layer_norm` | categorical | `{True, False}` | fixed in code |
 | `use_residual` | categorical | `{True, False}` | fixed in code |
+| `conv_channels` | categorical | values from `--conv-channel-choices` | conv1d only |
+| `conv_layers` | integer | `[conv_layers_min, conv_layers_max]` | conv1d only |
+| `conv_kernel_size` | categorical | odd values from `--conv-kernel-size-choices` | conv1d only |
+| `conv_dropout` | float | `[conv_dropout_min, conv_dropout_max]` | conv1d only |
 | `learning_rate` | float (log) | `[lr_min, lr_max]` | `--lr-min`, `--lr-max` |
 | `weight_decay` | float (log) | `[wd_min, wd_max]` | `--wd-min`, `--wd-max` |
 | `batch_size` | categorical | values from `--batch-sizes` CSV | `--batch-sizes` |
@@ -374,7 +384,7 @@ Not tuned by Optuna in the current setup:
 HPC default override note:
 
 - The CLI default for `--batch-sizes` is `32,64,128`.
-- The SLURM wrapper `scripts/hpc/trainffnnoptuna.sh` currently overrides this to `256,512,1024` unless changed via env var.
+- The SLURM wrapper `scripts/hpc/trainoptuna.sh` currently overrides this to `256,512,1024` unless changed via env var.
 
 **Outputs**
 
@@ -512,8 +522,8 @@ Bundled pretrained registry currently includes:
 | `pepseqpred-preprocess` | `apps/preprocess_cli.py` | metadata + z-score preprocessing |
 | `pepseqpred-esm` | `apps/esm_cli.py` | ESM-2 embedding generation |
 | `pepseqpred-labels` | `apps/labels_cli.py` | residue label shard generation |
-| `pepseqpred-train-ffnn` | `apps/train_ffnn_cli.py` | unified holdout/K-fold FFNN training (`--n-folds`) |
-| `pepseqpred-train-ffnn-optuna` | `apps/train_ffnn_optuna_cli.py` | Optuna tuning |
+| `pepseqpred-train` | `apps/train_cli.py` | unified holdout/K-fold model-head training (`--n-folds`) |
+| `pepseqpred-train-optuna` | `apps/train_optuna_cli.py` | fixed-head Optuna tuning |
 | `pepseqpred-predict` | `apps/prediction_cli.py` | FASTA inference from checkpoint/manifest |
 | `pepseqpred-eval-ffnn` | `apps/evaluate_ffnn_cli.py` | residue-level evaluation |
 
@@ -525,8 +535,8 @@ These wrappers are production-facing interfaces and should be treated as first-c
 | --- | --- | --- |
 | `generateembeddings.sh` | Embeddings | GPU, array `0-3`, `a100`, `2` CPU/GPU, `8G`/GPU, `01:00:00` |
 | `generatelabels.sh` | Labels | CPU, `1` CPU, `16G`, `01:00:00` |
-| `trainffnn.sh` | Train FFNN | GPU, `4xa100`, `20` CPU, `256G`, `12:00:00` |
-| `trainffnnoptuna.sh` | Optuna | GPU, `4xa100`, `20` CPU, `448G`, `48:00:00` |
+| `train.sh` | Train model head | GPU, `4xa100`, `20` CPU, `256G`, `12:00:00` |
+| `trainoptuna.sh` | Optuna | GPU, `4xa100`, `20` CPU, `448G`, `48:00:00` |
 | `predictepitope.sh` | Predict | GPU, `a100`, `4` CPU, `32G`, `00:30:00` |
 | `evaluateffnn.sh` | End-to-end eval pipeline | GPU, `a100`, `8` CPU, `128G`, `04:00:00` |
 | `evalffnnsweep.sh` | Set-indexed eval batch submitter | wrapper script (calls `evaluateffnn.sh`) |
@@ -536,7 +546,7 @@ These wrappers are production-facing interfaces and should be treated as first-c
 
 - `evaluateffnn.sh` orchestrates prepare, embed, labels, predict, eval, and peptide compare stages with stage toggles (`RUN_PREP`, `RUN_EMBED`, `RUN_LABELS`, `RUN_PREDICT`, `RUN_EVAL`, `RUN_COMPARE`).
 - `evaluateffnn.sh` and `evalffnnsweep.sh` depend on `scripts/tools/cocci_eval_pipeline.py`.
-- HPC wrappers expect `.pyz` runtime artifacts in the working directory (for example `esm.pyz`, `train_ffnn.pyz`, `predict.pyz`).
+- HPC wrappers expect `.pyz` runtime artifacts in the working directory (for example `esm.pyz`, `train.pyz`, `predict.pyz`).
 
 ## Zipapp and Tooling (`scripts/tools`)
 

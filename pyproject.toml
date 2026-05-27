@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pepseqpred"
-version = "1.1.1"
+version = "1.2.1"
 description = "Residue-level epitope prediction pipeline for peptide/protein workflows."
 readme = "README.pypi.md"
 requires-python = ">=3.12"
@@ -74,8 +74,8 @@ pepseqpred-predict = "pepseqpred.apps.prediction_cli:main"
 pepseqpred-preprocess = "pepseqpred.apps.preprocess_cli:main"
 pepseqpred-prepare-dataset = "pepseqpred.apps.prepare_dataset_cli:main"
 pepseqpred-eval-ffnn = "pepseqpred.apps.evaluate_ffnn_cli:main"
-pepseqpred-train-ffnn = "pepseqpred.apps.train_ffnn_cli:main"
-pepseqpred-train-ffnn-optuna = "pepseqpred.apps.train_ffnn_optuna_cli:main"
+pepseqpred-train = "pepseqpred.apps.train_cli:main"
+pepseqpred-train-optuna = "pepseqpred.apps.train_optuna_cli:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

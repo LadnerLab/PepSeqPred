@@ -38,7 +38,7 @@ class FakeESMModel:
     def __call__(self, batch_tokens, repr_layers, return_contacts=False):
         _ = return_contacts
         batch_size, token_len = batch_tokens.shape
-        # append_seq_len -> final emb dim is 4 (matches training fixture)
+        # Base fake ESM dim is 3; raw seq_len_feature makes prediction dim 4.
         rep_dim = 3
         reps = torch.ones((batch_size, token_len, rep_dim),
                           dtype=torch.float32)
@@ -77,6 +77,8 @@ def test_train_then_predict_e2e(training_artifacts, tmp_path: Path, monkeypatch)
         "8",
         "--dropouts",
         "0.1",
+        "--seq-len-feature",
+        "raw",
         "--val-frac",
         "0.5",
         "--split-seeds",

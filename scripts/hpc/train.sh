@@ -33,6 +33,7 @@ usage() {
     echo "  THRESHOLD_MIN_RECALL  default: 0.80"
     echo "  THRESHOLD_FIXED_VALUE default: 0.50"
     echo "  MODEL_HEAD            default: ffnn (ffnn or conv1d)"
+    echo "  SEQ_LEN_FEATURE       default: none (none, raw, inverse)"
 }
 
 # require at least one embedding dir, separator (--), one label shard
@@ -65,6 +66,7 @@ fi
 HIDDEN_SIZES="${HIDDEN_SIZES:-150,120,45}"
 DROPOUTS="${DROPOUTS:-0.1,0.1,0.1}"
 MODEL_HEAD="${MODEL_HEAD:-ffnn}"
+SEQ_LEN_FEATURE="${SEQ_LEN_FEATURE:-none}"
 CONV_CHANNELS="${CONV_CHANNELS:-64}"
 CONV_LAYERS="${CONV_LAYERS:-2}"
 CONV_KERNEL_SIZE="${CONV_KERNEL_SIZE:-9}"
@@ -146,6 +148,7 @@ ${LAUNCHER} torchrun --nproc_per_node=4 train.pyz \
     --hidden-sizes "$HIDDEN_SIZES" \
     --dropouts "$DROPOUTS" \
     --model-head "$MODEL_HEAD" \
+    --seq-len-feature "$SEQ_LEN_FEATURE" \
     --conv-channels "$CONV_CHANNELS" \
     --conv-layers "$CONV_LAYERS" \
     --conv-kernel-size "$CONV_KERNEL_SIZE" \

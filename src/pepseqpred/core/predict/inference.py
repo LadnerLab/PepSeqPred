@@ -9,9 +9,19 @@ from pepseqpred.core.models.factory import (
     PepSeqModelConfig,
     build_pepseq_model,
     model_config_from_mapping,
-    validate_model_config,
+    validate_model_config
 )
-from pepseqpred.core.embeddings.esm2 import clean_seq, compute_window_embedding, append_seq_len
+from pepseqpred.core.embeddings.esm2 import (
+    apply_seq_len_feature,
+    clean_seq,
+    compute_window_embedding
+)
+from pepseqpred.core.data.seq_len_feature import (
+    SEQ_LEN_FEATURE_AUTO,
+    SEQ_LEN_FEATURE_NONE,
+    model_seq_len_feature_to_embedding,
+    normalize_prediction_seq_len_feature
+)
 
 _HIDDEN_LAYER_RE = re.compile(r"^ff_model\.(\d+)\.linear\.weight$")
 _OUTPUT_LAYER_RE = re.compile(r"^ff_model\.(\d+)\.weight$")
@@ -20,6 +30,18 @@ _SKIP_LINEAR_RE = re.compile(r"^ff_model\.\d+\.skip\.weight$")
 
 
 FFNNModelConfig = PepSeqModelConfig
+
+
+def resolve_prediction_seq_len_feature(
+    seq_len_feature: str | None,
+    model_config: PepSeqModelConfig,
+) -> str:
+    """Resolve prediction embedding length-feature mode from override/config."""
+    mode = normalize_prediction_seq_len_feature(seq_len_feature)
+    if mode == SEQ_LEN_FEATURE_AUTO:
+        return model_seq_len_feature_to_embedding(
+            getattr(model_config, "seq_len_feature", None))
+    return mode
 
 
 def normalize_state_dict_keys(state: Mapping[str, Any]) -> Dict[str, Any]:
@@ -278,7 +300,8 @@ def embed_protein_seq(protein_seq: str,
                       layer: int,
                       batch_converter: esm.data.BatchConverter,
                       device: str,
-                      max_tokens: int = 1022) -> torch.Tensor:
+                      max_tokens: int = 1022,
+                      seq_len_feature: str | None = SEQ_LEN_FEATURE_NONE) -> torch.Tensor:
     """
     Generates the embedding for an entire protein sequence.
 
@@ -297,6 +320,8 @@ def embed_protein_seq(protein_seq: str,
             The device to run the embedding model on (`"cpu"` or `"cuda"`).
         max_tokens : int
             Maximum number of tokens the ESM model can fit in its context window. Default is 1022.
+        seq_len_feature : str or None
+            Sequence-length feature mode: `"none"`, `"raw"`, or `"inverse"`.
 
     Returns
     -------
@@ -332,7 +357,11 @@ def embed_protein_seq(protein_seq: str,
                 batch_tokens, esm_model, layer, device)
 
     rep_np = rep.numpy().astype(np.float32)
-    rep_np = append_seq_len(rep_np, seq_len)
+    rep_np = apply_seq_len_feature(
+        rep_np,
+        seq_len=seq_len,
+        seq_len_feature=seq_len_feature,
+    )
 
     return torch.from_numpy(rep_np)
 
@@ -540,7 +569,8 @@ def predict_protein(psp_model: torch.nn.Module,
                     protein_seq: str,
                     max_tokens: int,
                     device: str,
-                    threshold: float = 0.5) -> Dict[str, Any]:
+                    threshold: float = 0.5,
+                    seq_len_feature: str | None = SEQ_LEN_FEATURE_NONE) -> Dict[str, Any]:
     """
     Predict residue-level binary epitope mask for one protein sequence
 
@@ -562,6 +592,8 @@ def predict_protein(psp_model: torch.nn.Module,
             Device type: `"cuda"` for GPUs, otherwise `"cpu"`.
         threshold : float
             The threshold between `0.0` and `1.0`, that determine the cutoff for non-epitope vs definite epitope. Default is `0.5`.
+        seq_len_feature : str or None
+            Sequence-length feature mode used for generated embeddings.
 
     Returns
     -------
@@ -582,7 +614,8 @@ def predict_protein(psp_model: torch.nn.Module,
         layer=layer,
         batch_converter=batch_converter,
         device=device,
-        max_tokens=max_tokens
+        max_tokens=max_tokens,
+        seq_len_feature=seq_len_feature,
     )
     return predict_from_embedding(
         psp_model=psp_model,

@@ -180,6 +180,23 @@ def test_from_artifact_member_validation_and_emb_dim_errors(monkeypatch):
         with pytest.raises(ValueError, match="share emb_dim"):
             PepSeqPredictor.from_artifact(artifact, model_name="fake_model", device="cpu")
 
+        def _build_mixed_seq_len_feature(checkpoint, **_kwargs):
+            token = checkpoint["token"]
+            seq_len_feature = "raw" if token == "a" else "inverse"
+            return (
+                object(),
+                SimpleNamespace(emb_dim=4, seq_len_feature=seq_len_feature),
+                "state_dict",
+            )
+
+        monkeypatch.setattr(
+            predictor_mod,
+            "build_model_from_checkpoint",
+            _build_mixed_seq_len_feature,
+        )
+        with pytest.raises(ValueError, match="seq_len_feature"):
+            PepSeqPredictor.from_artifact(artifact, model_name="fake_model", device="cpu")
+
 
 def test_predictor_payload_and_wrapper_branches(monkeypatch):
     predictor = PepSeqPredictor(

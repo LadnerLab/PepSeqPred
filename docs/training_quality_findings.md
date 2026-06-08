@@ -238,13 +238,13 @@ Implementation status:
 
 ### 9. Raw protein sequence length is appended as an unnormalized feature
 
-The embedding pipeline appends the original sequence length as an additional scalar feature to every residue embedding.
+Resolved: sequence length is now explicit and opt-in. Embedding generation defaults to no appended length feature, and training records only `"raw"` or `"inverse"` in `model_config.seq_len_feature`; a missing key means no appended length feature.
 
-Evidence:
+Original evidence:
 
 - `src/pepseqpred/core/embeddings/esm2.py`
   - `append_seq_len` appends `float(seq_len)` as a column.
-  - Both embedding generation and prediction embedding paths use this behavior.
+  - Embedding generation and prediction embedding paths used this behavior by default.
 
 Why this can hurt:
 
@@ -254,8 +254,9 @@ Why this can hurt:
 
 Planning direction:
 
-- Run an ablation without the length feature.
-- If length is retained, normalize it, bucket it, or pass it through a controlled transform.
+- Use the default no-length behavior for new runs.
+- Use `--seq-len-feature raw` only for explicit compatibility or ablation runs.
+- Use `--seq-len-feature inverse` for the supported bounded transform (`1.0 / seq_len`).
 
 ## Concrete Bug Found
 

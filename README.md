@@ -206,6 +206,11 @@ pepseqpred-esm \
 - embedding index CSV under `<out-dir>/artifacts/*.csv`
 - optional shard-specific outputs when `--num-shards > 1`
 
+Length feature note:
+
+- `--seq-len-feature {none,raw,inverse}` controls whether a sequence-length scalar is appended to every residue embedding.
+- The default is `none`. `raw` appends `float(seq_len)`; `inverse` appends `1.0 / seq_len`.
+
 ### Stage 3: Build Residue Labels
 
 **CLI:** `pepseqpred-labels` (`src/pepseqpred/apps/labels_cli.py`)
@@ -247,6 +252,7 @@ pepseqpred-labels \
 - `--split-seeds` and `--train-seeds` are paired by index; if both are omitted, both default to `--seed`
 - `--model-head ffnn` is the default and preserves existing dense-head behavior
 - `--model-head conv1d` adds a local Conv1d feature stack before the dense residue classifier
+- `--seq-len-feature {none,raw,inverse}` records whether embeddings include an appended sequence-length feature; use the same mode used during embedding generation
 
 **Core modules**
 
@@ -378,6 +384,7 @@ Not tuned by Optuna in the current setup:
 - `pos_weight` (fixed for the study via `--pos-weight`, or computed once from label shards if omitted)
 - split strategy and validation fraction (`--split-type`, `--val-frac`)
 - sequence windowing (`--window-size`, `--stride`) and data-loader behavior
+- sequence-length feature mode (`--seq-len-feature`; defaults to `none`)
 - trial budget/pruning controls (`--n-trials`, `--epochs`, `--pruner-warmup`, `--timeout-s`)
 - optimization target metric selection (`--metric`) is user-selected, then maximized by Optuna
 
@@ -419,6 +426,11 @@ pepseqpred-predict \
 **Output**
 
 - FASTA containing binary residue masks
+
+Length feature note:
+
+- `--seq-len-feature auto` is the default and resolves from checkpoint `model_config.seq_len_feature`.
+- A missing checkpoint key means no appended sequence-length feature. Use `--seq-len-feature raw` only when predicting with older or explicit raw-length models.
 
 ### Stage 7: Evaluate
 
@@ -480,9 +492,9 @@ Bundled pretrained registry currently includes:
 
 ### Embedding `.pt`
 
-- tensor shape: `(L, D+1)`
+- tensor shape: `(L, D)` by default, or `(L, D+1)` when `--seq-len-feature raw` or `inverse` was used
 - `L`: residue count
-- final feature column stores sequence length
+- optional final feature column stores either raw sequence length or inverse sequence length
 
 ### Label shard `.pt`
 
@@ -503,6 +515,10 @@ Bundled pretrained registry currently includes:
   "optim_state_dict": ..., 
   "epoch": int,
   "config": {...},
+  "model_config": {
+    # seq_len_feature is omitted for no appended length feature
+    # or set to "raw" / "inverse" when present
+  },
   "best_loss": float,
   "metrics": {...}
 }

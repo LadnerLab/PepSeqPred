@@ -4,9 +4,9 @@ ESM-2 embedding utilities for PepSeqPred.
 
 This module normalizes protein sequences, batches inputs by a token budget to
 reduce padding, and computes per-residue embeddings for both short and long
-proteins (using sliding windows for long sequences). It also appends sequence
-length as a feature and writes per-sequence `.pt` embeddings plus a CSV index
-describing stored artifacts.
+proteins (using sliding windows for long sequences). It can optionally append a
+sequence-length feature and writes per-sequence `.pt` embeddings plus a CSV
+index describing stored artifacts.
 """
 
 import os
@@ -19,6 +19,12 @@ import torch
 import numpy as np
 import pandas as pd
 from pepseqpred.core.io.keys import build_emb_stem, normalize_family_value
+from pepseqpred.core.data.seq_len_feature import (
+    SEQ_LEN_FEATURE_INVERSE,
+    SEQ_LEN_FEATURE_NONE,
+    SEQ_LEN_FEATURE_RAW,
+    normalize_embedding_seq_len_feature
+)
 
 
 def clean_seq(seq: str) -> str:
@@ -117,8 +123,9 @@ def compute_window_embedding(token: torch.Tensor,
     Returns
     -------
         torch.Tensor
-            An array of shape (L, D+1) where L is the number of residues (excluding CLS and EOS), and D+1 is
-            the embedding dimension for the chosen layer plus an additional column for the protein sequence length.
+            An array of shape (L, D) where L is the number of residues
+            (excluding CLS and EOS), and D is the embedding dimension for the
+            chosen layer.
     """
     seq_len = token.size(1) - 2  # remove CLS and EOS tokens
 
@@ -238,7 +245,50 @@ def append_seq_len(res_vec: np.ndarray, seq_len: int) -> np.ndarray:
         np.ndarray
             The updated embedding array with the protein sequence length appended.
     """
-    col = np.full((res_vec.shape[0], 1), float(seq_len), dtype=res_vec.dtype)
+    return apply_seq_len_feature(
+        res_vec=res_vec,
+        seq_len=seq_len,
+        seq_len_feature=SEQ_LEN_FEATURE_RAW,
+    )
+
+
+def apply_seq_len_feature(
+    res_vec: np.ndarray,
+    seq_len: int,
+    seq_len_feature: str | None = SEQ_LEN_FEATURE_NONE,
+) -> np.ndarray:
+    """
+    Optionally append a sequence-length feature to residue embeddings.
+
+    Parameters
+    ----------
+        res_vec : np.ndarray
+            Per-residue ESM embeddings.
+        seq_len : int
+            Protein sequence length.
+        seq_len_feature : str or None
+            `"none"` leaves embeddings unchanged, `"raw"` appends `seq_len`,
+            and `"inverse"` appends `1.0 / seq_len`.
+
+    Returns
+    -------
+        np.ndarray
+            Embeddings with shape `(L, D)` for `"none"` or `(L, D+1)` for
+            appended feature modes.
+    """
+    mode = normalize_embedding_seq_len_feature(seq_len_feature)
+    if mode == SEQ_LEN_FEATURE_NONE:
+        return res_vec
+    if int(seq_len) <= 0:
+        raise ValueError("seq_len must be > 0 when appending length feature")
+
+    value = float(seq_len)
+    if mode == SEQ_LEN_FEATURE_INVERSE:
+        value = 1.0 / value
+    elif mode != SEQ_LEN_FEATURE_RAW:
+        raise ValueError(f"Unsupported seq_len_feature='{seq_len_feature}'")
+
+    col = np.full((res_vec.shape[0], 1), value, dtype=res_vec.dtype)
     return np.concatenate([res_vec, col], axis=1)
 
 
@@ -253,6 +303,7 @@ def esm_embeddings_from_fasta(fasta_df: pd.DataFrame,
                               index_csv_path: Path | str = "esm2_seq_index.csv",
                               key_mode: str = "id-family",
                               key_delimiter: str = "-",
+                              seq_len_feature: str | None = SEQ_LEN_FEATURE_NONE,
                               logger: Optional[logging.Logger] = None) -> Tuple[pd.DataFrame, List[str]]:
     """
     Generate per residue ESM embeddings for sequences in a DataFrame and write outputs.
@@ -284,6 +335,8 @@ def esm_embeddings_from_fasta(fasta_df: pd.DataFrame,
             - "id-family": use `{id_col}{key_delimiter}{viral_family}`.
         key_delimiter : str
             Delimiter between ID and viral family when `key_mode` is "id-family".
+        seq_len_feature : str or None
+            Sequence-length feature mode: `"none"`, `"raw"`, or `"inverse"`.
         logger : logging.Logger or None
             Logger to use. If None, uses esm_cli logger.
 
@@ -295,6 +348,7 @@ def esm_embeddings_from_fasta(fasta_df: pd.DataFrame,
     """
     # set up logger and start timer
     logger = logger or logging.getLogger("esm_cli")
+    seq_len_feature = normalize_embedding_seq_len_feature(seq_len_feature)
     index_records = []
     t0 = time.perf_counter()
 
@@ -383,7 +437,8 @@ def esm_embeddings_from_fasta(fasta_df: pd.DataFrame,
                 "extra": {
                     "total_sequences": len(df),
                     "key_mode": key_mode,
-                    "key_delimiter": key_delimiter
+                    "key_delimiter": key_delimiter,
+                    "seq_len_feature": seq_len_feature
                 }})
 
     # load ESM embedding model
@@ -456,8 +511,9 @@ def esm_embeddings_from_fasta(fasta_df: pd.DataFrame,
                     seq_key = str(batch[batch_idx][0])
                     seq_meta = metadata_by_key.get(seq_key, {})
 
-                    # append sequence length column
-                    res_vec = append_seq_len(res_vec, len_)  # (L, D+1)
+                    # optionally append sequence length column
+                    res_vec = apply_seq_len_feature(
+                        res_vec, len_, seq_len_feature)
 
                     # save as .pt per sequence
                     torch.save(torch.from_numpy(res_vec),
@@ -475,6 +531,7 @@ def esm_embeddings_from_fasta(fasta_df: pd.DataFrame,
                                           "embed_dim": int(res_vec.shape[1]),
                                           # entire sequence length
                                           "original_seq_len": int(len_),
+                                          "seq_len_feature": seq_len_feature,
                                           "handle": "short",
                                           "model": model_name,
                                           "storage": ".pt"})
@@ -489,9 +546,9 @@ def esm_embeddings_from_fasta(fasta_df: pd.DataFrame,
                         # (L, D)
                         single_token, model, layer, device).cpu().numpy().astype(np.float32)
 
-                    # append sequence length column
-                    res_vec = append_seq_len(
-                        res_vec, len(protein_seq))  # (L, D+1)
+                    # optionally append sequence length column
+                    res_vec = apply_seq_len_feature(
+                        res_vec, len(protein_seq), seq_len_feature)
 
                     seq_meta = metadata_by_key.get(str(protein_key), {})
                     # save logs per-residue embeddings for sliding window long sequences
@@ -503,6 +560,7 @@ def esm_embeddings_from_fasta(fasta_df: pd.DataFrame,
                                           "length": int(res_vec.shape[0]),
                                           "embed_dim": int(res_vec.shape[1]),
                                           "original_seq_len": len(protein_seq),
+                                          "seq_len_feature": seq_len_feature,
                                           "handle": "long",
                                           "model": model_name,
                                           "storage": ".pt"})
@@ -534,6 +592,7 @@ def esm_embeddings_from_fasta(fasta_df: pd.DataFrame,
         "length",
         "embed_dim",
         "original_seq_len",
+        "seq_len_feature",
         "handle",
         "model",
         "storage",
@@ -565,6 +624,7 @@ def esm_embeddings_from_fasta(fasta_df: pd.DataFrame,
         "handled_short": int(by_handle.get("short", 0)),
         "handled_long": int(by_handle.get("long", 0)),
         "total_duration_s": round(elapsed, 3),
+        "seq_len_feature": seq_len_feature,
         "artifacts_path": str(os.path.abspath(per_seq_dir)),
         "index_csv_path": str(os.path.abspath(index_csv_path))
     }})

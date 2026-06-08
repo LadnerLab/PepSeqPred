@@ -37,7 +37,7 @@ from pepseqpred.core.models.factory import (
     PepSeqModelConfig,
     build_pepseq_model,
     model_config_to_dict,
-    validate_model_config,
+    validate_model_config
 )
 from pepseqpred.core.train.trainer import (
     Trainer,
@@ -67,6 +67,10 @@ from pepseqpred.core.train.threshold import THRESHOLD_POLICIES
 from pepseqpred.core.train.embedding import infer_emb_dim
 from pepseqpred.core.train.seed import set_all_seeds
 from pepseqpred.core.io.read import parse_int_csv, parse_float_csv
+from pepseqpred.core.data.seq_len_feature import (
+    EMBEDDING_SEQ_LEN_FEATURES,
+    cli_seq_len_feature_to_model
+)
 
 
 def summarize_numeric(series: pd.Series) -> Dict[str, Any]:
@@ -930,6 +934,13 @@ def main() -> None:
                         type=float,
                         default=0.1,
                         help="Dropout applied after each Conv1d activation when --model-head=conv1d.")
+    parser.add_argument("--seq-len-feature",
+                        action="store",
+                        dest="seq_len_feature",
+                        type=str,
+                        choices=list(EMBEDDING_SEQ_LEN_FEATURES),
+                        default="none",
+                        help="Sequence-length feature mode used in embedding tensors.")
     parser.add_argument("--epochs",
                         action="store",
                         dest="epochs",
@@ -1308,13 +1319,18 @@ def main() -> None:
             conv_layers=int(args.conv_layers),
             conv_kernel_size=int(args.conv_kernel_size),
             conv_dropout=float(args.conv_dropout),
+            seq_len_feature=cli_seq_len_feature_to_model(
+                args.seq_len_feature),
         )
     )
     model_config_payload = model_config_to_dict(model_config)
     if rank == 0:
         logger.info(
             "model_config_resolved",
-            extra={"extra": model_config_payload}
+            extra={"extra": {
+                **model_config_payload,
+                "seq_len_feature": str(args.seq_len_feature),
+            }}
         )
 
     # per-run loop
@@ -1571,6 +1587,7 @@ def main() -> None:
                 "SplitStrategy": str(args.split_strategy),
                 "SplitReportJson": str(split_report_json),
                 "ModelHead": str(model_config.model_head),
+                "SeqLenFeature": str(args.seq_len_feature),
                 "ConvChannels": int(model_config.conv_channels),
                 "ConvLayers": int(model_config.conv_layers),
                 "ConvKernelSize": int(model_config.conv_kernel_size),
@@ -1618,6 +1635,7 @@ def main() -> None:
             "split_type": str(args.split_type),
             "split_strategy": str(args.split_strategy),
             "split_report_json": str(split_report_json),
+            "seq_len_feature": str(args.seq_len_feature),
             "model_config": model_config_payload,
             "best_model_metric": str(args.best_model_metric),
             "threshold_policy": str(args.threshold_policy),
@@ -1753,6 +1771,7 @@ def main() -> None:
                     "split_type": str(args.split_type),
                     "split_strategy": str(args.split_strategy),
                     "split_report_json": str(split_report_json),
+                    "seq_len_feature": str(args.seq_len_feature),
                     "model_config": model_config_payload,
                     "n_folds": int(split_meta["n_folds"]),
                     "set_index": int(entry["set_index"]),
@@ -1809,6 +1828,7 @@ def main() -> None:
                     "split_type": str(args.split_type),
                     "split_strategy": str(args.split_strategy),
                     "split_report_json": str(split_report_json),
+                    "seq_len_feature": str(args.seq_len_feature),
                     "model_config": model_config_payload,
                     "n_folds": int(split_meta["n_folds"]),
                     "n_sets": int(n_sets),

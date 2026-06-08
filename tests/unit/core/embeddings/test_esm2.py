@@ -44,7 +44,7 @@ class FakeModel(torch.nn.Module):
         return {"representations": {repr_layers[0]: rep}}
 
 
-def test_clean_seq_token_batches_and_append_len():
+def test_clean_seq_token_batches_and_seq_len_features():
     assert esm2.clean_seq("acdx-*\n") == "ACDX"
 
     batches = list(
@@ -58,9 +58,20 @@ def test_clean_seq_token_batches_and_append_len():
     assert [x[0] for x in batches[0]] == ["a", "b"]
 
     arr = torch.ones((5, 3), dtype=torch.float32).numpy()
+    out_none = esm2.apply_seq_len_feature(arr, 5, "none")
+    assert out_none.shape == (5, 3)
+
     out = esm2.append_seq_len(arr, 5)
     assert out.shape == (5, 4)
     assert (out[:, -1] == 5).all()
+
+    out_inverse = esm2.apply_seq_len_feature(arr, 5, "inverse")
+    assert out_inverse.shape == (5, 4)
+    assert out_inverse[0, -1] == pytest.approx(0.2)
+    assert (out_inverse[:, -1] == out_inverse[0, -1]).all()
+
+    with pytest.raises(ValueError, match="seq_len_feature"):
+        esm2.apply_seq_len_feature(arr, 5, "bad")
 
 
 def test_compute_window_embedding_cpu_paths():
@@ -115,8 +126,48 @@ def test_esm_embeddings_from_fasta_short_and_long(monkeypatch, tmp_path: Path):
     assert failed == []
     assert len(index_df) == 2
     assert set(index_df["handle"]) == {"short", "long"}
+    assert set(index_df["seq_len_feature"]) == {"none"}
     for key in index_df["id"].tolist():
         assert (per_seq / f"{key}.pt").exists()
+        emb = torch.load(per_seq / f"{key}.pt",
+                         map_location="cpu", weights_only=True)
+        assert emb.shape[1] == 3
+
+
+def test_esm_embeddings_from_fasta_raw_seq_len_feature(monkeypatch, tmp_path: Path):
+    fake_pretrained = types.SimpleNamespace(
+        fake_model=lambda: (FakeModel(embed_dim=3), FakeAlphabet())
+    )
+    monkeypatch.setattr(esm2.esm, "pretrained", fake_pretrained)
+
+    df = pd.DataFrame(
+        [{"ID": "P1", "Sequence": "ACD", "viral_family": "111"}]
+    )
+
+    per_seq = tmp_path / "pts"
+    idx_csv = tmp_path / "idx.csv"
+    index_df, failed = esm2.esm_embeddings_from_fasta(
+        df,
+        id_col="ID",
+        seq_col="Sequence",
+        family_col="viral_family",
+        model_name="fake_model",
+        max_tokens=6,
+        batch_size=1,
+        per_seq_dir=per_seq,
+        index_csv_path=idx_csv,
+        key_mode="id-family",
+        key_delimiter="-",
+        seq_len_feature="raw",
+        logger=logging.getLogger("esm2_test")
+    )
+
+    assert failed == []
+    assert index_df.loc[0, "seq_len_feature"] == "raw"
+    emb = torch.load(per_seq / f"{index_df.loc[0, 'id']}.pt",
+                     map_location="cpu", weights_only=True)
+    assert emb.shape == (3, 4)
+    assert (emb[:, -1] == 3).all()
 
 
 def test_esm_embeddings_from_fasta_key_validation(monkeypatch, tmp_path: Path):

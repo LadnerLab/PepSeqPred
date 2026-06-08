@@ -22,6 +22,7 @@ usage() {
     echo "  model_name default: esm2_t33_650M_UR50D"
     echo "  max_tokens default: 1022"
     echo "  batch_size default: 24"
+    echo "  SEQ_LEN_FEATURE env default: none (none, raw, inverse)"
     echo ""
     echo "Examples:"
     echo "  sbatch $0 /scratch/\$USER/data/targets.fasta"
@@ -49,6 +50,7 @@ OUT_DIR="${2:-${OUT_DIR:-${SCRATCH_DIR}/esm2}}"
 MODEL_NAME="${3:-${MODEL_NAME:-esm2_t33_650M_UR50D}}" # see ESM-2 documentation for other models
 MAX_TOKENS="${4:-${MAX_TOKENS:-1022}}" # max number of tokens in model's context window
 BATCH_SIZE="${5:-${BATCH_SIZE:-24}}" # can probably get away with 16 or 24 on V100, double on A100
+SEQ_LEN_FEATURE="${SEQ_LEN_FEATURE:-none}"
 
 if [ -z "${IN_FASTA}" ]; then
     echo "Missing required input FASTA path."
@@ -88,6 +90,7 @@ ${LAUNCHER} python -u esm.pyz \
     --key-delimiter "${KEY_DELIMITER}" \
     --max-tokens "${MAX_TOKENS}" \
     --batch-size "${BATCH_SIZE}" \
+    --seq-len-feature "${SEQ_LEN_FEATURE}" \
     --num-shards "${NUM_SHARDS}" \
     --shard-id "${SHARD_ID}" \
     --log-dir "${LOG_DIR}" \

@@ -23,6 +23,7 @@ usage() {
     echo "  USE_SRUN           default: 1 (set 0 to run without srun)"
     echo "  MODEL_NAME         default: esm2_t33_650M_UR50D"
     echo "  MAX_TOKENS         default: 1022"
+    echo "  SEQ_LEN_FEATURE    default: auto (auto, none, raw, inverse)"
     echo "  THRESHOLD          default: unset (use checkpoint threshold)"
     echo "  ENSEMBLE_AGGREGATION default: majority"
     echo "  ENSEMBLE_THRESHOLD default: unset"
@@ -60,6 +61,7 @@ OUTPUT_FASTA="$3"
 
 MODEL_NAME="${MODEL_NAME:-esm2_t33_650M_UR50D}"
 MAX_TOKENS="${MAX_TOKENS:-1022}"
+SEQ_LEN_FEATURE="${SEQ_LEN_FEATURE:-auto}"
 THRESHOLD="${THRESHOLD:-}"
 ENSEMBLE_AGGREGATION="${ENSEMBLE_AGGREGATION:-majority}"
 ENSEMBLE_THRESHOLD="${ENSEMBLE_THRESHOLD:-}"
@@ -80,6 +82,7 @@ CLI_ARGS=(
     --output-fasta "${OUTPUT_FASTA}"
     --model-name "${MODEL_NAME}"
     --max-tokens "${MAX_TOKENS}"
+    --seq-len-feature "${SEQ_LEN_FEATURE}"
     --log-dir "${LOG_DIR}"
     --log-level "${LOG_LEVEL}"
     --log-json

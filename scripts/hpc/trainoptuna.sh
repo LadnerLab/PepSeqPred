@@ -24,6 +24,7 @@ usage() {
     echo "  THRESHOLD_MIN_PRECISION default: 0.25"
     echo "  THRESHOLD_MIN_RECALL default: 0.80"
     echo "  THRESHOLD_FIXED_VALUE default: 0.50"
+    echo "  SEQ_LEN_FEATURE default: none (none, raw, inverse)"
     echo ""
     echo "Example:"
     echo "  $0 /scratch/$USER/embeddings/shard1 /scratch/$USER/embeddings/shard2 -- /scratch/$USER/labels/labels_00.pt /scratch/$USER/labels/labels_01.pt"
@@ -85,6 +86,7 @@ STORAGE="${STORAGE:-sqlite:////scratch/$USER/optuna/${STUDY_NAME}.db}"
 
 # architecture search space
 MODEL_HEAD="${MODEL_HEAD:-ffnn}" # ffnn or conv1d
+SEQ_LEN_FEATURE="${SEQ_LEN_FEATURE:-none}" # none, raw, inverse
 ARCH_MODE="${ARCH_MODE:-flat}" # flat, bottleneck, pyramid
 DEPTH_MIN="${DEPTH_MIN:-2}"
 DEPTH_MAX="${DEPTH_MAX:-6}"
@@ -152,6 +154,7 @@ ${LAUNCHER} torchrun --nproc_per_node=4 train_optuna.pyz \
     --seed "$SEED" \
     --metric "$METRIC" \
     --model-head "$MODEL_HEAD" \
+    --seq-len-feature "$SEQ_LEN_FEATURE" \
     --threshold-policy "$THRESHOLD_POLICY" \
     --threshold-min-precision "$THRESHOLD_MIN_PRECISION" \
     --threshold-min-recall "$THRESHOLD_MIN_RECALL" \

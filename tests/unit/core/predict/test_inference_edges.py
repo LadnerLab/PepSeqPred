@@ -119,6 +119,21 @@ def test_infer_decision_threshold_edge_cases():
     assert inf.infer_decision_threshold({"metrics": {"threshold": 1.1}}, default=0.5) == pytest.approx(0.5)
 
 
+def test_resolve_prediction_seq_len_feature():
+    cfg_none = types.SimpleNamespace(emb_dim=3)
+    cfg_raw = types.SimpleNamespace(emb_dim=4, seq_len_feature="raw")
+    cfg_inverse = types.SimpleNamespace(emb_dim=4, seq_len_feature="inverse")
+
+    assert inf.resolve_prediction_seq_len_feature("auto", cfg_none) == "none"
+    assert inf.resolve_prediction_seq_len_feature("auto", cfg_raw) == "raw"
+    assert inf.resolve_prediction_seq_len_feature("auto", cfg_inverse) == "inverse"
+    assert inf.resolve_prediction_seq_len_feature("none", cfg_raw) == "none"
+    assert inf.resolve_prediction_seq_len_feature("raw", cfg_none) == "raw"
+    assert inf.resolve_prediction_seq_len_feature("inverse", cfg_none) == "inverse"
+    with pytest.raises(ValueError, match="seq_len_feature"):
+        inf.resolve_prediction_seq_len_feature("bad", cfg_none)
+
+
 def test_prediction_payload_and_member_probability_errors():
     with pytest.raises(ValueError, match="Expected probs shape"):
         inf._build_prediction_payload(
@@ -184,7 +199,31 @@ def test_embed_protein_seq_paths(monkeypatch):
         device="cpu",
         max_tokens=10
     )
-    assert out_short.shape == (5, 4)
+    assert out_short.shape == (5, 3)
+
+    out_raw = inf.embed_protein_seq(
+        protein_seq="ABCDE",
+        esm_model=_FakeEsmModel(),
+        layer=1,
+        batch_converter=_FakeBatchConverter(),
+        device="cpu",
+        max_tokens=10,
+        seq_len_feature="raw"
+    )
+    assert out_raw.shape == (5, 4)
+    assert (out_raw[:, -1] == 5).all()
+
+    out_inverse = inf.embed_protein_seq(
+        protein_seq="ABCDE",
+        esm_model=_FakeEsmModel(),
+        layer=1,
+        batch_converter=_FakeBatchConverter(),
+        device="cpu",
+        max_tokens=10,
+        seq_len_feature="inverse"
+    )
+    assert out_inverse.shape == (5, 4)
+    assert out_inverse[0, -1] == pytest.approx(0.2)
 
     monkeypatch.setattr(
         inf,
@@ -199,7 +238,7 @@ def test_embed_protein_seq_paths(monkeypatch):
         device="cpu",
         max_tokens=1
     )
-    assert out_long.shape == (5, 4)
+    assert out_long.shape == (5, 3)
 
 
 class _BadShapeModel(torch.nn.Module):

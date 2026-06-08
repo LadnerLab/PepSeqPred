@@ -238,6 +238,7 @@ def test_train_cli_real_no_valid_score_with_val_curve_artifacts(monkeypatch):
         assert str(runs_df.iloc[0]["BestMetricKey"]) == "f1"
         assert str(runs_df.iloc[0]["Status"]) == "NO_VALID_SCORE"
         assert str(runs_df.iloc[0]["SplitStrategy"]) == "size-balanced"
+        assert str(runs_df.iloc[0]["SeqLenFeature"]) == "none"
         assert Path(str(runs_df.iloc[0]["SplitReportJson"])).exists()
         assert "TrainPositiveRate" in runs_df.columns
         assert "ValPositiveRate" in runs_df.columns
@@ -252,6 +253,7 @@ def test_train_cli_real_no_valid_score_with_val_curve_artifacts(monkeypatch):
         )
         assert int(summary["n_runs"]) == 1
         assert summary["split_strategy"] == "size-balanced"
+        assert summary["seq_len_feature"] == "none"
         assert Path(summary["split_report_json"]).exists()
         assert summary["threshold_policy"] == "max-recall-min-precision"
         assert summary["threshold_min_precision"] == pytest.approx(0.25)
@@ -329,6 +331,7 @@ def test_train_cli_real_ensemble_manifest_generation(monkeypatch):
         assert payload["train_mode"] == "ensemble-kfold"
         assert payload["n_sets"] == 2
         assert payload["split_strategy"] == "label-stratified"
+        assert payload["seq_len_feature"] == "none"
         assert Path(payload["split_report_json"]).exists()
         assert payload["threshold_policy"] == "fixed"
         assert payload["threshold_min_precision"] == pytest.approx(0.33)
@@ -341,6 +344,7 @@ def test_train_cli_real_ensemble_manifest_generation(monkeypatch):
         set_payload = json.loads(set_manifest_path.read_text(encoding="utf-8"))
         assert set_payload["threshold_policy"] == "fixed"
         assert set_payload["split_strategy"] == "label-stratified"
+        assert set_payload["seq_len_feature"] == "none"
         assert all(
             member["threshold_policy"] == "fixed"
             for member in set_payload["members"]
@@ -478,6 +482,7 @@ def test_train_optuna_cli_real_with_storage_and_helpers(monkeypatch):
         )
         assert best_payload["study_name"] == "unit_realcov_study"
         assert best_payload["metric"] == "auc"
+        assert best_payload["seq_len_feature"] == "none"
         assert best_payload["split_strategy"] == "label-stratified"
         assert Path(best_payload["split_report_json"]).exists()
         assert best_payload["threshold_policy"] == "fixed"
@@ -487,6 +492,7 @@ def test_train_optuna_cli_real_with_storage_and_helpers(monkeypatch):
         assert csv_path.exists()
         trials_df = pd.read_csv(csv_path)
         assert str(trials_df.iloc[0]["SplitStrategy"]) == "label-stratified"
+        assert str(trials_df.iloc[0]["SeqLenFeature"]) == "none"
         assert "TrainPositiveRate" in trials_df.columns
         assert "ValPositiveRate" in trials_df.columns
         assert str(trials_df.iloc[0]["ThresholdPolicy"]) == "fixed"

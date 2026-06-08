@@ -44,7 +44,7 @@ from pepseqpred.core.models.factory import (
     PepSeqModelConfig,
     build_pepseq_model,
     model_config_to_dict,
-    validate_model_config,
+    validate_model_config
 )
 from pepseqpred.core.train.trainer import Trainer, TrainerConfig
 from pepseqpred.core.train.ddp import init_ddp
@@ -65,6 +65,10 @@ from pepseqpred.core.train.weights import (
 from pepseqpred.core.train.threshold import THRESHOLD_POLICIES
 from pepseqpred.core.train.embedding import infer_emb_dim
 from pepseqpred.core.train.seed import set_all_seeds
+from pepseqpred.core.data.seq_len_feature import (
+    EMBEDDING_SEQ_LEN_FEATURES,
+    cli_seq_len_feature_to_model
+)
 
 
 def _broadcast_params(params: Dict[str, Any], ddp: Dict[str, Any] | None) -> Dict[str, Any]:
@@ -223,6 +227,13 @@ def main() -> None:
                         choices=list(MODEL_HEADS),
                         default="ffnn",
                         help="Classifier head to tune.")
+    parser.add_argument("--seq-len-feature",
+                        action="store",
+                        dest="seq_len_feature",
+                        type=str,
+                        choices=list(EMBEDDING_SEQ_LEN_FEATURES),
+                        default="none",
+                        help="Sequence-length feature mode used in embedding tensors.")
     parser.add_argument("--threshold-policy",
                         type=str,
                         default="max-recall-min-precision",
@@ -841,6 +852,8 @@ def main() -> None:
                 conv_layers=conv_layers,
                 conv_kernel_size=conv_kernel_size,
                 conv_dropout=conv_dropout,
+                seq_len_feature=cli_seq_len_feature_to_model(
+                    args.seq_len_feature),
             )
         )
         model = build_pepseq_model(model_config)
@@ -896,6 +909,7 @@ def main() -> None:
                 "Timestamp": pd.Timestamp.utcnow().isoformat(),
                 "ModelVersion": "train_optuna",
                 "ModelHead": str(model_config.model_head),
+                "SeqLenFeature": str(args.seq_len_feature),
                 "NumParameters": int(sum(p.numel() for p in model.parameters())),
                 "HiddenLayers": int(depth),
                 "HiddenSizes": ",".join(str(x) for x in hidden_sizes),
@@ -945,6 +959,7 @@ def main() -> None:
             trial.set_user_attr("best_val_loss_at_score",
                                 float(best_val_loss_at_score))
             trial.set_user_attr("best_metrics", best_metrics)
+            trial.set_user_attr("seq_len_feature", str(args.seq_len_feature))
             trial.set_user_attr("model_config", model_config_to_dict(model_config))
 
         return float(best_score)
@@ -996,6 +1011,7 @@ def main() -> None:
                         "best_user_attrs": dict(best.user_attrs),
                         "metric": args.metric,
                         "model_head": str(args.model_head),
+                        "seq_len_feature": str(args.seq_len_feature),
                         "split_strategy": str(args.split_strategy),
                         "split_report_json": str(split_report_json),
                         "threshold_policy": str(args.threshold_policy),

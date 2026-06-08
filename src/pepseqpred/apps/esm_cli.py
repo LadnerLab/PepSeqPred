@@ -33,6 +33,7 @@ from pepseqpred.core.io.keys import (
     normalize_family_value
 )
 from pepseqpred.core.embeddings.esm2 import esm_embeddings_from_fasta
+from pepseqpred.core.data.seq_len_feature import EMBEDDING_SEQ_LEN_FEATURES
 
 
 def main() -> None:
@@ -139,6 +140,13 @@ def main() -> None:
                         type=int,
                         default=1022,
                         help="Size of context window for ESM model.")
+    parser.add_argument("--seq-len-feature",
+                        action="store",
+                        dest="seq_len_feature",
+                        type=str,
+                        choices=list(EMBEDDING_SEQ_LEN_FEATURES),
+                        default="none",
+                        help="Optional sequence-length feature to append to residue embeddings.")
     parser.add_argument("-b", "--batch-size",
                         action="store",
                         dest="batch_size",
@@ -283,6 +291,7 @@ def main() -> None:
                     "metadata_file": str(metadata_file) if metadata_file is not None else None,
                     "embedding_key_mode": args.embedding_key_mode,
                     "key_delimiter": args.key_delimiter,
+                    "seq_len_feature": args.seq_len_feature,
                     "output_path": str(os.path.abspath(out_dir)),
                     "device": "cuda" if torch.cuda.is_available() else "cpu",
                     "torch_version": torch.__version__,
@@ -305,6 +314,7 @@ def main() -> None:
         index_csv_path=out_dir/idx_csv_path,
         key_mode=args.embedding_key_mode,
         key_delimiter=args.key_delimiter,
+        seq_len_feature=args.seq_len_feature,
         logger=logger
     )
     logger.info("run_end", extra={"extra": {

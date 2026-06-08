@@ -4,6 +4,7 @@ from dataclasses import asdict, dataclass
 from typing import Any, Mapping, Tuple
 import torch.nn as nn
 from pepseqpred.core.models.ffnn import PepSeqConvFFNN, PepSeqFFNN
+from pepseqpred.core.data.seq_len_feature import normalize_model_seq_len_feature
 
 MODEL_HEAD_FFNN = "ffnn"
 MODEL_HEAD_CONV1D = "conv1d"
@@ -25,6 +26,7 @@ class PepSeqModelConfig:
     conv_layers: int = 2
     conv_kernel_size: int = 9
     conv_dropout: float = 0.1
+    seq_len_feature: str | None = None
 
 
 def normalize_model_head(model_head: str | None) -> str:
@@ -57,6 +59,8 @@ def validate_model_config(config: PepSeqModelConfig) -> PepSeqModelConfig:
         raise ValueError("conv_kernel_size must be a positive odd integer")
     if float(config.conv_dropout) < 0.0 or float(config.conv_dropout) > 1.0:
         raise ValueError("conv_dropout must be in [0.0, 1.0]")
+    seq_len_feature = normalize_model_seq_len_feature(
+        config.seq_len_feature)
     return PepSeqModelConfig(
         emb_dim=int(config.emb_dim),
         hidden_sizes=hidden_sizes,
@@ -69,6 +73,7 @@ def validate_model_config(config: PepSeqModelConfig) -> PepSeqModelConfig:
         conv_layers=int(config.conv_layers),
         conv_kernel_size=int(config.conv_kernel_size),
         conv_dropout=float(config.conv_dropout),
+        seq_len_feature=seq_len_feature,
     )
 
 
@@ -92,6 +97,11 @@ def model_config_from_mapping(raw: Mapping[str, Any]) -> PepSeqModelConfig:
         raise ValueError(
             "model_config missing required fields: " + ", ".join(missing)
         )
+    if "seq_len_feature" in raw and raw["seq_len_feature"] is None:
+        raise ValueError(
+            "model_config.seq_len_feature must be either 'raw' or 'inverse' "
+            "when present"
+        )
 
     return validate_model_config(
         PepSeqModelConfig(
@@ -106,6 +116,11 @@ def model_config_from_mapping(raw: Mapping[str, Any]) -> PepSeqModelConfig:
             conv_layers=int(raw.get("conv_layers", 2)),
             conv_kernel_size=int(raw.get("conv_kernel_size", 9)),
             conv_dropout=float(raw.get("conv_dropout", 0.1)),
+            seq_len_feature=(
+                normalize_model_seq_len_feature(raw["seq_len_feature"])
+                if "seq_len_feature" in raw
+                else None
+            ),
         )
     )
 
@@ -116,6 +131,8 @@ def model_config_to_dict(config: PepSeqModelConfig) -> dict[str, Any]:
     out = asdict(normalized)
     out["hidden_sizes"] = [int(x) for x in normalized.hidden_sizes]
     out["dropouts"] = [float(x) for x in normalized.dropouts]
+    if normalized.seq_len_feature is None:
+        out.pop("seq_len_feature", None)
     return out
 
 

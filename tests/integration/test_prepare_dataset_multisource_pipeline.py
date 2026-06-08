@@ -40,7 +40,7 @@ class FakeESMModel(torch.nn.Module):
     def forward(self, batch_tokens, repr_layers, return_contacts=False):
         _ = return_contacts
         batch_size, token_len = batch_tokens.shape
-        rep_dim = 3  # append_seq_len => final emb dim=4
+        rep_dim = 3
         reps = torch.ones((batch_size, token_len, rep_dim),
                           dtype=torch.float32)
         return {"representations": {repr_layers[0]: reps}}

@@ -31,8 +31,10 @@ from pepseqpred.core.predict.inference import (
     embed_protein_seq,
     infer_decision_threshold,
     predict_ensemble_from_embedding,
-    predict_from_embedding
+    predict_from_embedding,
+    resolve_prediction_seq_len_feature
 )
+from pepseqpred.core.data.seq_len_feature import PREDICTION_SEQ_LEN_FEATURES
 
 
 @dataclass(frozen=True)
@@ -364,6 +366,13 @@ def main() -> None:
                         type=int,
                         default=1022,
                         help="ESM residue token budget excluding CLS and EOS.")
+    parser.add_argument("--seq-len-feature",
+                        action="store",
+                        dest="seq_len_feature",
+                        type=str,
+                        choices=list(PREDICTION_SEQ_LEN_FEATURES),
+                        default="auto",
+                        help="Sequence-length feature mode for generated embeddings; auto uses checkpoint metadata.")
     parser.add_argument("--log-dir",
                         action="store",
                         dest="log_dir",
@@ -527,6 +536,16 @@ def main() -> None:
         raise ValueError(
             f"All ensemble members must share emb_dim for shared-embedding inference, got {sorted(emb_dims)}"
         )
+    seq_len_features = {
+        resolve_prediction_seq_len_feature(args.seq_len_feature, cfg)
+        for cfg in member_model_cfgs
+    }
+    if len(seq_len_features) != 1:
+        raise ValueError(
+            "All ensemble members must share seq_len_feature for shared-embedding inference, "
+            f"got {sorted(seq_len_features)}"
+        )
+    resolved_seq_len_feature = next(iter(seq_len_features))
 
     resolved_ensemble_threshold = None
     if len(psp_models) > 1 and args.ensemble_aggregation == "mean-prob":
@@ -560,6 +579,7 @@ def main() -> None:
                     "device": device,
                     "model_cfg_src": str(member_model_cfg_srcs[0]) if len(set(member_model_cfg_srcs)) == 1 else "mixed",
                     "model_head": str(first_cfg.model_head),
+                    "seq_len_feature": resolved_seq_len_feature,
                     "emb_dim": int(first_cfg.emb_dim),
                     "hidden_sizes": [int(x) for x in first_cfg.hidden_sizes],
                     "use_layer_norm": bool(first_cfg.use_layer_norm),
@@ -586,7 +606,8 @@ def main() -> None:
                     layer=layer,
                     batch_converter=batch_converter,
                     device=device,
-                    max_tokens=args.max_tokens
+                    max_tokens=args.max_tokens,
+                    seq_len_feature=resolved_seq_len_feature,
                 )
                 if len(psp_models) == 1:
                     pred = predict_from_embedding(
@@ -635,6 +656,7 @@ def main() -> None:
                     "total_residues": total_residues,
                     "total_epitopes": total_epitopes,
                     "ensemble_aggregation": str(args.ensemble_aggregation),
+                    "seq_len_feature": resolved_seq_len_feature,
                     "ensemble_threshold": resolved_ensemble_threshold
                 }})
 

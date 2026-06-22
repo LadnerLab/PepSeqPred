@@ -52,7 +52,7 @@ Planning direction:
 
 ### 2. Sparse or zero-valid windows still participate in training
 
-The dataset yields all windows, including windows with no valid labeled residues. The trainer handles zero-valid masks by producing zero loss, but the optimizer still performs a step.
+Resolved for optimizer behavior: the dataset still yields windows with no valid labeled residues, but a synchronized step with zero valid residues globally now completes a graph-connected zero backward pass without advancing Adam. A rank with zero local support still takes the optimizer step when another rank has valid residues, using the globally reduced gradient.
 
 Evidence:
 
@@ -60,44 +60,47 @@ Evidence:
   - `ProteinDataset.__iter__` yields every window from `_iter_windows`.
   - The final mask may be all zero when a window contains only uncertain or padded residues.
 - `src/pepseqpred/core/train/trainer.py`
-  - `_batch_step` creates zero loss when `mask.sum() == 0`.
-  - Training still calls `zero_grad`, `loss.backward()`, and `optimizer.step()`.
+  - `_batch_step` distinguishes local valid support from global valid support.
+  - Globally empty steps skip `optimizer.step()` on every rank.
+  - Exhausted ranks use zero-valid dummy batches so their Adam state stays synchronized while other ranks still have data.
 
-Why this can hurt:
+Remaining concern:
 
-- Adam step counters still advance on no-information batches.
-- Learning-rate dynamics and optimizer moments can be affected without a meaningful gradient.
-- If some pathogens or proteins have many uncertain/unlabeled regions, they can consume training steps without learning signal.
+- Zero-valid windows still consume data-loading and forward/backward compute.
+- If some pathogens or proteins have many uncertain/unlabeled regions, they can consume substantial runtime without adding training signal.
 
 Planning direction:
 
-- Add logging for zero-valid windows and zero-valid batches by split, fold, rank, and source.
-- Skip optimizer steps when a batch has zero valid residues.
+- Add logging for zero-valid windows by split, fold, rank, and source.
 - Optionally filter zero-valid windows in `ProteinDataset` for training.
 
 ### 3. DDP and batch loss weighting are likely biased by local valid-residue counts
 
-Each rank computes a local masked mean BCE loss, then DDP averages gradients across ranks. This is not equivalent to a global valid-residue-weighted loss when ranks or batches have different valid residue counts.
+Resolved: training now backpropagates each rank's summed masked BCE scaled by `world_size / global_valid_residues`. After DDP averages gradients, the result is the globally valid-residue-normalized gradient.
 
 Evidence:
 
 - `src/pepseqpred/core/train/trainer.py`
-  - Loss is `(loss_raw * mask).sum() / mask.sum()` per local batch.
-  - DDP then averages gradients across ranks equally.
+  - Every rank reduces its valid-residue count before backward.
+  - Exhausted ranks remain in a collective-aware loop using minimal zero-valid dummy batches until all ranks are exhausted.
+  - Training no longer relies on `DDP.join()`, which cannot shadow the custom loss collective.
 - `src/pepseqpred/apps/train_cli.py`
   - IDs are partitioned across ranks by estimated embedding file size, not by valid positive/negative residue count.
 
-Why this can hurt:
+Remaining concern:
 
-- A rank with few valid residues can contribute the same gradient weight as a rank with many valid residues.
-- Long proteins, label sparsity, and source/pathogen-specific label density can make this much worse.
-- Multi-pathogen data is especially vulnerable if some groups have sparse labels or many uncertain residues.
+- Weighted partitioning now affects efficiency and late-step effective batch size rather than gradient correctness.
+- Large rank imbalance produces more dummy batches and smaller global batches near the end of an epoch.
 
 Planning direction:
 
-- Log valid residue count per batch and rank.
-- Consider globally normalized loss using summed numerator and denominator across ranks.
-- Alternatively ensure per-rank partitioning balances valid residues and positive residues, not just embedding file size.
+- Monitor the per-rank real/dummy batch counts emitted by `train_sync_summary`.
+- Consider balancing partitions by estimated window or valid-residue counts if dummy-batch fractions are large.
+
+Test coverage:
+
+- Unit tests cover local/global zero-valid behavior, loss scaling, dummy generation, and synchronized iteration.
+- A two-process CPU/Gloo integration test uses one versus three rank-local batches across two epochs and compares model parameters and Adam state.
 
 ### 4. Training uses overlapping windows while evaluation uses full proteins
 
@@ -342,4 +345,4 @@ Recommended first-pass diagnostics:
 
 ## Validation Notes
 
-This document was produced from static code inspection. No tests or training jobs were run for this report.
+The original findings were produced from static code inspection. Subsequent resolved sections have targeted unit and integration coverage. The real-process Gloo regression is Linux-only, matching CI and HPC; no multi-GPU training job has yet been run for this change.

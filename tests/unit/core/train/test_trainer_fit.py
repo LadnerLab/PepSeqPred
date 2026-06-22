@@ -54,6 +54,80 @@ def _make_trainer(train_loader, val_loader=None, emb_dim: int = 4, epochs: int =
     )
 
 
+def test_make_zero_valid_dummy_batch_supports_masked_and_unmasked_batches():
+    trainer = _make_trainer(_make_batches(n_batches=1), epochs=1)
+    x, y, mask = _make_batches(n_batches=1)[0]
+
+    masked_dummy = trainer._make_zero_valid_dummy_batch((x, y, mask))
+    unmasked_dummy = trainer._make_zero_valid_dummy_batch((x, y))
+
+    for dummy_x, dummy_y, dummy_mask in (masked_dummy, unmasked_dummy):
+        assert dummy_x.shape == (1, 1, x.size(-1))
+        assert dummy_y.shape == (1, 1)
+        assert dummy_mask.shape == (1, 1)
+        assert torch.count_nonzero(dummy_x).item() == 0
+        assert torch.count_nonzero(dummy_y).item() == 0
+        assert torch.count_nonzero(dummy_mask).item() == 0
+
+
+def test_synchronized_training_batches_yields_dummy_after_local_exhaustion(monkeypatch):
+    batches = _make_batches(n_batches=1)
+    trainer = _make_trainer(batches, epochs=1)
+    reduced_states = iter(((2, 2), (1, 2), (0, 2)))
+    local_states = []
+
+    def _reduce_active(tensor: torch.Tensor) -> torch.Tensor:
+        local_states.append(tuple(int(x) for x in tensor.tolist()))
+        active, world = next(reduced_states)
+        return torch.tensor(
+            [active, world], device=tensor.device, dtype=tensor.dtype)
+
+    monkeypatch.setattr(trainer_mod, "ddp_all_reduce_sum", _reduce_active)
+
+    synchronized = list(trainer._synchronized_training_batches(batches))
+
+    assert local_states == [(1, 1), (0, 1), (0, 1)]
+    assert len(synchronized) == 2
+    assert synchronized[0][0] is batches[0]
+    assert synchronized[0][1] is True
+    dummy_batch, is_real = synchronized[1]
+    assert is_real is False
+    assert dummy_batch[0].shape == (1, 1, 4)
+    assert torch.count_nonzero(dummy_batch[2]).item() == 0
+
+
+def test_synchronized_training_batches_rejects_initial_empty_rank(monkeypatch):
+    trainer = _make_trainer([], epochs=1)
+
+    def _one_active_rank(tensor: torch.Tensor) -> torch.Tensor:
+        return torch.tensor([1, 2], device=tensor.device, dtype=tensor.dtype)
+
+    monkeypatch.setattr(trainer_mod, "ddp_all_reduce_sum", _one_active_rank)
+
+    with pytest.raises(RuntimeError, match="no initial training batch"):
+        list(trainer._synchronized_training_batches([]))
+
+
+def test_run_epoch_train_reports_single_rank_synchronization():
+    batches = _make_batches(n_batches=2)
+    trainer = _make_trainer(batches, epochs=1)
+
+    out = trainer._run_epoch(0, train=True)
+
+    assert out["synchronized_steps"] == 2
+    assert out["optimizer_steps"] == 2
+    assert out["zero_valid_steps"] == 0
+    assert out["real_batches"] == 2
+    assert out["dummy_batches"] == 0
+    assert out["sync_summary"] == {
+        "synchronized_steps": 2,
+        "optimizer_steps": 2,
+        "zero_valid_steps": 0,
+        "dummy_batch_fraction": 0.0,
+        "per_rank": [{"rank": 0, "real_batches": 2, "dummy_batches": 0}],
+    }
+
+
 def test_fit_with_validation_saves_checkpoint(tmp_path: Path):
     trainer = _make_trainer(
         _make_batches(), _make_batches(), emb_dim=4, epochs=2)

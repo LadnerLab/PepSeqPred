@@ -82,7 +82,7 @@ TRAIN_SEEDS="${TRAIN_SEEDS:-101,202,303,404,505}"
 SPLIT_STRATEGY="${SPLIT_STRATEGY:-size-balanced}"
 SPLIT_REPORT_JSON="${SPLIT_REPORT_JSON:-}"
 N_FOLDS="${N_FOLDS:-1}"
-BATCH_SIZE="${BATCH_SIZE:-256}" # ensure batch size is 4 times what you would do for one GPU (for example. 256 = 64 * 4)
+BATCH_SIZE="${BATCH_SIZE:-64}" # ensure you account for number of GPUs (ex. 64 * 4 GPUs = 256 total batch size)
 LR="${LR:-0.001}"
 WD="${WD:-0.0}"
 VAL_FRAC="${VAL_FRAC:-0.2}"

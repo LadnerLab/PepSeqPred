@@ -7,10 +7,9 @@ metrics, threshold selection, checkpointing, and optional Optuna tuning.
 """
 
 import logging
-import contextlib
 from pathlib import Path
 from dataclasses import dataclass
-from typing import Optional, List, Dict, Any, Tuple
+from typing import Optional, List, Dict, Any, Tuple, Iterator
 import torch
 import torch.nn as nn
 from torch.nn.parallel import DistributedDataParallel as TorchDDP
@@ -22,6 +21,12 @@ from .metrics import compute_eval_metrics
 from .threshold import select_threshold, threshold_diagnostic_grid
 from .curveartifacts import write_validation_curve_artifacts
 from pepseqpred.core.models.factory import PepSeqModelConfig, model_config_to_dict
+
+
+Batch = (
+    Tuple[torch.Tensor, torch.Tensor]
+    | Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+)
 
 
 @dataclass
@@ -116,7 +121,95 @@ class Trainer:
                                  "threshold_fixed_value": self.config.threshold_fixed_value
                              }})
 
-    def _batch_step(self, batch: torch.Tensor, train: bool = True) -> Dict[str, Any]:
+    @staticmethod
+    def _make_zero_valid_dummy_batch(batch: Batch) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Build a minimal graph-compatible batch with no valid residues."""
+        if len(batch) == 2:
+            X, y = batch
+            mask = None
+        elif len(batch) == 3:
+            X, y, mask = batch
+        else:
+            raise ValueError(
+                f"Expected a two- or three-tensor batch, got {len(batch)} elements")
+
+        if X.dim() != 3:
+            raise ValueError(
+                f"Expected embedding shape (B, L, D), got {tuple(X.shape)}")
+        if y.dim() != 2:
+            raise ValueError(
+                f"Expected target shape (B, L), got {tuple(y.shape)}")
+
+        dummy_x = X.new_zeros((1, 1, X.size(-1)))
+        dummy_y = y.new_zeros((1, 1))
+        if mask is None:
+            dummy_mask = torch.zeros(
+                (1, 1), dtype=torch.long, device=y.device)
+        else:
+            dummy_mask = mask.new_zeros((1, 1))
+        return dummy_x, dummy_y, dummy_mask
+
+    def _synchronized_training_batches(
+        self,
+        loader: DataLoader
+    ) -> Iterator[Tuple[Batch, bool]]:
+        """Yield real or zero-valid batches until every DDP rank is exhausted.
+
+        Every rank performs the same active-rank collective before a forward
+        pass. Once a rank exhausts its local loader, it continues yielding a
+        minimal zero-valid batch so custom loss collectives, DDP backward, and
+        optimizer state remain synchronized. The current model heads do not use
+        batch-statistics layers; adding BatchNorm or SyncBatchNorm requires
+        revisiting this dummy-forward behavior.
+        """
+        iterator = iter(loader)
+        dummy_batch: Optional[Tuple[
+            torch.Tensor, torch.Tensor, torch.Tensor
+        ]] = None
+        first_iteration = True
+
+        while True:
+            try:
+                batch = next(iterator)
+                has_local_batch = True
+                if dummy_batch is None:
+                    dummy_batch = self._make_zero_valid_dummy_batch(batch)
+            except StopIteration:
+                batch = None
+                has_local_batch = False
+
+            sync_state = torch.tensor(
+                [1 if has_local_batch else 0, 1],
+                device=self.device,
+                dtype=torch.int64,
+            )
+            sync_state = ddp_all_reduce_sum(sync_state)
+            active_ranks = int(sync_state[0].item())
+            world_size = int(sync_state[1].item())
+
+            if active_ranks == 0:
+                return
+
+            if first_iteration and active_ranks != world_size:
+                raise RuntimeError(
+                    "At least one DDP rank has no initial training batch; "
+                    "training requires every rank to start with data"
+                )
+            first_iteration = False
+
+            if has_local_batch:
+                if batch is None:
+                    raise RuntimeError("Training iterator lost a local batch")
+                yield batch, True
+            else:
+                if dummy_batch is None:
+                    raise RuntimeError(
+                        "Cannot construct a synchronized dummy batch before "
+                        "receiving a real training batch"
+                    )
+                yield dummy_batch, False
+
+    def _batch_step(self, batch: Batch, train: bool = True) -> Dict[str, Any]:
         """Steps through a batch to train and optimize the model."""
         # ensure we grab mask when applicable
         if len(batch) == 2:
@@ -173,14 +266,27 @@ class Trainer:
                 n_tensor.detach().to(dtype=torch.float64),
                 torch.ones((), device=y.device, dtype=torch.float64)
             )))
-            # if no valid windows, return before back-prop
-            if int(step_stats[0].item()) == 0:
-                return {"loss": float(loss.item()), "n": n}
+            global_valid_count = int(step_stats[0].item())
+            # complete DDP's backward sequence without advancing Adam when the
+            # entire synchronized step contains no valid residues
+            if global_valid_count == 0:
+                (loss_num * 0.0).backward()
+                return {
+                    "loss": float(loss.item()),
+                    "n": n,
+                    "global_valid_count": 0,
+                    "optimizer_step": False
+                }
             train_loss = loss_num * (
                 step_stats[1] / step_stats[0]).to(dtype=loss_num.dtype)
             train_loss.backward()
             self.optimizer.step()
-            return {"loss": float(loss.item()), "n": n}
+            return {
+                "loss": float(loss.item()),
+                "n": n,
+                "global_valid_count": global_valid_count,
+                "optimizer_step": True
+            }
 
         probs = torch.sigmoid(logits)  # (B, L)
         y_flat = y.to(torch.long).view(-1)
@@ -221,18 +327,32 @@ class Trainer:
         total_samples = 0
         total_pos = 0
         total_neg = 0
+        synchronized_steps = 0
+        optimizer_steps = 0
+        zero_valid_steps = 0
+        real_batches = 0
+        dummy_batches = 0
 
         all_y: List[torch.Tensor] = []
         all_probs: List[torch.Tensor] = []
 
+        if train:
+            batches = self._synchronized_training_batches(loader)
+        else:
+            batches = ((batch, True) for batch in loader)
+
         # use inference mode for eval
         torch_ctx = torch.enable_grad() if train else torch.inference_mode()
-        loop_ctx = self.model.join() if train and hasattr(
-            self.model, "join") else contextlib.nullcontext()
-        with loop_ctx:
-            for batch in loader:
-                with torch_ctx:
-                    out = self._batch_step(batch, train=train)
+        with torch_ctx:
+            for batch, is_real_batch in batches:
+                out = self._batch_step(batch, train=train)
+
+                if train:
+                    synchronized_steps += 1
+                    real_batches += int(is_real_batch)
+                    dummy_batches += int(not is_real_batch)
+                    optimizer_steps += int(out["optimizer_step"])
+                    zero_valid_steps += int(out["global_valid_count"] == 0)
 
                 # collect data for metrics
                 if not train and out["n"] > 0:
@@ -282,6 +402,47 @@ class Trainer:
         neg_sum = ddp_all_reduce_sum(neg_sum)
         total_pos = int(pos_sum.item())
         total_neg = int(neg_sum.item())
+
+        sync_summary = None
+        if train:
+            local_sync_stats = torch.tensor(
+                [real_batches, dummy_batches],
+                device=self.device,
+                dtype=torch.int64
+            )
+            gathered_sync_stats, sync_sizes = ddp_gather_all_1d(
+                local_sync_stats, self.device)
+            if ddp_rank() == 0:
+                per_rank = []
+                for rank_index, size in enumerate(sync_sizes):
+                    if size != 2:
+                        raise RuntimeError(
+                            "Expected two training synchronization counters "
+                            f"from rank {rank_index}, got {size}"
+                        )
+                    rank_stats = gathered_sync_stats[rank_index][:size]
+                    per_rank.append({
+                        "rank": int(rank_index),
+                        "real_batches": int(rank_stats[0].item()),
+                        "dummy_batches": int(rank_stats[1].item())
+                    })
+
+                total_dummy_batches = sum(
+                    entry["dummy_batches"] for entry in per_rank)
+                total_rank_steps = synchronized_steps * len(per_rank)
+                sync_summary = {
+                    "synchronized_steps": int(synchronized_steps),
+                    "optimizer_steps": int(optimizer_steps),
+                    "zero_valid_steps": int(zero_valid_steps),
+                    "dummy_batch_fraction": (
+                        float(total_dummy_batches / total_rank_steps)
+                        if total_rank_steps > 0
+                        else 0.0
+                    ),
+                    "per_rank": per_rank
+                }
+                self.logger.info(
+                    "train_sync_summary", extra={"extra": sync_summary})
 
         # compute eval metrics
         cm = None
@@ -439,7 +600,16 @@ class Trainer:
         # handle training vs eval output
         out = {"loss": avg_loss, "n_residues": total_samples,
                "pos_residues": total_pos, "neg_residues": total_neg}
-        if not train:
+        if train:
+            out.update({
+                "synchronized_steps": int(synchronized_steps),
+                "optimizer_steps": int(optimizer_steps),
+                "zero_valid_steps": int(zero_valid_steps),
+                "real_batches": int(real_batches),
+                "dummy_batches": int(dummy_batches),
+                "sync_summary": sync_summary
+            })
+        else:
             out["acc"] = avg_acc
             out["eval_metrics"] = eval_metrics
             if capture_eval_arrays and ddp_rank() == 0:

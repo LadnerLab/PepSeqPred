@@ -63,7 +63,14 @@ def test_batch_step_zero_mask_returns_zero_n(monkeypatch):
     out = trainer._batch_step((x, y, mask), train=True)
     assert out["n"] == 0
     assert out["loss"] == pytest.approx(0.0, abs=1e-12)
+    assert out["global_valid_count"] == 0
+    assert out["optimizer_step"] is False
     assert step_calls == 0
+    assert all(
+        parameter.grad is not None
+        and torch.count_nonzero(parameter.grad).item() == 0
+        for parameter in model.parameters()
+    )
 
 
 def test_batch_step_zero_local_mask_steps_when_global_valid(monkeypatch):
@@ -98,6 +105,8 @@ def test_batch_step_zero_local_mask_steps_when_global_valid(monkeypatch):
     out = trainer._batch_step((x, y, mask), train=True)
     assert out["n"] == 0
     assert out["loss"] == pytest.approx(0.0, abs=1e-12)
+    assert out["global_valid_count"] == 1
+    assert out["optimizer_step"] is True
     assert step_calls == 1
 
 
@@ -123,6 +132,8 @@ def test_batch_step_scales_training_loss_by_global_valid_count(monkeypatch):
 
     out = trainer._batch_step((x, y, mask), train=True)
     assert out["n"] == 1
+    assert out["global_valid_count"] == 4
+    assert out["optimizer_step"] is True
     assert model.p.grad.item() == pytest.approx(0.25, abs=1e-12)
 
 

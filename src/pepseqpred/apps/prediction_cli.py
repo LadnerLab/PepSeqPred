@@ -24,14 +24,17 @@ import esm
 from pepseqpred.core.io.logger import setup_logger
 from pepseqpred.core.io.read import parse_int_csv, parse_float_csv
 from pepseqpred.core.embeddings.esm2 import clean_seq
+from pepseqpred.core.models.factory import MODEL_HEADS
 from pepseqpred.core.predict.inference import (
     FFNNModelConfig,
     build_model_from_checkpoint,
     embed_protein_seq,
     infer_decision_threshold,
     predict_ensemble_from_embedding,
-    predict_from_embedding
+    predict_from_embedding,
+    resolve_prediction_seq_len_feature
 )
+from pepseqpred.core.data.seq_len_feature import PREDICTION_SEQ_LEN_FEATURES
 
 
 @dataclass(frozen=True)
@@ -68,6 +71,11 @@ def read_fasta_records(fasta_path: Path | str) -> Iterator[Tuple[str, str]]:
 
 def _build_cli_model_config(args: argparse.Namespace) -> FFNNModelConfig | None:
     """Builds the model configuration using CLI arguments."""
+    model_head_arg = getattr(args, "model_head", None)
+    conv_channels_arg = getattr(args, "conv_channels", None)
+    conv_layers_arg = getattr(args, "conv_layers", None)
+    conv_kernel_size_arg = getattr(args, "conv_kernel_size", None)
+    conv_dropout_arg = getattr(args, "conv_dropout", None)
     any_explicit = any(
         arg is not None
         for arg in (
@@ -76,7 +84,12 @@ def _build_cli_model_config(args: argparse.Namespace) -> FFNNModelConfig | None:
             args.dropouts,
             args.use_layer_norm,
             args.use_residual,
-            args.num_classes
+            args.num_classes,
+            model_head_arg,
+            conv_channels_arg,
+            conv_layers_arg,
+            conv_kernel_size_arg,
+            conv_dropout_arg
         )
     )
     if not any_explicit:
@@ -93,6 +106,16 @@ def _build_cli_model_config(args: argparse.Namespace) -> FFNNModelConfig | None:
         missing.append("--use-layer-norm/--no-use-layer-norm")
     if args.use_residual is None:
         missing.append("--use-residual/--no-use-residual")
+    model_head = str(model_head_arg or "ffnn")
+    if model_head == "conv1d":
+        if conv_channels_arg is None:
+            missing.append("--conv-channels")
+        if conv_layers_arg is None:
+            missing.append("--conv-layers")
+        if conv_kernel_size_arg is None:
+            missing.append("--conv-kernel-size")
+        if conv_dropout_arg is None:
+            missing.append("--conv-dropout")
     if missing:
         raise ValueError(
             "When using explicit architecture flags, provide all required values: "
@@ -113,7 +136,12 @@ def _build_cli_model_config(args: argparse.Namespace) -> FFNNModelConfig | None:
         dropouts=tuple(dropouts),
         num_classes=num_classes,
         use_layer_norm=bool(args.use_layer_norm),
-        use_residual=bool(args.use_residual)
+        use_residual=bool(args.use_residual),
+        model_head=model_head,
+        conv_channels=int(conv_channels_arg) if conv_channels_arg is not None else 64,
+        conv_layers=int(conv_layers_arg) if conv_layers_arg is not None else 2,
+        conv_kernel_size=int(conv_kernel_size_arg) if conv_kernel_size_arg is not None else 9,
+        conv_dropout=float(conv_dropout_arg) if conv_dropout_arg is not None else 0.1
     )
 
 
@@ -301,6 +329,19 @@ def main() -> None:
                         type=float,
                         default=None,
                         help="Optional global threshold override within (0.0, 1.0).")
+    parser.add_argument("--ensemble-aggregation",
+                        action="store",
+                        dest="ensemble_aggregation",
+                        type=str,
+                        choices=["majority", "mean-prob"],
+                        default="majority",
+                        help="Ensemble aggregation rule for manifest predictions.")
+    parser.add_argument("--ensemble-threshold",
+                        action="store",
+                        dest="ensemble_threshold",
+                        type=float,
+                        default=None,
+                        help="Optional threshold for mean-prob ensemble aggregation.")
     parser.add_argument("--ensemble-set-index",
                         action="store",
                         dest="ensemble_set_index",
@@ -325,6 +366,13 @@ def main() -> None:
                         type=int,
                         default=1022,
                         help="ESM residue token budget excluding CLS and EOS.")
+    parser.add_argument("--seq-len-feature",
+                        action="store",
+                        dest="seq_len_feature",
+                        type=str,
+                        choices=list(PREDICTION_SEQ_LEN_FEATURES),
+                        default="auto",
+                        help="Sequence-length feature mode for generated embeddings; auto uses checkpoint metadata.")
     parser.add_argument("--log-dir",
                         action="store",
                         dest="log_dir",
@@ -367,6 +415,37 @@ def main() -> None:
                         type=int,
                         default=None,
                         help="Explicit output classes (binary=1).")
+    parser.add_argument("--model-head",
+                        action="store",
+                        dest="model_head",
+                        type=str,
+                        choices=list(MODEL_HEADS),
+                        default=None,
+                        help="Explicit model head used in training.")
+    parser.add_argument("--conv-channels",
+                        action="store",
+                        dest="conv_channels",
+                        type=int,
+                        default=None,
+                        help="Explicit Conv1d channels used in training.")
+    parser.add_argument("--conv-layers",
+                        action="store",
+                        dest="conv_layers",
+                        type=int,
+                        default=None,
+                        help="Explicit Conv1d layer count used in training.")
+    parser.add_argument("--conv-kernel-size",
+                        action="store",
+                        dest="conv_kernel_size",
+                        type=int,
+                        default=None,
+                        help="Explicit Conv1d kernel size used in training.")
+    parser.add_argument("--conv-dropout",
+                        action="store",
+                        dest="conv_dropout",
+                        type=float,
+                        default=None,
+                        help="Explicit Conv1d dropout used in training.")
     parser.add_argument("--use-layer-norm",
                         action="store_true",
                         dest="use_layer_norm",
@@ -392,6 +471,10 @@ def main() -> None:
         raise ValueError("--k-folds must be >= 1")
     if args.threshold is not None and (args.threshold <= 0.0 or args.threshold >= 1.0):
         raise ValueError("--threshold must be between (0.0, 1.0)")
+    if args.ensemble_threshold is not None and (
+        args.ensemble_threshold <= 0.0 or args.ensemble_threshold >= 1.0
+    ):
+        raise ValueError("--ensemble-threshold must be between (0.0, 1.0)")
 
     json_indent = 2 if args.log_json else None
     logger = setup_logger(log_dir=args.log_dir,
@@ -453,6 +536,28 @@ def main() -> None:
         raise ValueError(
             f"All ensemble members must share emb_dim for shared-embedding inference, got {sorted(emb_dims)}"
         )
+    seq_len_features = {
+        resolve_prediction_seq_len_feature(args.seq_len_feature, cfg)
+        for cfg in member_model_cfgs
+    }
+    if len(seq_len_features) != 1:
+        raise ValueError(
+            "All ensemble members must share seq_len_feature for shared-embedding inference, "
+            f"got {sorted(seq_len_features)}"
+        )
+    resolved_seq_len_feature = next(iter(seq_len_features))
+
+    resolved_ensemble_threshold = None
+    if len(psp_models) > 1 and args.ensemble_aggregation == "mean-prob":
+        resolved_ensemble_threshold = (
+            float(args.ensemble_threshold)
+            if args.ensemble_threshold is not None
+            else (
+                float(args.threshold)
+                if args.threshold is not None
+                else float(sum(member_thresholds) / len(member_thresholds))
+            )
+        )
 
     first_cfg = member_model_cfgs[0]
     logger.info("prediction_init",
@@ -469,12 +574,20 @@ def main() -> None:
                     ),
                     "threshold": float(member_thresholds[0]) if len(member_thresholds) == 1 else None,
                     "member_thresholds": [float(x) for x in member_thresholds],
+                    "ensemble_aggregation": str(args.ensemble_aggregation),
+                    "ensemble_threshold": resolved_ensemble_threshold,
                     "device": device,
                     "model_cfg_src": str(member_model_cfg_srcs[0]) if len(set(member_model_cfg_srcs)) == 1 else "mixed",
+                    "model_head": str(first_cfg.model_head),
+                    "seq_len_feature": resolved_seq_len_feature,
                     "emb_dim": int(first_cfg.emb_dim),
                     "hidden_sizes": [int(x) for x in first_cfg.hidden_sizes],
                     "use_layer_norm": bool(first_cfg.use_layer_norm),
                     "use_residual": bool(first_cfg.use_residual),
+                    "conv_channels": int(first_cfg.conv_channels),
+                    "conv_layers": int(first_cfg.conv_layers),
+                    "conv_kernel_size": int(first_cfg.conv_kernel_size),
+                    "conv_dropout": float(first_cfg.conv_dropout),
                     "num_classes": int(first_cfg.num_classes)
                 }})
 
@@ -493,7 +606,8 @@ def main() -> None:
                     layer=layer,
                     batch_converter=batch_converter,
                     device=device,
-                    max_tokens=args.max_tokens
+                    max_tokens=args.max_tokens,
+                    seq_len_feature=resolved_seq_len_feature,
                 )
                 if len(psp_models) == 1:
                     pred = predict_from_embedding(
@@ -507,7 +621,9 @@ def main() -> None:
                         psp_models=psp_models,
                         protein_emb=protein_emb,
                         device=device,
-                        thresholds=member_thresholds
+                        thresholds=member_thresholds,
+                        aggregation=args.ensemble_aggregation,
+                        ensemble_threshold=resolved_ensemble_threshold
                     )
                 out_f.write(f">{header}\n{pred['binary_mask']}\n")
 
@@ -538,7 +654,10 @@ def main() -> None:
                     "processed": processed,
                     "failed": failed,
                     "total_residues": total_residues,
-                    "total_epitopes": total_epitopes
+                    "total_epitopes": total_epitopes,
+                    "ensemble_aggregation": str(args.ensemble_aggregation),
+                    "seq_len_feature": resolved_seq_len_feature,
+                    "ensemble_threshold": resolved_ensemble_threshold
                 }})
 
 

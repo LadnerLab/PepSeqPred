@@ -9,7 +9,6 @@ current git revision and writing a `*_latest.pyz` copy.
 import argparse
 import shutil
 import subprocess
-import sys
 import zipapp
 from pathlib import Path
 from pyzapps import APPS

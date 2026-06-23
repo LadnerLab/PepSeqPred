@@ -27,8 +27,8 @@ The main CLIs are:
 - `pepseqpred-labels`
 - `pepseqpred-predict`
 - `pepseqpred-preprocess`
-- `pepseqpred-train-ffnn`
-- `pepseqpred-train-ffnn-optuna`
+- `pepseqpred-train`
+- `pepseqpred-train-optuna`
 
 These map to files in `src/pepseqpred/apps/`.
 
@@ -51,8 +51,8 @@ Batch scripts live in `scripts/hpc/`. These are part of the intended workflow, e
 - label generation
 - preprocessing
 - prediction
-- FFNN training
-- FFNN Optuna tuning
+- model-head training
+- model-head Optuna tuning
 
 Treat these scripts as first class project interfaces, not throwaway helpers.
 
@@ -181,8 +181,8 @@ Available CLIs:
 - `pepseqpred-labels`
 - `pepseqpred-predict`
 - `pepseqpred-preprocess`
-- `pepseqpred-train-ffnn`
-- `pepseqpred-train-ffnn-optuna`
+- `pepseqpred-train`
+- `pepseqpred-train-optuna`
 
 ## Testing guidance
 

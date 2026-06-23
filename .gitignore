@@ -21,6 +21,7 @@ pip-wheel-metadata/
 # Test runner and coverage artifacts
 .pytest_cache/
 .pytest_tmp*/
+.tmp_pytest_*/
 .coverage
 .coverage.*
 coverage.xml

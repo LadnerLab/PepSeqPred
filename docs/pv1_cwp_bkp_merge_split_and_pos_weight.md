@@ -61,7 +61,7 @@ That is the behavior exercised in `tests/integration/test_prepare_dataset_multis
 
 ### 3.1 Base protein universe
 
-`train_ffnn_cli` builds a `ProteinDataset` from provided embedding dirs + label shards, then uses:
+`train_cli` builds a `ProteinDataset` from provided embedding dirs + label shards, then uses:
 
 - `protein_ids = intersection(embedding_index IDs, label_index IDs)`
 
@@ -119,7 +119,7 @@ There are two connected pieces:
      - `pos_weight = neg_count / max(1, pos_count)`
    - For 3-column labels `[Def epitope, Uncertain, Not epitope]`, counts only include residues where `Uncertain == 0`.
 
-2. Train time (`pepseqpred-train-ffnn`)
+2. Train time (`pepseqpred-train`)
    - If `--pos-weight` is provided, that value is used directly.
    - Otherwise it reads `class_stats` from all provided label shards and recomputes:
      - `total_neg / max(1, total_pos)`

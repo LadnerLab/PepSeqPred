@@ -3,6 +3,7 @@
 from pepseqpred.core.predict.artifacts import PredictionMember, resolve_prediction_members
 from pepseqpred.core.predict.inference import (
     FFNNModelConfig,
+    PepSeqModelConfig,
     build_model_from_checkpoint,
     embed_protein_seq,
     infer_decision_threshold,
@@ -18,6 +19,7 @@ __all__ = [
     "PredictionMember",
     "resolve_prediction_members",
     "FFNNModelConfig",
+    "PepSeqModelConfig",
     "build_model_from_checkpoint",
     "embed_protein_seq",
     "infer_decision_threshold",

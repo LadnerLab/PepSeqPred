@@ -22,11 +22,14 @@ usage() {
     echo "  model_name default: esm2_t33_650M_UR50D"
     echo "  max_tokens default: 1022"
     echo "  batch_size default: 24"
+    echo "  EMBEDDING_KEY_MODE env default: id-family (id or id-family)"
+    echo "  METADATA_FILE env required when EMBEDDING_KEY_MODE=id-family"
+    echo "  SEQ_LEN_FEATURE env default: none (none, raw, inverse)"
     echo ""
     echo "Examples:"
-    echo "  sbatch $0 /scratch/\$USER/data/targets.fasta"
-    echo "  sbatch $0 /scratch/\$USER/data/targets.fasta /scratch/\$USER/esm2 esm2_t33_650M_UR50D 1022 24"
-    echo "  sbatch --export=ALL,IN_FASTA=/scratch/\$USER/data/targets.fasta $0"
+    echo "  sbatch --export=ALL,METADATA_FILE=/scratch/\$USER/data/targets.metadata $0 /scratch/\$USER/data/targets.fasta"
+    echo "  sbatch --export=ALL,METADATA_FILE=/scratch/\$USER/data/targets.metadata $0 /scratch/\$USER/data/targets.fasta /scratch/\$USER/esm2 esm2_t33_650M_UR50D 1022 24"
+    echo "  sbatch --export=ALL,IN_FASTA=/scratch/\$USER/data/targets.fasta,METADATA_FILE=/scratch/\$USER/data/targets.metadata $0"
 }
 
 if [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ]; then
@@ -49,6 +52,8 @@ OUT_DIR="${2:-${OUT_DIR:-${SCRATCH_DIR}/esm2}}"
 MODEL_NAME="${3:-${MODEL_NAME:-esm2_t33_650M_UR50D}}" # see ESM-2 documentation for other models
 MAX_TOKENS="${4:-${MAX_TOKENS:-1022}}" # max number of tokens in model's context window
 BATCH_SIZE="${5:-${BATCH_SIZE:-24}}" # can probably get away with 16 or 24 on V100, double on A100
+METADATA_FILE="${METADATA_FILE:-}"
+SEQ_LEN_FEATURE="${SEQ_LEN_FEATURE:-none}"
 
 if [ -z "${IN_FASTA}" ]; then
     echo "Missing required input FASTA path."
@@ -59,6 +64,19 @@ fi
 # filenaming keys
 EMBEDDING_KEY_MODE="${EMBEDDING_KEY_MODE:-id-family}"
 KEY_DELIMITER="${KEY_DELIMITER:--}"
+
+METADATA_ARGS=()
+if [ "${EMBEDDING_KEY_MODE}" = "id-family" ]; then
+    if [ -z "${METADATA_FILE}" ]; then
+        echo "METADATA_FILE is required when EMBEDDING_KEY_MODE=id-family."
+        exit 1
+    fi
+    if [ ! -f "${METADATA_FILE}" ]; then
+        echo "Metadata file not found: ${METADATA_FILE}"
+        exit 1
+    fi
+    METADATA_ARGS+=(--metadata-file "${METADATA_FILE}")
+fi
 
 # paths and directories
 LOG_DIR="logs"
@@ -85,9 +103,11 @@ ${LAUNCHER} python -u esm.pyz \
     --fasta-file "${IN_FASTA}" \
     --model-name "${MODEL_NAME}" \
     --embedding-key-mode "${EMBEDDING_KEY_MODE}" \
+    "${METADATA_ARGS[@]}" \
     --key-delimiter "${KEY_DELIMITER}" \
     --max-tokens "${MAX_TOKENS}" \
     --batch-size "${BATCH_SIZE}" \
+    --seq-len-feature "${SEQ_LEN_FEATURE}" \
     --num-shards "${NUM_SHARDS}" \
     --shard-id "${SHARD_ID}" \
     --log-dir "${LOG_DIR}" \

@@ -1,21 +1,23 @@
 import sys
 import json
+import csv
 from pathlib import Path
 import pytest
-import pepseqpred.apps.train_ffnn_cli as train_cli
-import pepseqpred.apps.train_ffnn_optuna_cli as optuna_cli
+import torch
+import pepseqpred.apps.train_cli as train_cli
+import pepseqpred.apps.train_optuna_cli as optuna_cli
 
 pytestmark = pytest.mark.integration
 
 
-def test_train_ffnn_cli_main_inprocess(training_artifacts, tmp_path: Path, monkeypatch):
+def test_train_cli_main_inprocess(training_artifacts, tmp_path: Path, monkeypatch):
     save_dir = tmp_path / "train_out"
 
     monkeypatch.setattr(
         sys,
         "argv",
         [
-            "train_ffnn_cli.py",
+            "train_cli.py",
             "--embedding-dirs",
             str(training_artifacts["embedding_dir"]),
             "--label-shards",
@@ -50,9 +52,18 @@ def test_train_ffnn_cli_main_inprocess(training_artifacts, tmp_path: Path, monke
     assert (run_dirs[0] / "fully_connected.pt").exists()
     assert (save_dir / "runs.csv").exists()
     assert (save_dir / "multi_run_summary.json").exists()
+    with (save_dir / "runs.csv").open(newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+    assert rows[0]["SplitStrategy"] == "size-balanced"
+    assert Path(rows[0]["SplitReportJson"]).exists()
+    assert "TrainPositiveRate" in rows[0]
+    assert "ValPositiveRate" in rows[0]
+    assert rows[0]["ThresholdPolicy"] == "max-recall-min-precision"
+    assert float(rows[0]["ThresholdMinPrecision"]) == pytest.approx(0.25)
+    assert "ThresholdPredPosFrac" in rows[0]
 
 
-def test_train_ffnn_cli_main_inprocess_with_val_curves(
+def test_train_cli_main_inprocess_with_val_curves(
     training_artifacts, tmp_path: Path, monkeypatch
 ):
     save_dir = tmp_path / "train_out_curves"
@@ -61,7 +72,7 @@ def test_train_ffnn_cli_main_inprocess_with_val_curves(
         sys,
         "argv",
         [
-            "train_ffnn_cli.py",
+            "train_cli.py",
             "--embedding-dirs",
             str(training_artifacts["embedding_dir"]),
             "--label-shards",
@@ -108,14 +119,14 @@ def test_train_ffnn_cli_main_inprocess_with_val_curves(
         assert pr_plot.exists()
 
 
-def test_train_ffnn_cli_ensemble_kfold_inprocess(training_artifacts, tmp_path: Path, monkeypatch):
+def test_train_cli_ensemble_kfold_inprocess(training_artifacts, tmp_path: Path, monkeypatch):
     save_dir = tmp_path / "ensemble_out"
 
     monkeypatch.setattr(
         sys,
         "argv",
         [
-            "train_ffnn_cli.py",
+            "train_cli.py",
             "--embedding-dirs",
             str(training_artifacts["embedding_dir"]),
             "--label-shards",
@@ -163,16 +174,22 @@ def test_train_ffnn_cli_ensemble_kfold_inprocess(training_artifacts, tmp_path: P
     payload = json.loads(manifest_path.read_text(encoding="utf-8"))
     assert payload["train_mode"] == "ensemble-kfold"
     assert payload["n_sets"] == 2
+    assert payload["split_strategy"] == "size-balanced"
+    assert Path(payload["split_report_json"]).exists()
+    assert payload["threshold_policy"] == "max-recall-min-precision"
+    assert payload["threshold_min_precision"] == pytest.approx(0.25)
     assert len(payload["sets"]) == 2
     assert [(x["split_seed"], x["train_seed"]) for x in payload["sets"]] == [
         (17, 101),
         (19, 202),
     ]
     assert all(int(x["n_members"]) == 2 for x in payload["sets"])
+    assert all(x["split_strategy"] == "size-balanced" for x in payload["sets"])
+    assert all(x["threshold_policy"] == "max-recall-min-precision" for x in payload["sets"])
     assert all(Path(x["manifest_path"]).exists() for x in payload["sets"])
 
 
-def test_train_ffnn_cli_ensemble_kfold_with_aggregate_val_curves(
+def test_train_cli_ensemble_kfold_with_aggregate_val_curves(
     training_artifacts, tmp_path: Path, monkeypatch
 ):
     save_dir = tmp_path / "ensemble_out_curves"
@@ -181,7 +198,7 @@ def test_train_ffnn_cli_ensemble_kfold_with_aggregate_val_curves(
         sys,
         "argv",
         [
-            "train_ffnn_cli.py",
+            "train_cli.py",
             "--embedding-dirs",
             str(training_artifacts["embedding_dir"]),
             "--label-shards",
@@ -259,7 +276,7 @@ def test_train_ffnn_cli_ensemble_kfold_with_aggregate_val_curves(
 
 
 @pytest.mark.slow
-def test_train_ffnn_optuna_cli_main_inprocess(
+def test_train_optuna_cli_main_inprocess(
     training_artifacts, tmp_path: Path, monkeypatch
 ):
     save_dir = tmp_path / "optuna_out"
@@ -269,7 +286,7 @@ def test_train_ffnn_optuna_cli_main_inprocess(
         sys,
         "argv",
         [
-            "train_ffnn_optuna_cli.py",
+            "train_optuna_cli.py",
             "--embedding-dirs",
             str(training_artifacts["embedding_dir"]),
             "--label-shards",
@@ -309,5 +326,25 @@ def test_train_ffnn_optuna_cli_main_inprocess(
 
     optuna_cli.main()
 
-    assert (save_dir / "best_trial.json").exists()
+    best_payload = json.loads((save_dir / "best_trial.json").read_text(encoding="utf-8"))
+    assert best_payload["split_strategy"] == "size-balanced"
+    assert Path(best_payload["split_report_json"]).exists()
+    assert best_payload["threshold_policy"] == "max-recall-min-precision"
+    assert best_payload["model_head"] == "ffnn"
+    best_checkpoint = save_dir / "best_model_by_score.pt"
+    assert best_checkpoint.exists()
+    checkpoint = torch.load(
+        best_checkpoint,
+        map_location="cpu",
+        weights_only=False,
+    )
+    assert checkpoint["model_config"]["model_head"] == "ffnn"
     assert csv_path.exists()
+    with csv_path.open(newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+    assert rows[0]["ThresholdPolicy"] == "max-recall-min-precision"
+    assert rows[0]["SplitStrategy"] == "size-balanced"
+    assert rows[0]["ModelHead"] == "ffnn"
+    assert "TrainPositiveRate" in rows[0]
+    assert "ValPositiveRate" in rows[0]
+    assert "ThresholdPredPosFrac" in rows[0]

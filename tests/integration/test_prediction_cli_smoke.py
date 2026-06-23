@@ -5,6 +5,11 @@ from pathlib import Path
 import pytest
 import torch
 import pepseqpred.apps.prediction_cli as prediction_cli
+from pepseqpred.core.models.factory import (
+    PepSeqModelConfig,
+    build_pepseq_model,
+    model_config_to_dict,
+)
 from pepseqpred.core.models.ffnn import PepSeqFFNN
 
 pytestmark = pytest.mark.integration
@@ -38,7 +43,7 @@ class FakeESMModel:
     def __call__(self, batch_tokens, repr_layers, return_contacts=False):
         _ = return_contacts
         batch_size, token_len = batch_tokens.shape
-        rep_dim = 3  # append_seq_len -> final emb dim is 4
+        rep_dim = 3
         reps = torch.ones((batch_size, token_len, rep_dim),
                           dtype=torch.float32)
         return {"representations": {repr_layers[0]: reps}}
@@ -46,8 +51,8 @@ class FakeESMModel:
 
 def _write_checkpoint(path: Path, threshold: float = 0.5) -> None:
     model = PepSeqFFNN(
-        emb_dim=4,
-        hidden_sizes=(3,),
+        emb_dim=3,
+        hidden_sizes=(4,),
         dropouts=(0.0,),
         use_layer_norm=False,
         use_residual=False,
@@ -59,6 +64,34 @@ def _write_checkpoint(path: Path, threshold: float = 0.5) -> None:
     torch.save(
         {
             "model_state_dict": model.state_dict(),
+            "metrics": {"threshold": float(threshold)},
+        },
+        path,
+    )
+
+
+def _write_conv_checkpoint(path: Path, threshold: float = 0.5) -> None:
+    cfg = PepSeqModelConfig(
+        emb_dim=3,
+        hidden_sizes=(3,),
+        dropouts=(0.0,),
+        num_classes=1,
+        use_layer_norm=False,
+        use_residual=False,
+        model_head="conv1d",
+        conv_channels=3,
+        conv_layers=1,
+        conv_kernel_size=3,
+        conv_dropout=0.0,
+    )
+    model = build_pepseq_model(cfg)
+    for param in model.parameters():
+        torch.nn.init.constant_(param, 0.0)
+
+    torch.save(
+        {
+            "model_state_dict": model.state_dict(),
+            "model_config": model_config_to_dict(cfg),
             "metrics": {"threshold": float(threshold)},
         },
         path,
@@ -106,6 +139,40 @@ def test_prediction_cli_smoke(monkeypatch, tmp_path: Path):
     assert lines[2] == ">protein_2"
     assert len(lines[3]) == 5
     assert set(lines[3]).issubset({"0", "1"})
+
+
+def test_prediction_cli_loads_conv_checkpoint_metadata(monkeypatch, tmp_path: Path):
+    fake_pretrained = types.SimpleNamespace(
+        fake_model=lambda: (FakeESMModel(), FakeAlphabet())
+    )
+    monkeypatch.setattr(prediction_cli.esm, "pretrained", fake_pretrained)
+
+    checkpoint = tmp_path / "conv_model.pt"
+    _write_conv_checkpoint(checkpoint)
+
+    fasta = tmp_path / "input.fasta"
+    fasta.write_text(">protein_1\nACDEFG\n", encoding="utf-8")
+    output_fasta = tmp_path / "predictions.fasta"
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "prediction_cli.py",
+            str(checkpoint),
+            str(fasta),
+            "--output-fasta",
+            str(output_fasta),
+            "--model-name",
+            "fake_model",
+        ],
+    )
+
+    prediction_cli.main()
+
+    lines = [line.strip() for line in output_fasta.read_text(
+        encoding="utf-8").splitlines() if line.strip()]
+    assert lines == [">protein_1", "111111"]
 
 
 def test_prediction_cli_manifest_v1_majority_vote(monkeypatch, tmp_path: Path):
@@ -156,6 +223,60 @@ def test_prediction_cli_manifest_v1_majority_vote(monkeypatch, tmp_path: Path):
         encoding="utf-8").splitlines() if line.strip()]
     assert lines[0] == ">protein_1"
     assert lines[1] == "000000"
+
+
+def test_prediction_cli_manifest_mean_prob_aggregation(monkeypatch, tmp_path: Path):
+    fake_pretrained = types.SimpleNamespace(
+        fake_model=lambda: (FakeESMModel(), FakeAlphabet())
+    )
+    monkeypatch.setattr(prediction_cli.esm, "pretrained", fake_pretrained)
+
+    ckpt_1 = tmp_path / "fold_1.pt"
+    ckpt_2 = tmp_path / "fold_2.pt"
+    ckpt_3 = tmp_path / "fold_3.pt"
+    _write_checkpoint(ckpt_1, threshold=0.6)
+    _write_checkpoint(ckpt_2, threshold=0.6)
+    _write_checkpoint(ckpt_3, threshold=0.4)
+
+    manifest = {
+        "schema_version": 1,
+        "members": [
+            {"member_index": 1, "fold_index": 1, "status": "OK", "checkpoint": str(ckpt_1), "threshold": 0.6},
+            {"member_index": 2, "fold_index": 2, "status": "OK", "checkpoint": str(ckpt_2), "threshold": 0.6},
+            {"member_index": 3, "fold_index": 3, "status": "OK", "checkpoint": str(ckpt_3), "threshold": 0.4},
+        ]
+    }
+    manifest_path = tmp_path / "ensemble_manifest.json"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    fasta = tmp_path / "input.fasta"
+    fasta.write_text(">protein_1\nACDEFG\n", encoding="utf-8")
+    output_fasta = tmp_path / "predictions.fasta"
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "prediction_cli.py",
+            str(manifest_path),
+            str(fasta),
+            "--output-fasta",
+            str(output_fasta),
+            "--model-name",
+            "fake_model",
+            "--ensemble-aggregation",
+            "mean-prob",
+            "--ensemble-threshold",
+            "0.49",
+        ],
+    )
+
+    prediction_cli.main()
+
+    lines = [line.strip() for line in output_fasta.read_text(
+        encoding="utf-8").splitlines() if line.strip()]
+    assert lines[0] == ">protein_1"
+    assert lines[1] == "111111"
 
 
 def test_prediction_cli_manifest_v2_set_index_and_k_folds(monkeypatch, tmp_path: Path):

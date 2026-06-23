@@ -1,6 +1,11 @@
 import pytest
 import torch
 from pepseqpred.core.models.ffnn import PepSeqFFNN
+from pepseqpred.core.models.factory import (
+    PepSeqModelConfig,
+    build_pepseq_model,
+    model_config_to_dict,
+)
 from pepseqpred.core.predict.inference import (
     FFNNModelConfig,
     build_model_from_checkpoint,
@@ -30,6 +35,28 @@ def _make_checkpoint(
         use_residual=use_residual,
     )
     return {"model_state_dict": model.state_dict(), "metrics": {"threshold": 0.37}}
+
+
+def _make_conv_checkpoint():
+    cfg = PepSeqModelConfig(
+        emb_dim=4,
+        hidden_sizes=(8,),
+        dropouts=(0.0,),
+        num_classes=1,
+        use_layer_norm=False,
+        use_residual=False,
+        model_head="conv1d",
+        conv_channels=3,
+        conv_layers=1,
+        conv_kernel_size=3,
+        conv_dropout=0.0,
+    )
+    model = build_pepseq_model(cfg)
+    return {
+        "model_state_dict": model.state_dict(),
+        "model_config": model_config_to_dict(cfg),
+        "metrics": {"threshold": 0.37},
+    }
 
 
 def test_normalize_state_dict_keys_strips_module_prefix():
@@ -71,6 +98,19 @@ def test_build_model_from_checkpoint_handles_ddp_prefixed_state():
     x = torch.randn(2, 5, 4)
     with torch.inference_mode():
         y = model(x)
+    assert y.shape == (2, 5)
+
+
+def test_build_model_from_checkpoint_uses_checkpoint_model_config_for_conv():
+    ckpt = _make_conv_checkpoint()
+
+    model, cfg, cfg_src = build_model_from_checkpoint(ckpt, device="cpu")
+
+    assert cfg_src == "checkpoint"
+    assert cfg.model_head == "conv1d"
+    assert cfg.conv_channels == 3
+    with torch.inference_mode():
+        y = model(torch.randn(2, 5, 4))
     assert y.shape == (2, 5)
 
 
@@ -125,6 +165,8 @@ def test_predict_ensemble_from_embedding_uses_majority_vote():
     assert out["binary_mask"] == "1110"
     assert out["n_members"] == 3
     assert out["votes_needed"] == 2
+    assert out["ensemble_aggregation"] == "majority"
+    assert out["ensemble_threshold"] is None
 
 
 def test_predict_ensemble_from_embedding_even_tie_is_negative():
@@ -141,6 +183,26 @@ def test_predict_ensemble_from_embedding_even_tie_is_negative():
     )
     assert out["binary_mask"] == "00"
     assert out["votes_needed"] == 2
+
+
+def test_predict_ensemble_from_embedding_mean_prob_thresholding():
+    emb = torch.zeros((2, 3), dtype=torch.float32)
+    models = [
+        _ConstantLogitModel([2.0, -2.0]),
+        _ConstantLogitModel([-2.0, 2.0]),
+    ]
+    out = predict_ensemble_from_embedding(
+        psp_models=models,
+        protein_emb=emb,
+        device="cpu",
+        thresholds=[0.5, 0.5],
+        aggregation="mean-prob",
+        ensemble_threshold=0.49
+    )
+    assert out["binary_mask"] == "11"
+    assert out["votes_needed"] is None
+    assert out["ensemble_aggregation"] == "mean-prob"
+    assert out["ensemble_threshold"] == pytest.approx(0.49)
 
 
 def test_predict_ensemble_from_embedding_k1_matches_single():

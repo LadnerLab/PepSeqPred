@@ -109,6 +109,7 @@ def test_esm_cli_id_mode_invokes_embedding_pipeline(monkeypatch, tmp_path: Path)
         key_delimiter="-",
         model_name="fake_model",
         max_tokens=16,
+        seq_len_feature="inverse",
         batch_size=2,
         num_shards=1,
         shard_id=0
@@ -134,6 +135,7 @@ def test_esm_cli_id_mode_invokes_embedding_pipeline(monkeypatch, tmp_path: Path)
 
     assert captured["kwargs"]["key_mode"] == "id"
     assert captured["kwargs"]["id_col"] == "ID"
+    assert captured["kwargs"]["seq_len_feature"] == "inverse"
 
 
 def test_esm_cli_id_family_requires_metadata(monkeypatch, tmp_path: Path):
@@ -154,6 +156,7 @@ def test_esm_cli_id_family_requires_metadata(monkeypatch, tmp_path: Path):
         key_delimiter="-",
         model_name="fake_model",
         max_tokens=16,
+        seq_len_feature="none",
         batch_size=2,
         num_shards=1,
         shard_id=0

@@ -9,8 +9,8 @@ import pandas as pd
 import pytest
 import torch
 
-import pepseqpred.apps.train_ffnn_cli as train_cli
-import pepseqpred.apps.train_ffnn_optuna_cli as optuna_cli
+import pepseqpred.apps.train_cli as train_cli
+import pepseqpred.apps.train_optuna_cli as optuna_cli
 
 pytestmark = pytest.mark.unit
 
@@ -67,6 +67,50 @@ def _run_main(entrypoint, argv: list[str]) -> None:
         sys.argv = old_argv
 
 
+def _capture_protein_dataset_calls(monkeypatch, module):
+    calls = []
+    real_dataset = module.ProteinDataset
+
+    def _wrapped_protein_dataset(*args, **kwargs):
+        calls.append(dict(kwargs))
+        return real_dataset(*args, **kwargs)
+
+    monkeypatch.setattr(module, "ProteinDataset", _wrapped_protein_dataset)
+    return calls
+
+
+def _assert_train_window_val_full_protein(calls):
+    train_val_calls = [kwargs for kwargs in calls if "protein_ids" in kwargs]
+    assert len(train_val_calls) == 2
+
+    train_kwargs, val_kwargs = train_val_calls
+    assert train_kwargs["window_size"] == 4
+    assert train_kwargs["stride"] == 2
+    assert train_kwargs["pad_last_window"] is True
+    assert val_kwargs["window_size"] is None
+    assert val_kwargs["stride"] == 1
+    assert val_kwargs["pad_last_window"] is False
+
+
+def _capture_pos_weight_resolution(monkeypatch, module, *, counts: tuple[int, int]):
+    calls = {"count": 0, "global": 0}
+
+    def _compute_pos_neg_counts(loader):
+        assert loader is not None
+        calls["count"] += 1
+        return counts
+
+    def _global_pos_neg_counts(local_pos, local_neg, ddp):
+        _ = ddp
+        calls["global"] += 1
+        assert (local_pos, local_neg) == counts
+        return local_pos, local_neg
+
+    monkeypatch.setattr(module, "compute_pos_neg_counts", _compute_pos_neg_counts)
+    monkeypatch.setattr(module, "global_pos_neg_counts", _global_pos_neg_counts)
+    return calls
+
+
 def test_train_cli_helper_parsers_and_numeric_summary():
     summary_empty = train_cli.summarize_numeric(
         pd.Series([float("nan"), float("inf"), -float("inf")])
@@ -89,6 +133,18 @@ def test_train_cli_helper_parsers_and_numeric_summary():
         train_cli._parse_plot_formats("png,jpg")
 
 
+def test_hpc_scripts_only_pass_pos_weight_when_env_is_set():
+    for script in [
+        Path("scripts/hpc/train.sh"),
+        Path("scripts/hpc/trainoptuna.sh")
+    ]:
+        text = script.read_text(encoding="utf-8")
+        assert "13.18999647945325" not in text
+        assert 'POS_WEIGHT="${POS_WEIGHT:-}"' in text
+        assert 'POS_WEIGHT_ARGS+=(--pos-weight "$POS_WEIGHT")' in text
+        assert '"${POS_WEIGHT_ARGS[@]}"' in text
+
+
 @pytest.mark.parametrize(
     ("legacy_flag", "legacy_value"),
     [
@@ -97,14 +153,14 @@ def test_train_cli_helper_parsers_and_numeric_summary():
         ("--ensemble-train-seeds", "11,12"),
     ],
 )
-def test_train_ffnn_cli_rejects_removed_legacy_mode_flags(
+def test_train_cli_rejects_removed_legacy_mode_flags(
     legacy_flag: str, legacy_value: str
 ):
     with pytest.raises(ValueError, match="Legacy train-mode flags are no longer supported"):
         _run_main(
             train_cli.main,
             [
-                "train_ffnn_cli.py",
+                "train_cli.py",
                 "--embedding-dirs",
                 "dummy_embedding_dir",
                 "--label-shards",
@@ -115,18 +171,24 @@ def test_train_ffnn_cli_rejects_removed_legacy_mode_flags(
         )
 
 
-def test_train_ffnn_cli_real_no_valid_score_with_val_curve_artifacts():
+def test_train_cli_real_no_valid_score_with_val_curve_artifacts(monkeypatch):
     case_dir = _mk_case_dir("ffnn_no_valid")
     emb_dir, label_shard = _write_training_artifacts(
         case_dir, all_uncertain=True
     )
     save_dir = case_dir / "train_out"
+    dataset_calls = _capture_protein_dataset_calls(monkeypatch, train_cli)
+    pos_weight_calls = _capture_pos_weight_resolution(
+        monkeypatch,
+        train_cli,
+        counts=(2, 8)
+    )
 
     try:
         _run_main(
             train_cli.main,
             [
-                "train_ffnn_cli.py",
+                "train_cli.py",
                 "--embedding-dirs",
                 str(emb_dir),
                 "--label-shards",
@@ -137,6 +199,10 @@ def test_train_ffnn_cli_real_no_valid_score_with_val_curve_artifacts():
                 "2",
                 "--num-workers",
                 "0",
+                "--window-size",
+                "4",
+                "--stride",
+                "2",
                 "--hidden-sizes",
                 "8",
                 "--dropouts",
@@ -171,27 +237,51 @@ def test_train_ffnn_cli_real_no_valid_score_with_val_curve_artifacts():
         assert int(runs_df.shape[0]) == 1
         assert str(runs_df.iloc[0]["BestMetricKey"]) == "f1"
         assert str(runs_df.iloc[0]["Status"]) == "NO_VALID_SCORE"
+        assert str(runs_df.iloc[0]["SplitStrategy"]) == "size-balanced"
+        assert str(runs_df.iloc[0]["SeqLenFeature"]) == "none"
+        assert Path(str(runs_df.iloc[0]["SplitReportJson"])).exists()
+        assert "TrainPositiveRate" in runs_df.columns
+        assert "ValPositiveRate" in runs_df.columns
+        assert str(runs_df.iloc[0]["ThresholdPolicy"]) == "max-recall-min-precision"
+        assert str(runs_df.iloc[0]["ThresholdStatus"]) == "no_valid_residues"
+        assert float(runs_df.iloc[0]["ThresholdMinPrecision"]) == pytest.approx(0.25)
+        assert float(runs_df.iloc[0]["ThresholdMinRecall"]) == pytest.approx(0.80)
+        assert float(runs_df.iloc[0]["ThresholdFixedValue"]) == pytest.approx(0.50)
 
         summary = json.loads(
             (save_dir / "multi_run_summary.json").read_text(encoding="utf-8")
         )
         assert int(summary["n_runs"]) == 1
+        assert summary["split_strategy"] == "size-balanced"
+        assert summary["seq_len_feature"] == "none"
+        assert Path(summary["split_report_json"]).exists()
+        assert summary["threshold_policy"] == "max-recall-min-precision"
+        assert summary["threshold_min_precision"] == pytest.approx(0.25)
+        assert "ThresholdPredPosFrac" in summary["metrics"]
+        _assert_train_window_val_full_protein(dataset_calls)
+        assert pos_weight_calls == {"count": 1, "global": 1}
     finally:
         shutil.rmtree(case_dir, ignore_errors=True)
 
 
-def test_train_ffnn_cli_real_ensemble_manifest_generation():
+def test_train_cli_real_ensemble_manifest_generation(monkeypatch):
     case_dir = _mk_case_dir("ffnn_ensemble")
     emb_dir, label_shard = _write_training_artifacts(
         case_dir, all_uncertain=False
     )
     save_dir = case_dir / "ensemble_out"
 
+    def _unexpected_auto_pos_weight(*_args, **_kwargs):
+        raise AssertionError("explicit --pos-weight should bypass automatic counting")
+
+    monkeypatch.setattr(train_cli, "compute_pos_neg_counts", _unexpected_auto_pos_weight)
+    monkeypatch.setattr(train_cli, "global_pos_neg_counts", _unexpected_auto_pos_weight)
+
     try:
         _run_main(
             train_cli.main,
             [
-                "train_ffnn_cli.py",
+                "train_cli.py",
                 "--embedding-dirs",
                 str(emb_dir),
                 "--label-shards",
@@ -214,6 +304,18 @@ def test_train_ffnn_cli_real_ensemble_manifest_generation():
                 "17,19",
                 "--train-seeds",
                 "101,202",
+                "--pos-weight",
+                "3.5",
+                "--split-strategy",
+                "label-stratified",
+                "--threshold-policy",
+                "fixed",
+                "--threshold-min-precision",
+                "0.33",
+                "--threshold-min-recall",
+                "0.77",
+                "--threshold-fixed-value",
+                "0.49",
                 "--save-path",
                 str(save_dir),
                 "--results-csv",
@@ -228,13 +330,37 @@ def test_train_ffnn_cli_real_ensemble_manifest_generation():
         )
         assert payload["train_mode"] == "ensemble-kfold"
         assert payload["n_sets"] == 2
+        assert payload["split_strategy"] == "label-stratified"
+        assert payload["seq_len_feature"] == "none"
+        assert Path(payload["split_report_json"]).exists()
+        assert payload["threshold_policy"] == "fixed"
+        assert payload["threshold_min_precision"] == pytest.approx(0.33)
+        assert payload["threshold_min_recall"] == pytest.approx(0.77)
+        assert payload["threshold_fixed_value"] == pytest.approx(0.49)
         assert len(payload["sets"]) == 2
         assert all(int(x["n_members"]) == 2 for x in payload["sets"])
+        assert all(x["threshold_policy"] == "fixed" for x in payload["sets"])
+        set_manifest_path = Path(payload["sets"][0]["manifest_path"])
+        set_payload = json.loads(set_manifest_path.read_text(encoding="utf-8"))
+        assert set_payload["threshold_policy"] == "fixed"
+        assert set_payload["split_strategy"] == "label-stratified"
+        assert set_payload["seq_len_feature"] == "none"
+        assert all(
+            member["threshold_policy"] == "fixed"
+            for member in set_payload["members"]
+        )
+        runs_df = pd.read_csv(save_dir / "runs.csv")
+        assert set(runs_df["SplitStrategy"]) == {"label-stratified"}
+        assert "TrainPositiveRate" in runs_df.columns
+        assert "ValPositiveRate" in runs_df.columns
+        assert set(runs_df["ThresholdPolicy"]) == {"fixed"}
+        assert set(runs_df["ThresholdStatus"]) == {"ok"}
+        assert set(runs_df["ThresholdFixedValue"]) == {0.49}
     finally:
         shutil.rmtree(case_dir, ignore_errors=True)
 
 
-def test_train_ffnn_optuna_cli_real_with_storage_and_helpers():
+def test_train_optuna_cli_real_with_storage_and_helpers(monkeypatch):
     assert optuna_cli._broadcast_params({"a": 1}, None) == {"a": 1}
 
     study = optuna.create_study(sampler=optuna.samplers.RandomSampler(seed=7))
@@ -286,12 +412,18 @@ def test_train_ffnn_optuna_cli_real_with_storage_and_helpers():
     save_dir = case_dir / "optuna_out"
     csv_path = save_dir / "trials.csv"
     storage_uri = f"sqlite:///{(case_dir / 'study.db').as_posix()}"
+    dataset_calls = _capture_protein_dataset_calls(monkeypatch, optuna_cli)
+    pos_weight_calls = _capture_pos_weight_resolution(
+        monkeypatch,
+        optuna_cli,
+        counts=(3, 12)
+    )
 
     try:
         _run_main(
             optuna_cli.main,
             [
-                "train_ffnn_optuna_cli.py",
+                "train_optuna_cli.py",
                 "--embedding-dirs",
                 str(emb_dir),
                 "--label-shards",
@@ -310,6 +442,10 @@ def test_train_ffnn_optuna_cli_real_with_storage_and_helpers():
                 "2",
                 "--num-workers",
                 "0",
+                "--window-size",
+                "4",
+                "--stride",
+                "2",
                 "--metric",
                 "auc",
                 "--arch-mode",
@@ -328,6 +464,16 @@ def test_train_ffnn_optuna_cli_real_with_storage_and_helpers():
                 str(csv_path),
                 "--study-name",
                 "unit_realcov_study",
+                "--split-strategy",
+                "label-stratified",
+                "--threshold-policy",
+                "fixed",
+                "--threshold-min-precision",
+                "0.35",
+                "--threshold-min-recall",
+                "0.75",
+                "--threshold-fixed-value",
+                "0.49",
             ],
         )
 
@@ -336,7 +482,24 @@ def test_train_ffnn_optuna_cli_real_with_storage_and_helpers():
         )
         assert best_payload["study_name"] == "unit_realcov_study"
         assert best_payload["metric"] == "auc"
+        assert best_payload["seq_len_feature"] == "none"
+        assert best_payload["split_strategy"] == "label-stratified"
+        assert Path(best_payload["split_report_json"]).exists()
+        assert best_payload["threshold_policy"] == "fixed"
+        assert best_payload["threshold_min_precision"] == pytest.approx(0.35)
+        assert best_payload["threshold_min_recall"] == pytest.approx(0.75)
+        assert best_payload["threshold_fixed_value"] == pytest.approx(0.49)
         assert csv_path.exists()
+        trials_df = pd.read_csv(csv_path)
+        assert str(trials_df.iloc[0]["SplitStrategy"]) == "label-stratified"
+        assert str(trials_df.iloc[0]["SeqLenFeature"]) == "none"
+        assert "TrainPositiveRate" in trials_df.columns
+        assert "ValPositiveRate" in trials_df.columns
+        assert str(trials_df.iloc[0]["ThresholdPolicy"]) == "fixed"
+        assert float(trials_df.iloc[0]["ThresholdFixedValue"]) == pytest.approx(0.49)
+        assert "ThresholdPredPosFrac" in trials_df.columns
         assert (case_dir / "study.db").exists()
+        _assert_train_window_val_full_protein(dataset_calls)
+        assert pos_weight_calls == {"count": 1, "global": 1}
     finally:
         shutil.rmtree(case_dir, ignore_errors=True)

@@ -1,12 +1,27 @@
-from dataclasses import dataclass
 import math
 import re
 from typing import Tuple, Dict, Any, Mapping, List, Optional, Sequence
 import esm
 import torch
 import numpy as np
-from pepseqpred.core.models.ffnn import PepSeqFFNN
-from pepseqpred.core.embeddings.esm2 import clean_seq, compute_window_embedding, append_seq_len
+from pepseqpred.core.models.factory import (
+    MODEL_HEAD_FFNN,
+    PepSeqModelConfig,
+    build_pepseq_model,
+    model_config_from_mapping,
+    validate_model_config
+)
+from pepseqpred.core.embeddings.esm2 import (
+    apply_seq_len_feature,
+    clean_seq,
+    compute_window_embedding
+)
+from pepseqpred.core.data.seq_len_feature import (
+    SEQ_LEN_FEATURE_AUTO,
+    SEQ_LEN_FEATURE_NONE,
+    model_seq_len_feature_to_embedding,
+    normalize_prediction_seq_len_feature
+)
 
 _HIDDEN_LAYER_RE = re.compile(r"^ff_model\.(\d+)\.linear\.weight$")
 _OUTPUT_LAYER_RE = re.compile(r"^ff_model\.(\d+)\.weight$")
@@ -14,14 +29,19 @@ _LAYER_NORM_RE = re.compile(r"^ff_model\.\d+\.layer_norm\.weight$")
 _SKIP_LINEAR_RE = re.compile(r"^ff_model\.\d+\.skip\.weight$")
 
 
-@dataclass
-class FFNNModelConfig:
-    emb_dim: int
-    hidden_sizes: Tuple[int, ...]
-    dropouts: Tuple[float, ...]
-    num_classes: int
-    use_layer_norm: bool
-    use_residual: bool
+FFNNModelConfig = PepSeqModelConfig
+
+
+def resolve_prediction_seq_len_feature(
+    seq_len_feature: str | None,
+    model_config: PepSeqModelConfig,
+) -> str:
+    """Resolve prediction embedding length-feature mode from override/config."""
+    mode = normalize_prediction_seq_len_feature(seq_len_feature)
+    if mode == SEQ_LEN_FEATURE_AUTO:
+        return model_seq_len_feature_to_embedding(
+            getattr(model_config, "seq_len_feature", None))
+    return mode
 
 
 def normalize_state_dict_keys(state: Mapping[str, Any]) -> Dict[str, Any]:
@@ -47,7 +67,7 @@ def normalize_state_dict_keys(state: Mapping[str, Any]) -> Dict[str, Any]:
     return out_dict
 
 
-def infer_model_config_from_state(state: Mapping[str, Any]) -> FFNNModelConfig:
+def infer_model_config_from_state(state: Mapping[str, Any]) -> PepSeqModelConfig:
     """
     Infer PepSeqFFNN architecture directly from checkpoint `model_state_dict`.
 
@@ -58,7 +78,7 @@ def infer_model_config_from_state(state: Mapping[str, Any]) -> FFNNModelConfig:
 
     Returns
     -------
-        FFNNModelConfig
+        PepSeqModelConfig
             A fully populated model configuration dataclass to be used in model building.
 
     Raises
@@ -137,21 +157,22 @@ def infer_model_config_from_state(state: Mapping[str, Any]) -> FFNNModelConfig:
     # dropout is not stored in state_dict
     dropouts = tuple(0.0 for _ in hidden_sizes)
 
-    return FFNNModelConfig(
+    return PepSeqModelConfig(
         emb_dim=emb_dim,
         hidden_sizes=hidden_sizes,
         dropouts=dropouts,
         num_classes=num_classes,
         use_layer_norm=use_layer_norm,
-        use_residual=use_residual
+        use_residual=use_residual,
+        model_head=MODEL_HEAD_FFNN,
     )
 
 
 def build_model_from_checkpoint(
     checkpoint: Mapping[str, Any],
     device: str = "cpu",
-    model_config: Optional[FFNNModelConfig] = None
-) -> Tuple[PepSeqFFNN, FFNNModelConfig, str]:
+    model_config: Optional[PepSeqModelConfig] = None
+) -> Tuple[torch.nn.Module, PepSeqModelConfig, str]:
     """
     Builds and loads model exactly from training checkpoint.
 
@@ -161,22 +182,22 @@ def build_model_from_checkpoint(
             State dictionary obtained from saved trained model checkpoint.
         device : str
             Device type to use for building model checkpoint, default is `"cpu"`, `"cuda"` if accepted if GPUs are available.
-        model_config : FFNNModelConfig or None
+        model_config : PepSeqModelConfig or None
             A fully populated model configuration dataclass to be used in model building.
 
     Returns
     -------
-        PepSeqFFNN
+        torch.nn.Module
             Fully populated PepSeqPred model ready to use in inference.
-        FFNNModelConfig
+        PepSeqModelConfig
             Model configuration dataclass returned for logging/tracking purposes.
         str
-            The model configuration source, either `"cli"` if passed explicitly or `"state_dict"` if inferred from the state dictionary.
+            The model configuration source: `"cli"`, `"checkpoint"`, or `"state_dict"`.
 
     Raises
     ------
         ValueError
-            If `checkpoint` is not of type `Mapping` or `"model_state_dict"` is not a key in `checkpoint`. If `state` is not of type `Mapping`. If the number of output classes is not 1 (binary), if the embedding dimension is <= 0, or if the number hidden layer sizes is not the same as the number of dropouts. If the checkpoint weights are incompatible with the model architecture provided. 
+            If `checkpoint` is not of type `Mapping` or `"model_state_dict"` is not a key in `checkpoint`. If `state` is not of type `Mapping`. If the model config is invalid or if the checkpoint weights are incompatible with the model architecture provided.
     """
     if not isinstance(checkpoint, Mapping) or "model_state_dict" not in checkpoint:
         raise ValueError(
@@ -189,35 +210,22 @@ def build_model_from_checkpoint(
 
     # can either pass config directly or infer from the state dict
     if model_config is not None:
-        config = model_config
+        config = validate_model_config(model_config)
         config_src = "cli"
+    elif isinstance(checkpoint.get("model_config"), Mapping):
+        config = model_config_from_mapping(checkpoint["model_config"])
+        config_src = "checkpoint"
     else:
         config = infer_model_config_from_state(state)
         config_src = "state_dict"
 
-    # validate config
-    if config.num_classes != 1:
-        raise ValueError(
-            f"Inference expects binary residue model (num_classes=1), got {config.num_classes}")
-    if config.emb_dim <= 0:
-        raise ValueError("emb_dim must be > 0")
-    if len(config.hidden_sizes) != len(config.dropouts):
-        raise ValueError("hidden_sizes and dropouts must have the same length")
-
-    model = PepSeqFFNN(
-        emb_dim=config.emb_dim,
-        hidden_sizes=config.hidden_sizes,
-        dropouts=config.dropouts,
-        num_classes=config.num_classes,
-        use_layer_norm=config.use_layer_norm,
-        use_residual=config.use_residual
-    )
+    model = build_pepseq_model(config)
     try:
         model.load_state_dict(state, strict=True)
     except RuntimeError as e:
         raise ValueError(
             "Checkpoint weights are incompatible with the provided model architecture. "
-            "Check --emb-dim/--hidden-sizes/--dropouts/--use-layer-norm/--use-residual"
+            "Check --model-head and architecture flags."
         ) from e
     model.eval().to(device)
     return model, config, config_src
@@ -292,7 +300,8 @@ def embed_protein_seq(protein_seq: str,
                       layer: int,
                       batch_converter: esm.data.BatchConverter,
                       device: str,
-                      max_tokens: int = 1022) -> torch.Tensor:
+                      max_tokens: int = 1022,
+                      seq_len_feature: str | None = SEQ_LEN_FEATURE_NONE) -> torch.Tensor:
     """
     Generates the embedding for an entire protein sequence.
 
@@ -311,6 +320,8 @@ def embed_protein_seq(protein_seq: str,
             The device to run the embedding model on (`"cpu"` or `"cuda"`).
         max_tokens : int
             Maximum number of tokens the ESM model can fit in its context window. Default is 1022.
+        seq_len_feature : str or None
+            Sequence-length feature mode: `"none"`, `"raw"`, or `"inverse"`.
 
     Returns
     -------
@@ -346,13 +357,17 @@ def embed_protein_seq(protein_seq: str,
                 batch_tokens, esm_model, layer, device)
 
     rep_np = rep.numpy().astype(np.float32)
-    rep_np = append_seq_len(rep_np, seq_len)
+    rep_np = apply_seq_len_feature(
+        rep_np,
+        seq_len=seq_len,
+        seq_len_feature=seq_len_feature,
+    )
 
     return torch.from_numpy(rep_np)
 
 
 def predict_member_probabilities_from_embedding(
-    psp_model: PepSeqFFNN,
+    psp_model: torch.nn.Module,
     protein_emb: torch.Tensor,
     device: str
 ) -> torch.Tensor:
@@ -361,7 +376,7 @@ def predict_member_probabilities_from_embedding(
 
     Parameters
     ----------
-        psp_model : PepSeqFFNN
+        psp_model : torch.nn.Module
             The PepSeqPred model to use for predicting member probabilities.
         protein_emb : torch.Tensor
             Protein embedding to pass through model.
@@ -394,7 +409,7 @@ def predict_member_probabilities_from_embedding(
         return torch.sigmoid(logits)[0].detach().cpu()
 
 
-def predict_from_embedding(psp_model: PepSeqFFNN,
+def predict_from_embedding(psp_model: torch.nn.Module,
                            protein_emb: torch.Tensor,
                            device: str,
                            threshold: float = 0.5) -> Dict[str, Any]:
@@ -403,7 +418,7 @@ def predict_from_embedding(psp_model: PepSeqFFNN,
 
     Parameters
     ----------
-        psp_model : PepSeqFFNN
+        psp_model : torch.nn.Module
             The PepSeqPred model to use for predicting member probabilities.
         protein_emb : torch.Tensor
             Protein embedding to pass through model.
@@ -436,17 +451,19 @@ def predict_from_embedding(psp_model: PepSeqFFNN,
 
 
 def predict_ensemble_from_embedding(
-    psp_models: Sequence[PepSeqFFNN],
+    psp_models: Sequence[torch.nn.Module],
     protein_emb: torch.Tensor,
     device: str,
-    thresholds: Sequence[float]
+    thresholds: Sequence[float],
+    aggregation: str = "majority",
+    ensemble_threshold: float | None = None
 ) -> Dict[str, Any]:
     """
-    Predict residue-level mask using strict majority vote across model members.
+    Predict residue-level mask from an ensemble of model members.
 
     Parameters
     ----------
-        psp_models : Sequence[PepSeqFFNN]
+        psp_models : Sequence[torch.nn.Module]
             A sequence of PepSeqPred models to use for majority vote prediction of member probabilities.
         protein_emb : torch.Tensor
             Protein embedding to pass through models.
@@ -454,6 +471,13 @@ def predict_ensemble_from_embedding(
             Device type: `"cuda"` for GPUs, otherwise `"cpu"`.
         thresholds : Sequence[float]
             A sequence of thresholds between `0.0` and `1.0`, that determine the cutoff for non-epitope vs definite epitope. Default is `0.5`.
+        aggregation : str
+            Ensemble aggregation rule. `"majority"` thresholds each member and
+            applies strict majority vote. `"mean-prob"` thresholds the mean
+            probability across members.
+        ensemble_threshold : float or None
+            Threshold used for `"mean-prob"` aggregation. If omitted, the mean
+            of member thresholds is used.
 
     Returns
     -------
@@ -464,9 +488,13 @@ def predict_ensemble_from_embedding(
     ------
         ValueError
             If no models are provided, if number of models and thresholds differs,
-            if any threshold is outside `(0.0, 1.0)`, if member probability shapes
-            are invalid, or if member output lengths are inconsistent.
+            if any threshold is outside `(0.0, 1.0)`, if aggregation is invalid,
+            if member probability shapes are invalid, or if member output lengths
+            are inconsistent.
     """
+    aggregation = str(aggregation).strip().lower()
+    if aggregation not in {"majority", "mean-prob"}:
+        raise ValueError("aggregation must be one of: majority, mean-prob")
     if len(psp_models) < 1:
         raise ValueError(
             "At least one model is required for ensemble prediction")
@@ -497,36 +525,58 @@ def predict_ensemble_from_embedding(
         raise ValueError(
             "All ensemble members must produce the same sequence length")
 
-    vote_sum = torch.stack(member_masks, dim=0).sum(dim=0)
     n_members = int(len(member_masks))
-    votes_needed = int((n_members // 2) + 1)
-    majority_mask = (vote_sum >= votes_needed).to(torch.int64)
     mean_probs = torch.stack(member_probs, dim=0).mean(dim=0)
+    votes_needed: int | None = None
+    if aggregation == "majority":
+        vote_sum = torch.stack(member_masks, dim=0).sum(dim=0)
+        votes_needed = int((n_members // 2) + 1)
+        mask = (vote_sum >= votes_needed).to(torch.int64)
+        payload_threshold = float("nan")
+        resolved_ensemble_threshold = None
+    else:
+        resolved_ensemble_threshold = (
+            float(ensemble_threshold)
+            if ensemble_threshold is not None
+            else float(sum(float(x) for x in thresholds) / len(thresholds))
+        )
+        if resolved_ensemble_threshold <= 0.0 or resolved_ensemble_threshold >= 1.0:
+            raise ValueError("ensemble_threshold must be in (0.0, 1.0)")
+        mask = (mean_probs >= resolved_ensemble_threshold).to(torch.int64)
+        payload_threshold = float(resolved_ensemble_threshold)
+
     out = _build_prediction_payload(
         probs=mean_probs,
-        mask=majority_mask,
-        threshold=float("nan")
+        mask=mask,
+        threshold=payload_threshold
     )
     out["n_members"] = n_members
     out["votes_needed"] = votes_needed
     out["member_thresholds"] = [float(x) for x in thresholds]
+    out["ensemble_aggregation"] = aggregation
+    out["ensemble_threshold"] = (
+        float(resolved_ensemble_threshold)
+        if resolved_ensemble_threshold is not None
+        else None
+    )
     return out
 
 
-def predict_protein(psp_model: PepSeqFFNN,
+def predict_protein(psp_model: torch.nn.Module,
                     esm_model: torch.nn.Module,
                     layer: int,
                     batch_converter: esm.data.BatchConverter,
                     protein_seq: str,
                     max_tokens: int,
                     device: str,
-                    threshold: float = 0.5) -> Dict[str, Any]:
+                    threshold: float = 0.5,
+                    seq_len_feature: str | None = SEQ_LEN_FEATURE_NONE) -> Dict[str, Any]:
     """
     Predict residue-level binary epitope mask for one protein sequence
 
     Parameters
     ----------
-        psp_model : PepSeqFFNN
+        psp_model : torch.nn.Module
             The PepSeqPred model to use for predicting member probabilities.
         esm_model : torch.nn.Module
             The ESM-2 model to use for embedding generation.
@@ -542,6 +592,8 @@ def predict_protein(psp_model: PepSeqFFNN,
             Device type: `"cuda"` for GPUs, otherwise `"cpu"`.
         threshold : float
             The threshold between `0.0` and `1.0`, that determine the cutoff for non-epitope vs definite epitope. Default is `0.5`.
+        seq_len_feature : str or None
+            Sequence-length feature mode used for generated embeddings.
 
     Returns
     -------
@@ -562,7 +614,8 @@ def predict_protein(psp_model: PepSeqFFNN,
         layer=layer,
         batch_converter=batch_converter,
         device=device,
-        max_tokens=max_tokens
+        max_tokens=max_tokens,
+        seq_len_feature=seq_len_feature,
     )
     return predict_from_embedding(
         psp_model=psp_model,

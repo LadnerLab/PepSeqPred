@@ -1,6 +1,6 @@
-"""train_ffnn_cli.py
+"""train_cli.py
 
-Handles end-to-end training and evaluation of a PepSeqPredFFNN with the goal to predict the locations
+Handles end-to-end training and evaluation of PepSeqPred model heads with the goal to predict the locations
 of antibody epitopes within a protein sequence downstream. The resulting model will make binary predictions:
 definite epitope or not epitope, it handles residues labeled uncertain through a masking process.
 
@@ -11,8 +11,8 @@ from 3 to 5 hours.
 
 Usage
 -----
->>> # from scripts/hpc/trainffnn.sh (see shell script for CLI config)
->>> sbatch trainffnn.sh /path/to/emb_shard_dir0 ... /path/to/emb_shard_dirN -- \\ 
+>>> # from scripts/hpc/train.sh (see shell script for CLI config)
+>>> sbatch train.sh /path/to/emb_shard_dir0 ... /path/to/emb_shard_dirN -- \\ 
                         /path/to/label_shard0.pt ... /path/to/label_shardN.pt
 """
 
@@ -32,7 +32,13 @@ import pandas as pd
 from pepseqpred.core.io.logger import setup_logger
 from pepseqpred.core.io.write import append_csv_row
 from pepseqpred.core.data.proteindataset import ProteinDataset, pad_collate
-from pepseqpred.core.models.ffnn import PepSeqFFNN
+from pepseqpred.core.models.factory import (
+    MODEL_HEADS,
+    PepSeqModelConfig,
+    build_pepseq_model,
+    model_config_to_dict,
+    validate_model_config
+)
 from pepseqpred.core.train.trainer import (
     Trainer,
     TrainerConfig,
@@ -40,18 +46,31 @@ from pepseqpred.core.train.trainer import (
 )
 from pepseqpred.core.train.ddp import init_ddp
 from pepseqpred.core.train.split import (
+    SPLIT_STRATEGIES,
     split_ids,
     split_ids_grouped,
+    split_ids_label_stratified,
     build_kfold_splits,
     build_grouped_kfold_splits,
+    build_label_stratified_kfold_splits,
+    build_label_support_by_id,
+    build_split_report,
     partition_ids_weighted,
     sort_ids_for_locality,
     shuffle_ids_by_group
 )
-from pepseqpred.core.train.weights import pos_weight_from_label_shards
+from pepseqpred.core.train.weights import (
+    compute_pos_neg_counts,
+    global_pos_neg_counts
+)
+from pepseqpred.core.train.threshold import THRESHOLD_POLICIES
 from pepseqpred.core.train.embedding import infer_emb_dim
 from pepseqpred.core.train.seed import set_all_seeds
 from pepseqpred.core.io.read import parse_int_csv, parse_float_csv
+from pepseqpred.core.data.seq_len_feature import (
+    EMBEDDING_SEQ_LEN_FEATURES,
+    cli_seq_len_feature_to_model
+)
 
 
 def summarize_numeric(series: pd.Series) -> Dict[str, Any]:
@@ -103,6 +122,21 @@ def _finite_or_none(value: Any) -> float | None:
     except (TypeError, ValueError):
         return None
     return num if math.isfinite(num) else None
+
+
+def _split_summary_csv_fields(
+    prefix: str,
+    summary: Mapping[str, Any] | None
+) -> Dict[str, Any]:
+    """Flattens split report summary fields for run CSV artifacts."""
+    summary = summary or {}
+    return {
+        f"{prefix}Proteins": _finite_or_none(summary.get("protein_count")),
+        f"{prefix}ValidResidues": _finite_or_none(summary.get("valid_residues")),
+        f"{prefix}PosResidues": _finite_or_none(summary.get("positive_residues")),
+        f"{prefix}NegResidues": _finite_or_none(summary.get("negative_residues")),
+        f"{prefix}PositiveRate": _finite_or_none(summary.get("positive_rate")),
+    }
 
 
 def _parse_plot_formats(raw: str) -> Tuple[str, ...]:
@@ -670,11 +704,27 @@ def _check_family_leakage(train_ids: List[str], val_ids: List[str], family_group
 def _build_run_plans(
     args: argparse.Namespace,
     protein_ids: List[str],
-    family_groups: Dict[str, str]
+    split_groups: Dict[str, str] | None = None,
+    family_groups: Dict[str, str] | None = None,
+    label_support_by_id: Mapping[str, Mapping[str, Any]] | None = None
 ) -> Tuple[List[RunPlan], Dict[str, Any]]:
     """Builds run plans from unified seed lists and n-folds configuration."""
     if len(protein_ids) == 0:
         raise ValueError("No proteins found to train on")
+
+    split_strategy = str(getattr(args, "split_strategy", "size-balanced"))
+    # Backward-compatibility: legacy callers pass family_groups as the third
+    # positional argument, which now maps to split_groups.
+    if family_groups is None and str(args.split_type) == "id-family" and split_groups is not None:
+        family_groups = dict(split_groups)
+    family_groups = family_groups or {}
+    if split_groups is None:
+        split_groups = (
+            family_groups
+            if str(args.split_type) == "id-family"
+            else {protein_id: protein_id for protein_id in protein_ids}
+        )
+    label_support_by_id = label_support_by_id or {}
 
     n_folds = int(args.n_folds)
     if n_folds < 1:
@@ -702,7 +752,18 @@ def _build_run_plans(
     if n_folds == 1:
         run_plans: List[RunPlan] = []
         for run_index, (split_seed, train_seed) in enumerate(zip(split_seeds, train_seeds), start=1):
-            if args.split_type == "id-family":
+            if split_strategy == "label-stratified":
+                train_ids_all, val_ids_all = split_ids_label_stratified(
+                    protein_ids,
+                    args.val_frac,
+                    split_seed,
+                    split_groups,
+                    label_support_by_id,
+                )
+                if args.split_type == "id-family":
+                    _check_family_leakage(
+                        train_ids_all, val_ids_all, family_groups)
+            elif args.split_type == "id-family":
                 train_ids_all, val_ids_all = split_ids_grouped(
                     protein_ids, args.val_frac, split_seed, family_groups
                 )
@@ -733,6 +794,7 @@ def _build_run_plans(
             "train_seeds": [int(x) for x in train_seeds],
             "n_folds": 1,
             "n_sets": int(n_sets),
+            "split_strategy": split_strategy,
             "train_mode": train_mode
         }
 
@@ -742,7 +804,15 @@ def _build_run_plans(
         zip(split_seeds, train_seeds),
         start=1
     ):
-        if args.split_type == "id-family":
+        if split_strategy == "label-stratified":
+            fold_splits = build_label_stratified_kfold_splits(
+                protein_ids,
+                n_folds=n_folds,
+                seed=int(set_split_seed),
+                groups=split_groups,
+                support_by_id=label_support_by_id,
+            )
+        elif args.split_type == "id-family":
             fold_splits = build_grouped_kfold_splits(
                 protein_ids, n_folds=n_folds, seed=int(set_split_seed), groups=family_groups
             )
@@ -794,14 +864,15 @@ def _build_run_plans(
         "n_folds": int(n_folds),
         "n_sets": int(n_sets),
         "ensemble_seed_mode": "set-paired",
+        "split_strategy": split_strategy,
         "train_mode": train_mode
     }
 
 
 def main() -> None:
-    """Handles command-line argument parsing and high-level execution of the Train FFNN program."""
+    """Handles command-line argument parsing and high-level execution of training."""
     parser = argparse.ArgumentParser(
-        description="Train PepSeqPred FFNN on protein ESM-2 embeddings for binary residue-level epitope prediction.")
+        description="Train a PepSeqPred model head on protein ESM-2 embeddings for binary residue-level epitope prediction.")
     parser.add_argument("--embedding-dirs",
                         nargs="+",
                         required=True,
@@ -832,6 +903,44 @@ def main() -> None:
                         action="store_true",
                         dest="use_residual",
                         help="If set, residuals are used in feed-forward calculation")
+    parser.add_argument("--model-head",
+                        action="store",
+                        dest="model_head",
+                        type=str,
+                        choices=list(MODEL_HEADS),
+                        default="ffnn",
+                        help="Classifier head to train.")
+    parser.add_argument("--conv-channels",
+                        action="store",
+                        dest="conv_channels",
+                        type=int,
+                        default=64,
+                        help="Number of local Conv1d channels when --model-head=conv1d.")
+    parser.add_argument("--conv-layers",
+                        action="store",
+                        dest="conv_layers",
+                        type=int,
+                        default=2,
+                        help="Number of Conv1d layers when --model-head=conv1d.")
+    parser.add_argument("--conv-kernel-size",
+                        action="store",
+                        dest="conv_kernel_size",
+                        type=int,
+                        default=9,
+                        help="Odd Conv1d kernel size when --model-head=conv1d.")
+    parser.add_argument("--conv-dropout",
+                        action="store",
+                        dest="conv_dropout",
+                        type=float,
+                        default=0.1,
+                        help="Dropout applied after each Conv1d activation when --model-head=conv1d.")
+    parser.add_argument("--seq-len-feature",
+                        action="store",
+                        dest="seq_len_feature",
+                        type=str,
+                        choices=list(EMBEDDING_SEQ_LEN_FEATURES),
+                        default="none",
+                        help="Sequence-length feature mode used in embedding tensors.")
     parser.add_argument("--epochs",
                         action="store",
                         dest="epochs",
@@ -867,7 +976,7 @@ def main() -> None:
                         action="store",
                         type=float,
                         default=None,
-                        help="Optionally include a pre-calculated postive class weight")
+                        help="Optional manual positive class weight; omitted means compute from the current training split")
     parser.add_argument("--save-path",
                         action="store",
                         dest="save_path",
@@ -891,6 +1000,15 @@ def main() -> None:
                         default="id-family",
                         choices=["id", "id-family"],
                         help="Data partition type, use ID only or ID and taxonomic family.")
+    parser.add_argument("--split-strategy",
+                        type=str,
+                        default="size-balanced",
+                        choices=list(SPLIT_STRATEGIES),
+                        help="Split assignment strategy. Default preserves existing size-balanced behavior.")
+    parser.add_argument("--split-report-json",
+                        type=Path,
+                        default=None,
+                        help="Optional split report JSON path. Defaults to <save-path>/split_report.json.")
     parser.add_argument("--num-workers",
                         action="store",
                         dest="num_workers",
@@ -902,13 +1020,13 @@ def main() -> None:
                         dest="window_size",
                         type=int,
                         default=1000,
-                        help="Window size for long protein sequences (<= 0 to disable)")
+                        help="Training window size for long protein sequences (<= 0 to disable; validation uses full proteins)")
     parser.add_argument("--stride",
                         action="store",
                         dest="stride",
                         type=int,
                         default=900,
-                        help="Stride between windows for long proteins")
+                        help="Stride between training windows for long proteins")
     parser.add_argument("--no-collapse-labels",
                         dest="collapse_labels",
                         action="store_false",
@@ -916,7 +1034,7 @@ def main() -> None:
     parser.add_argument("--no-pad-last-window",
                         dest="pad_last_window",
                         action="store_false",
-                        help="Disable padding of final short window")
+                        help="Disable padding of final short training window")
     parser.add_argument("--no-cache-label-shard",
                         dest="cache_current_label_shard",
                         action="store_false",
@@ -950,6 +1068,23 @@ def main() -> None:
                         choices=["loss", "precision", "recall",
                                  "f1", "mcc", "auc", "auc10", "pr_auc", "res_balanced_acc"],
                         help="Metric used to choose the best model checkpoint per run")
+    parser.add_argument("--threshold-policy",
+                        type=str,
+                        default="max-recall-min-precision",
+                        choices=list(THRESHOLD_POLICIES),
+                        help="Validation threshold selection policy.")
+    parser.add_argument("--threshold-min-precision",
+                        type=float,
+                        default=0.25,
+                        help="Minimum precision for max-recall-min-precision threshold selection.")
+    parser.add_argument("--threshold-min-recall",
+                        type=float,
+                        default=0.80,
+                        help="Minimum recall for min-recall-max-precision threshold selection.")
+    parser.add_argument("--threshold-fixed-value",
+                        type=float,
+                        default=0.50,
+                        help="Fixed threshold used when --threshold-policy=fixed.")
     parser.add_argument("--results-csv",
                         type=Path,
                         default=None,
@@ -993,9 +1128,15 @@ def main() -> None:
         )
     if len(unknown) > 0:
         parser.error(f"unrecognized arguments: {' '.join(unknown)}")
+    if args.threshold_min_precision < 0.0 or args.threshold_min_precision > 1.0:
+        raise ValueError("--threshold-min-precision must be in [0.0, 1.0]")
+    if args.threshold_min_recall < 0.0 or args.threshold_min_recall > 1.0:
+        raise ValueError("--threshold-min-recall must be in [0.0, 1.0]")
+    if args.threshold_fixed_value <= 0.0 or args.threshold_fixed_value >= 1.0:
+        raise ValueError("--threshold-fixed-value must be between (0.0, 1.0)")
     logger = setup_logger(json_lines=True,
                           json_indent=2,
-                          name="train_ffnn_cli")
+                          name="train_cli")
 
     ddp = init_ddp()
     rank = ddp["rank"] if ddp is not None else 0
@@ -1049,18 +1190,37 @@ def main() -> None:
     if args.subset > 0:
         protein_ids = protein_ids[:args.subset]
 
-    # parition data by ID + family or just ID
+    split_report_json = args.split_report_json or (
+        args.save_path / "split_report.json")
+
+    # partition data by ID + family or just ID
     family_groups: Dict[str, str] = {}
     missing_family_ids = 0
-    if args.split_type == "id-family":
-        for protein_id in protein_ids:
-            family = base_dataset.embedding_family_by_id.get(protein_id)
-            if family is None or str(family).strip() == "":
-                # singleton group when family missing fallback
-                family_groups[protein_id] = f"__missing_family__:{protein_id}"
-                missing_family_ids += 1
-            else:
-                family_groups[protein_id] = str(family)
+    for protein_id in protein_ids:
+        family = base_dataset.embedding_family_by_id.get(protein_id)
+        if family is None or str(family).strip() == "":
+            # singleton group when family missing fallback
+            family_groups[protein_id] = f"__missing_family__:{protein_id}"
+            missing_family_ids += 1
+        else:
+            family_groups[protein_id] = str(family)
+    split_groups = (
+        family_groups
+        if args.split_type == "id-family"
+        else {protein_id: protein_id for protein_id in protein_ids}
+    )
+
+    if ddp is None or rank == 0:
+        label_support_by_id = build_label_support_by_id(
+            protein_ids,
+            base_dataset.label_index,
+        )
+    else:
+        label_support_by_id = {}
+    if ddp is not None:
+        obj = [label_support_by_id]
+        dist.broadcast_object_list(obj, src=0)
+        label_support_by_id = obj[0]
 
     # estimate relative workload without tensor I/O by using embedding file size.
     id_weights: Dict[str, float] = {}
@@ -1079,12 +1239,52 @@ def main() -> None:
         for protein_id in protein_ids
     }
 
-    run_plans, split_meta = _build_run_plans(args, protein_ids, family_groups)
+    run_plans, split_meta = _build_run_plans(
+        args,
+        protein_ids,
+        split_groups,
+        family_groups,
+        label_support_by_id,
+    )
+    split_summary_by_run: Dict[int, Mapping[str, Any]] = {}
     if rank == 0:
+        split_report_payload = build_split_report(
+            run_splits=[
+                {
+                    "run_index": plan.run_index,
+                    "train_mode": plan.train_mode,
+                    "split_seed": plan.split_seed,
+                    "train_seed": plan.train_seed,
+                    "fold_index": plan.fold_index,
+                    "n_folds": plan.n_folds,
+                    "ensemble_set_index": plan.ensemble_set_index,
+                    "train_ids": plan.train_ids_all,
+                    "val_ids": plan.val_ids_all,
+                }
+                for plan in run_plans
+            ],
+            support_by_id=label_support_by_id,
+            families_by_id=family_groups,
+            split_type=str(args.split_type),
+            split_strategy=str(args.split_strategy),
+        )
+        split_report_json.parent.mkdir(parents=True, exist_ok=True)
+        split_report_json.write_text(
+            json.dumps(_sanitize_for_json(split_report_payload),
+                       indent=2, allow_nan=False),
+            encoding="utf-8",
+        )
+        split_summary_by_run = {
+            int(entry["run_index"]): entry
+            for entry in split_report_payload["runs"]
+            if entry.get("run_index") is not None
+        }
         logger.info("run_plan_init", extra={"extra": {
             "train_mode": str(split_meta["train_mode"]),
             "n_runs": len(run_plans),
             "split_type": args.split_type,
+            "split_strategy": args.split_strategy,
+            "split_report_json": str(split_report_json),
             "missing_family_ids": missing_family_ids,
             "n_folds": int(split_meta["n_folds"]) if "n_folds" in split_meta else None,
             "n_sets": int(split_meta["n_sets"]) if "n_sets" in split_meta else None,
@@ -1104,6 +1304,33 @@ def main() -> None:
     if len(hidden_sizes) != len(dropouts):
         raise ValueError(
             "--hidden-sizes and --dropouts must be the same length"
+        )
+    emb_dim = infer_emb_dim(base_dataset.embedding_index)
+    model_config = validate_model_config(
+        PepSeqModelConfig(
+            emb_dim=emb_dim,
+            hidden_sizes=hidden_sizes,
+            dropouts=dropouts,
+            num_classes=1,
+            use_layer_norm=bool(args.use_layer_norm),
+            use_residual=bool(args.use_residual),
+            model_head=str(args.model_head),
+            conv_channels=int(args.conv_channels),
+            conv_layers=int(args.conv_layers),
+            conv_kernel_size=int(args.conv_kernel_size),
+            conv_dropout=float(args.conv_dropout),
+            seq_len_feature=cli_seq_len_feature_to_model(
+                args.seq_len_feature),
+        )
+    )
+    model_config_payload = model_config_to_dict(model_config)
+    if rank == 0:
+        logger.info(
+            "model_config_resolved",
+            extra={"extra": {
+                **model_config_payload,
+                "seq_len_feature": str(args.seq_len_feature),
+            }}
         )
 
     # per-run loop
@@ -1196,10 +1423,10 @@ def main() -> None:
                 protein_ids=val_ids,
                 label_index=base_dataset.label_index,
                 embedding_index=base_dataset.embedding_index,
-                window_size=args.window_size if args.window_size > 0 else None,
-                stride=args.stride,
+                window_size=None,
+                stride=1,
                 collapse_labels=args.collapse_labels,
-                pad_last_window=args.pad_last_window,
+                pad_last_window=False,
                 return_meta=False,
                 cache_current_label_shard=args.cache_current_label_shard,
                 drop_label_after_use=args.drop_label_after_use,
@@ -1225,20 +1452,36 @@ def main() -> None:
             val_data, **loader_kwargs) if val_data is not None else None
 
         # compute or store positive weight
-        pos_weight = None
+        pos_weight_source = "cli"
+        train_pos_residues = None
+        train_neg_residues = None
         if args.pos_weight is not None:
             pos_weight = float(args.pos_weight)
         else:
-            pos_weight = pos_weight_from_label_shards(label_shards)
+            local_pos, local_neg = compute_pos_neg_counts(train_loader)
+            train_pos_residues, train_neg_residues = global_pos_neg_counts(
+                local_pos,
+                local_neg,
+                ddp
+            )
+            pos_weight = float(train_neg_residues / max(train_pos_residues, 1))
+            pos_weight_source = "train_loader"
 
-        # build our FFNN model
-        emb_dim = infer_emb_dim(base_dataset.embedding_index)
-        model = PepSeqFFNN(emb_dim=emb_dim,
-                           hidden_sizes=hidden_sizes,
-                           dropouts=dropouts,
-                           use_layer_norm=args.use_layer_norm,
-                           use_residual=args.use_residual,
-                           num_classes=1)
+        if rank == 0:
+            logger.info(
+                "pos_weight_resolved",
+                extra={
+                    "extra": {
+                        "run_index": int(run_index),
+                        "source": pos_weight_source,
+                        "train_pos_residues": train_pos_residues,
+                        "train_neg_residues": train_neg_residues,
+                        "pos_weight": float(pos_weight)
+                    }
+                }
+            )
+
+        model = build_pepseq_model(model_config)
 
         if ddp is not None:
             device = torch.device(f"cuda:{ddp['local_rank']}")
@@ -1257,12 +1500,17 @@ def main() -> None:
                                learning_rate=args.lr,
                                weight_decay=args.weight_decay,
                                device="cuda" if torch.cuda.is_available() else "cpu",
-                               pos_weight=pos_weight)
+                               pos_weight=pos_weight,
+                               threshold_policy=args.threshold_policy,
+                               threshold_min_precision=args.threshold_min_precision,
+                               threshold_min_recall=args.threshold_min_recall,
+                               threshold_fixed_value=args.threshold_fixed_value)
         trainer = Trainer(model=model,
                           train_loader=train_loader,
                           logger=logger,
                           val_loader=val_loader,
-                          config=config)
+                          config=config,
+                          model_config=model_config)
 
         # run training, only save if rank 0 or single rank run
         if ddp is None or rank == 0:
@@ -1318,6 +1566,9 @@ def main() -> None:
                     "best_val_loss": best_val_loss,
                     "best_score_value": best_score_value
                 }})
+            split_entry = split_summary_by_run.get(int(run_index), {})
+            train_split_summary = split_entry.get("train", {})
+            val_split_summary = split_entry.get("validation", {})
             row = {
                 "RunIndex": run_index,
                 "TrainMode": run_plan.train_mode,
@@ -1333,6 +1584,16 @@ def main() -> None:
                 "NFolds": run_plan.n_folds,
                 "SplitSeed": split_seed,
                 "TrainSeed": train_seed,
+                "SplitStrategy": str(args.split_strategy),
+                "SplitReportJson": str(split_report_json),
+                "ModelHead": str(model_config.model_head),
+                "SeqLenFeature": str(args.seq_len_feature),
+                "ConvChannels": int(model_config.conv_channels),
+                "ConvLayers": int(model_config.conv_layers),
+                "ConvKernelSize": int(model_config.conv_kernel_size),
+                "ConvDropout": float(model_config.conv_dropout),
+                **_split_summary_csv_fields("Train", train_split_summary),
+                **_split_summary_csv_fields("Val", val_split_summary),
                 "RunSaveDir": str(run_save_dir) if run_save_dir is not None else None,
                 "CheckpointPath": str(checkpoint_path) if checkpoint_path is not None else None,
                 "BestMetricKey": args.best_model_metric,
@@ -1340,6 +1601,16 @@ def main() -> None:
                 "BestEpoch": best_epoch,
                 "BestValLoss": best_val_loss,
                 "Threshold": threshold,
+                "ThresholdPolicy": str(best_metrics.get("threshold_policy", args.threshold_policy)),
+                "ThresholdStatus": str(best_metrics.get("threshold_status", "")),
+                "ThresholdMinPrecision": _finite_or_none(
+                    best_metrics.get("threshold_min_precision", float("nan"))),
+                "ThresholdMinRecall": _finite_or_none(
+                    best_metrics.get("threshold_min_recall", float("nan"))),
+                "ThresholdFixedValue": _finite_or_none(
+                    best_metrics.get("threshold_fixed_value", float("nan"))),
+                "ThresholdPredPosFrac": _finite_or_none(
+                    best_metrics.get("threshold_pred_pos_frac", float("nan"))),
                 "PR_AUC": _finite_or_none(best_metrics.get("pr_auc", float("nan"))),
                 "F1": _finite_or_none(best_metrics.get("f1", float("nan"))),
                 "MCC": _finite_or_none(best_metrics.get("mcc", float("nan"))),
@@ -1362,11 +1633,23 @@ def main() -> None:
             "n_runs": int(len(run_rows)),
             "train_mode": str(split_meta["train_mode"]),
             "split_type": str(args.split_type),
+            "split_strategy": str(args.split_strategy),
+            "split_report_json": str(split_report_json),
+            "seq_len_feature": str(args.seq_len_feature),
+            "model_config": model_config_payload,
             "best_model_metric": str(args.best_model_metric),
+            "threshold_policy": str(args.threshold_policy),
+            "threshold_min_precision": float(args.threshold_min_precision),
+            "threshold_min_recall": float(args.threshold_min_recall),
+            "threshold_fixed_value": float(args.threshold_fixed_value),
             "split_seeds": [int(x) for x in split_meta["split_seeds"]],
             "train_seeds": [int(x) for x in split_meta["train_seeds"]],
             "metrics": {
                 "BestMetricValue": summarize_numeric(df_runs["BestMetricValue"]),
+                "TrainPositiveRate": summarize_numeric(df_runs["TrainPositiveRate"]),
+                "ValPositiveRate": summarize_numeric(df_runs["ValPositiveRate"]),
+                "Threshold": summarize_numeric(df_runs["Threshold"]),
+                "ThresholdPredPosFrac": summarize_numeric(df_runs["ThresholdPredPosFrac"]),
                 "PR_AUC": summarize_numeric(df_runs["PR_AUC"]),
                 "F1": summarize_numeric(df_runs["F1"]),
                 "MCC": summarize_numeric(df_runs["MCC"]),
@@ -1421,6 +1704,11 @@ def main() -> None:
                     "train_seed": int(row["TrainSeed"]),
                     "checkpoint": row.get("CheckpointPath"),
                     "threshold": row.get("Threshold"),
+                    "threshold_policy": row.get("ThresholdPolicy"),
+                    "threshold_status": row.get("ThresholdStatus"),
+                    "threshold_min_precision": row.get("ThresholdMinPrecision"),
+                    "threshold_min_recall": row.get("ThresholdMinRecall"),
+                    "threshold_fixed_value": row.get("ThresholdFixedValue"),
                     "status": row.get("Status"),
                     "best_metric_value": row.get("BestMetricValue")
                 })
@@ -1481,11 +1769,19 @@ def main() -> None:
                     "ensemble_type": "kfold_majority_vote",
                     "train_mode": str(split_meta["train_mode"]),
                     "split_type": str(args.split_type),
+                    "split_strategy": str(args.split_strategy),
+                    "split_report_json": str(split_report_json),
+                    "seq_len_feature": str(args.seq_len_feature),
+                    "model_config": model_config_payload,
                     "n_folds": int(split_meta["n_folds"]),
                     "set_index": int(entry["set_index"]),
                     "split_seed": int(entry["split_seed"]),
                     "train_seed": int(entry["train_seed"]),
                     "best_model_metric": str(args.best_model_metric),
+                    "threshold_policy": str(args.threshold_policy),
+                    "threshold_min_precision": float(args.threshold_min_precision),
+                    "threshold_min_recall": float(args.threshold_min_recall),
+                    "threshold_fixed_value": float(args.threshold_fixed_value),
                     "n_members": int(len(members)),
                     "n_valid_members": int(len(valid_members)),
                     "voting": {
@@ -1530,12 +1826,20 @@ def main() -> None:
                     "ensemble_type": "kfold_majority_vote",
                     "train_mode": str(split_meta["train_mode"]),
                     "split_type": str(args.split_type),
+                    "split_strategy": str(args.split_strategy),
+                    "split_report_json": str(split_report_json),
+                    "seq_len_feature": str(args.seq_len_feature),
+                    "model_config": model_config_payload,
                     "n_folds": int(split_meta["n_folds"]),
                     "n_sets": int(n_sets),
                     "ensemble_seed_mode": str(
                         split_meta.get("ensemble_seed_mode", "set-paired")
                     ),
                     "best_model_metric": str(args.best_model_metric),
+                    "threshold_policy": str(args.threshold_policy),
+                    "threshold_min_precision": float(args.threshold_min_precision),
+                    "threshold_min_recall": float(args.threshold_min_recall),
+                    "threshold_fixed_value": float(args.threshold_fixed_value),
                     "sets": set_payloads
                 }
                 root_manifest_path = args.ensemble_manifest or (

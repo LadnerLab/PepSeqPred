@@ -18,6 +18,7 @@ from sklearn.metrics import average_precision_score, precision_recall_curve, roc
 from pepseqpred.core.io.logger import setup_logger
 from pepseqpred.core.io.read import parse_float_csv, parse_int_csv
 from pepseqpred.core.data.proteindataset import ProteinDataset, pad_collate
+from pepseqpred.core.models.factory import MODEL_HEADS
 from pepseqpred.core.predict.inference import (
     FFNNModelConfig,
     build_model_from_checkpoint,
@@ -25,6 +26,7 @@ from pepseqpred.core.predict.inference import (
     predict_member_probabilities_from_embedding
 )
 from pepseqpred.core.train.metrics import compute_eval_metrics
+from pepseqpred.core.train.threshold import threshold_diagnostic_grid
 
 
 @dataclass(frozen=True)
@@ -159,6 +161,11 @@ def _resolve_best_set_index(
 
 def _build_cli_model_config(args: argparse.Namespace) -> FFNNModelConfig | None:
     """Builds the model configuration from explicit CLI architecture flags."""
+    model_head_arg = getattr(args, "model_head", None)
+    conv_channels_arg = getattr(args, "conv_channels", None)
+    conv_layers_arg = getattr(args, "conv_layers", None)
+    conv_kernel_size_arg = getattr(args, "conv_kernel_size", None)
+    conv_dropout_arg = getattr(args, "conv_dropout", None)
     any_explicit = any(
         arg is not None
         for arg in (
@@ -167,7 +174,12 @@ def _build_cli_model_config(args: argparse.Namespace) -> FFNNModelConfig | None:
             args.dropouts,
             args.use_layer_norm,
             args.use_residual,
-            args.num_classes
+            args.num_classes,
+            model_head_arg,
+            conv_channels_arg,
+            conv_layers_arg,
+            conv_kernel_size_arg,
+            conv_dropout_arg
         )
     )
     if not any_explicit:
@@ -184,6 +196,16 @@ def _build_cli_model_config(args: argparse.Namespace) -> FFNNModelConfig | None:
         missing.append("--use-layer-norm/--no-use-layer-norm")
     if args.use_residual is None:
         missing.append("--use-residual/--no-use-residual")
+    model_head = str(model_head_arg or "ffnn")
+    if model_head == "conv1d":
+        if conv_channels_arg is None:
+            missing.append("--conv-channels")
+        if conv_layers_arg is None:
+            missing.append("--conv-layers")
+        if conv_kernel_size_arg is None:
+            missing.append("--conv-kernel-size")
+        if conv_dropout_arg is None:
+            missing.append("--conv-dropout")
     if missing:
         raise ValueError(
             "When using explicit architecture flags, provide all required values: "
@@ -203,7 +225,12 @@ def _build_cli_model_config(args: argparse.Namespace) -> FFNNModelConfig | None:
         dropouts=tuple(dropouts),
         num_classes=num_classes,
         use_layer_norm=bool(args.use_layer_norm),
-        use_residual=bool(args.use_residual)
+        use_residual=bool(args.use_residual),
+        model_head=model_head,
+        conv_channels=int(conv_channels_arg) if conv_channels_arg is not None else 64,
+        conv_layers=int(conv_layers_arg) if conv_layers_arg is not None else 2,
+        conv_kernel_size=int(conv_kernel_size_arg) if conv_kernel_size_arg is not None else 9,
+        conv_dropout=float(conv_dropout_arg) if conv_dropout_arg is not None else 0.1
     )
 
 
@@ -538,7 +565,12 @@ def _compute_pr_auc_trapezoid(y_true: np.ndarray, y_prob: np.ndarray) -> float:
     return float(np.trapezoid(precision, recall))
 
 
-def _empty_eval_output(votes_needed: int | None, include_curves: bool) -> Dict[str, Any]:
+def _empty_eval_output(
+    votes_needed: int | None,
+    include_curves: bool,
+    ensemble_aggregation: str = "majority",
+    ensemble_threshold: float | None = None,
+) -> Dict[str, Any]:
     """Returns a canonical empty evaluation payload."""
     out = {
         "processed_proteins": 0,
@@ -552,6 +584,11 @@ def _empty_eval_output(votes_needed: int | None, include_curves: bool) -> Dict[s
         "accuracy": float("nan"),
         "confusion_matrix": [[0, 0], [0, 0]],
         "votes_needed": votes_needed,
+        "ensemble_aggregation": str(ensemble_aggregation),
+        "ensemble_threshold": (
+            float(ensemble_threshold) if ensemble_threshold is not None else None
+        ),
+        "threshold_grid": [],
         "has_both_classes": False,
         "metrics": {
             "precision": float("nan"),
@@ -598,12 +635,18 @@ def _build_eval_output_from_arrays(
     proteins_zero_valid_residues: int,
     votes_needed: int | None,
     include_curves: bool,
-    curve_max_points: int
+    curve_max_points: int,
+    ensemble_aggregation: str = "majority",
+    ensemble_threshold: float | None = None,
 ) -> Dict[str, Any]:
     """Builds a full evaluation summary from flattened residue-level arrays."""
     if y_true.size < 1:
         out = _empty_eval_output(
-            votes_needed=votes_needed, include_curves=include_curves)
+            votes_needed=votes_needed,
+            include_curves=include_curves,
+            ensemble_aggregation=ensemble_aggregation,
+            ensemble_threshold=ensemble_threshold,
+        )
         out["processed_proteins"] = int(processed_proteins)
         out["proteins_zero_valid_residues"] = int(proteins_zero_valid_residues)
         out["proteins_with_valid_residues"] = int(
@@ -633,6 +676,11 @@ def _build_eval_output_from_arrays(
         "accuracy": float((y_true == y_pred).mean()) if y_true.size > 0 else float("nan"),
         "confusion_matrix": [[int(cm[0, 0]), int(cm[0, 1])], [int(cm[1, 0]), int(cm[1, 1])]],
         "votes_needed": votes_needed,
+        "ensemble_aggregation": str(ensemble_aggregation),
+        "ensemble_threshold": (
+            float(ensemble_threshold) if ensemble_threshold is not None else None
+        ),
+        "threshold_grid": list(threshold_diagnostic_grid(y_true, y_prob)),
         "has_both_classes": bool(metrics.get("has_both_classes", False)),
         "metrics": metrics
     }
@@ -977,9 +1025,14 @@ def _evaluate_dataset(
     best_fold_by: str,
     best_fold_direction: str,
     plot_dir: Path | None,
-    plot_formats: Sequence[str]
+    plot_formats: Sequence[str],
+    ensemble_aggregation: str = "majority",
+    ensemble_threshold: float | None = None,
 ) -> Dict[str, Any]:
     """Evaluates one model or an ensemble on the given eval dataset loader."""
+    ensemble_aggregation = str(ensemble_aggregation).strip().lower()
+    if ensemble_aggregation not in {"majority", "mean-prob"}:
+        raise ValueError("--ensemble-aggregation must be one of: majority, mean-prob")
     n_members = int(len(psp_models))
     if n_members < 1:
         raise ValueError("At least one model is required for evaluation")
@@ -994,7 +1047,18 @@ def _evaluate_dataset(
     if curve_max_points < 2:
         raise ValueError("--curve-max-points must be >= 2")
 
-    votes_needed = int((n_members // 2) + 1)
+    resolved_ensemble_threshold: float | None = None
+    votes_needed: int | None = None
+    if n_members > 1 and ensemble_aggregation == "majority":
+        votes_needed = int((n_members // 2) + 1)
+    elif n_members > 1:
+        resolved_ensemble_threshold = (
+            float(ensemble_threshold)
+            if ensemble_threshold is not None
+            else float(sum(float(x) for x in thresholds) / len(thresholds))
+        )
+        if resolved_ensemble_threshold <= 0.0 or resolved_ensemble_threshold >= 1.0:
+            raise ValueError("--ensemble-threshold must be between (0.0, 1.0)")
 
     all_true: List[torch.Tensor] = []
     ens_pred: List[torch.Tensor] = []
@@ -1036,11 +1100,17 @@ def _evaluate_dataset(
             if n_members == 1:
                 pred_ensemble = member_pred_full[0]
                 prob_ensemble = member_probs_full[0]
-            else:
+            elif ensemble_aggregation == "majority":
                 vote_sum = torch.stack(member_pred_full, dim=0).sum(dim=0)
                 pred_ensemble = (vote_sum >= votes_needed).to(torch.int64)
                 prob_ensemble = torch.stack(
                     member_probs_full, dim=0).mean(dim=0)
+            else:
+                prob_ensemble = torch.stack(
+                    member_probs_full, dim=0).mean(dim=0)
+                pred_ensemble = (
+                    prob_ensemble >= float(resolved_ensemble_threshold)
+                ).to(torch.int64)
 
             y_true_valid = y_row[valid_mask].to(torch.int64).cpu()
             ens_pred_valid = pred_ensemble[valid_mask].to(torch.int64).cpu()
@@ -1097,9 +1167,13 @@ def _evaluate_dataset(
         y_prob=ens_prob_np,
         processed_proteins=int(processed),
         proteins_zero_valid_residues=int(zero_valid),
-        votes_needed=(votes_needed if n_members > 1 else None),
+        votes_needed=votes_needed,
         include_curves=include_curves,
-        curve_max_points=curve_max_points
+        curve_max_points=curve_max_points,
+        ensemble_aggregation=(
+            ensemble_aggregation if n_members > 1 else "single-model"
+        ),
+        ensemble_threshold=resolved_ensemble_threshold,
     )
 
     if not emit_fold_metrics:
@@ -1125,7 +1199,9 @@ def _evaluate_dataset(
             proteins_zero_valid_residues=int(zero_valid),
             votes_needed=None,
             include_curves=include_curves,
-            curve_max_points=curve_max_points
+            curve_max_points=curve_max_points,
+            ensemble_aggregation="member",
+            ensemble_threshold=float(thresholds[member_idx]),
         )
         fold_eval["fold_index"] = member.fold_index
         fold_eval["member_index"] = member.member_index
@@ -1276,6 +1352,23 @@ def main() -> None:
         type=float,
         default=None,
         help="Optional global threshold override in (0.0, 1.0)."
+    )
+    parser.add_argument(
+        "--ensemble-aggregation",
+        action="store",
+        dest="ensemble_aggregation",
+        type=str,
+        choices=["majority", "mean-prob"],
+        default="majority",
+        help="Ensemble aggregation rule for manifest evaluation."
+    )
+    parser.add_argument(
+        "--ensemble-threshold",
+        action="store",
+        dest="ensemble_threshold",
+        type=float,
+        default=None,
+        help="Optional threshold for mean-prob ensemble aggregation."
     )
     parser.add_argument(
         "--ensemble-set-index",
@@ -1475,6 +1568,47 @@ def main() -> None:
         help="Explicit output classes (binary=1)."
     )
     parser.add_argument(
+        "--model-head",
+        action="store",
+        dest="model_head",
+        type=str,
+        choices=list(MODEL_HEADS),
+        default=None,
+        help="Explicit model head used in training."
+    )
+    parser.add_argument(
+        "--conv-channels",
+        action="store",
+        dest="conv_channels",
+        type=int,
+        default=None,
+        help="Explicit Conv1d channels used in training."
+    )
+    parser.add_argument(
+        "--conv-layers",
+        action="store",
+        dest="conv_layers",
+        type=int,
+        default=None,
+        help="Explicit Conv1d layer count used in training."
+    )
+    parser.add_argument(
+        "--conv-kernel-size",
+        action="store",
+        dest="conv_kernel_size",
+        type=int,
+        default=None,
+        help="Explicit Conv1d kernel size used in training."
+    )
+    parser.add_argument(
+        "--conv-dropout",
+        action="store",
+        dest="conv_dropout",
+        type=float,
+        default=None,
+        help="Explicit Conv1d dropout used in training."
+    )
+    parser.add_argument(
         "--use-layer-norm",
         action="store_true",
         dest="use_layer_norm",
@@ -1507,6 +1641,10 @@ def main() -> None:
         raise ValueError("--k-folds must be >= 1")
     if args.threshold is not None and (args.threshold <= 0.0 or args.threshold >= 1.0):
         raise ValueError("--threshold must be between (0.0, 1.0)")
+    if args.ensemble_threshold is not None and (
+        args.ensemble_threshold <= 0.0 or args.ensemble_threshold >= 1.0
+    ):
+        raise ValueError("--ensemble-threshold must be between (0.0, 1.0)")
     if args.subset < 0:
         raise ValueError("--subset must be >= 0")
     if args.batch_size < 1:
@@ -1595,6 +1733,18 @@ def main() -> None:
             f"got {sorted(emb_dims)}"
         )
 
+    resolved_ensemble_threshold = None
+    if len(psp_models) > 1 and args.ensemble_aggregation == "mean-prob":
+        resolved_ensemble_threshold = (
+            float(args.ensemble_threshold)
+            if args.ensemble_threshold is not None
+            else (
+                float(args.threshold)
+                if args.threshold is not None
+                else float(sum(member_thresholds) / len(member_thresholds))
+            )
+        )
+
     base_dataset = ProteinDataset(
         embedding_dirs=args.embedding_dirs,
         label_shards=args.label_shards,
@@ -1673,16 +1823,23 @@ def main() -> None:
                 ),
                 "threshold": float(member_thresholds[0]) if len(member_thresholds) == 1 else None,
                 "member_thresholds": [float(x) for x in member_thresholds],
+                "ensemble_aggregation": str(args.ensemble_aggregation),
+                "ensemble_threshold": resolved_ensemble_threshold,
                 "device": device,
                 "model_cfg_src": (
                     str(member_model_cfg_srcs[0])
                     if len(set(member_model_cfg_srcs)) == 1
                     else "mixed"
                 ),
+                "model_head": str(first_cfg.model_head),
                 "emb_dim": int(first_cfg.emb_dim),
                 "hidden_sizes": [int(x) for x in first_cfg.hidden_sizes],
                 "use_layer_norm": bool(first_cfg.use_layer_norm),
                 "use_residual": bool(first_cfg.use_residual),
+                "conv_channels": int(first_cfg.conv_channels),
+                "conv_layers": int(first_cfg.conv_layers),
+                "conv_kernel_size": int(first_cfg.conv_kernel_size),
+                "conv_dropout": float(first_cfg.conv_dropout),
                 "num_classes": int(first_cfg.num_classes),
                 "emit_fold_metrics": bool(args.emit_fold_metrics),
                 "include_curves": bool(args.include_curves),
@@ -1710,7 +1867,9 @@ def main() -> None:
         best_fold_by=str(args.best_fold_by),
         best_fold_direction=str(args.best_fold_direction),
         plot_dir=args.plot_dir,
-        plot_formats=plot_formats
+        plot_formats=plot_formats,
+        ensemble_aggregation=str(args.ensemble_aggregation),
+        ensemble_threshold=resolved_ensemble_threshold
     )
     if not bool(eval_out.get("has_both_classes", False)):
         logger.warning(
@@ -1761,6 +1920,8 @@ def main() -> None:
         ),
         "threshold": float(member_thresholds[0]) if len(member_thresholds) == 1 else None,
         "member_thresholds": [float(x) for x in member_thresholds],
+        "ensemble_aggregation": str(args.ensemble_aggregation),
+        "ensemble_threshold": resolved_ensemble_threshold,
         "emit_fold_metrics": bool(args.emit_fold_metrics),
         "include_curves": bool(args.include_curves),
         "curve_max_points": int(args.curve_max_points),
@@ -1779,10 +1940,15 @@ def main() -> None:
             if len(set(member_model_cfg_srcs)) == 1
             else "mixed"
         ),
+        "model_head": str(first_cfg.model_head),
         "emb_dim": int(first_cfg.emb_dim),
         "hidden_sizes": [int(x) for x in first_cfg.hidden_sizes],
         "use_layer_norm": bool(first_cfg.use_layer_norm),
         "use_residual": bool(first_cfg.use_residual),
+        "conv_channels": int(first_cfg.conv_channels),
+        "conv_layers": int(first_cfg.conv_layers),
+        "conv_kernel_size": int(first_cfg.conv_kernel_size),
+        "conv_dropout": float(first_cfg.conv_dropout),
         "num_classes": int(first_cfg.num_classes),
         "evaluation": eval_out
     }

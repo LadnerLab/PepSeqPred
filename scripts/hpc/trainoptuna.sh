@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=ffnn_optuna
+#SBATCH --job-name=pepseqpred_optuna
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=20
@@ -7,8 +7,8 @@
 #SBATCH --gpus-per-node=a100:4
 #SBATCH --mem=448G
 #SBATCH --time=48:00:00
-#SBATCH --output=/scratch/%u/optuna_ffnn/%j/%x.out
-#SBATCH --error=/scratch/%u/optuna_ffnn/%j/%x.err
+#SBATCH --output=/scratch/%u/optuna_train/%j/%x.out
+#SBATCH --error=/scratch/%u/optuna_train/%j/%x.err
 
 # for testing
 USE_SRUN="${USE_SRUN:-1}"
@@ -18,6 +18,13 @@ usage() {
     echo "Usage: $0 <embedding_dirs...> -- <label_shards...>"
     echo "  embedding_dirs: one or more directories containing per-protein embeddings (.pt)"
     echo "  label_shards: one or more label shard .pt files"
+    echo "  SPLIT_STRATEGY default: size-balanced"
+    echo "  SPLIT_REPORT_JSON default: unset (<save-path>/split_report.json)"
+    echo "  THRESHOLD_POLICY default: max-recall-min-precision"
+    echo "  THRESHOLD_MIN_PRECISION default: 0.25"
+    echo "  THRESHOLD_MIN_RECALL default: 0.80"
+    echo "  THRESHOLD_FIXED_VALUE default: 0.50"
+    echo "  SEQ_LEN_FEATURE default: none (none, raw, inverse)"
     echo ""
     echo "Example:"
     echo "  $0 /scratch/$USER/embeddings/shard1 /scratch/$USER/embeddings/shard2 -- /scratch/$USER/labels/labels_00.pt /scratch/$USER/labels/labels_01.pt"
@@ -51,17 +58,23 @@ if [ "${#EMBEDDING_DIRS[@]}" -eq 0 ] || [ "${#LABEL_SHARDS[@]}" -eq 0 ]; then
 fi
 
 # tuning controls
-STUDY_NAME="${STUDY_NAME:-ffnn_optuna_v1}"
+STUDY_NAME="${STUDY_NAME:-train_optuna_v1}"
 N_TRIALS="${N_TRIALS:-20}"
 EPOCHS="${EPOCHS:-15}"
 SEED="${SEED:-42}"
 METRIC="${METRIC:-pr_auc}"
+THRESHOLD_POLICY="${THRESHOLD_POLICY:-max-recall-min-precision}"
+THRESHOLD_MIN_PRECISION="${THRESHOLD_MIN_PRECISION:-0.25}"
+THRESHOLD_MIN_RECALL="${THRESHOLD_MIN_RECALL:-0.80}"
+THRESHOLD_FIXED_VALUE="${THRESHOLD_FIXED_VALUE:-0.50}"
 VAL_FRAC="${VAL_FRAC:-0.2}"
+SPLIT_STRATEGY="${SPLIT_STRATEGY:-size-balanced}"
+SPLIT_REPORT_JSON="${SPLIT_REPORT_JSON:-}"
 SUBSET="${SUBSET:-0}"
 NUM_WORKERS="${NUM_WORKERS:-1}"
 WINDOW_SIZE="${WINDOW_SIZE:-1000}"
 STRIDE="${STRIDE:-900}"
-POS_WEIGHT="${POS_WEIGHT:-13.18999647945325}" # calculated from other script
+POS_WEIGHT="${POS_WEIGHT:-}" # optional manual override; empty uses train-only auto-compute
 SPLIT_TYPE="${SPLIT_TYPE:-id-family}" # id-family or id
 
 # output paths
@@ -72,11 +85,19 @@ CSV_PATH="${CSV_PATH:-/scratch/$USER/optuna/${STUDY_NAME}_trials.csv}"
 STORAGE="${STORAGE:-sqlite:////scratch/$USER/optuna/${STUDY_NAME}.db}"
 
 # architecture search space
+MODEL_HEAD="${MODEL_HEAD:-ffnn}" # ffnn or conv1d
+SEQ_LEN_FEATURE="${SEQ_LEN_FEATURE:-none}" # none, raw, inverse
 ARCH_MODE="${ARCH_MODE:-flat}" # flat, bottleneck, pyramid
 DEPTH_MIN="${DEPTH_MIN:-2}"
 DEPTH_MAX="${DEPTH_MAX:-6}"
 WIDTH_MIN="${WIDTH_MIN:-64}"
 WIDTH_MAX="${WIDTH_MAX:-512}"
+CONV_CHANNEL_CHOICES="${CONV_CHANNEL_CHOICES:-32,64,128}"
+CONV_LAYERS_MIN="${CONV_LAYERS_MIN:-1}"
+CONV_LAYERS_MAX="${CONV_LAYERS_MAX:-3}"
+CONV_KERNEL_SIZE_CHOICES="${CONV_KERNEL_SIZE_CHOICES:-3,5,9,15}"
+CONV_DROPOUT_MIN="${CONV_DROPOUT_MIN:-0.0}"
+CONV_DROPOUT_MAX="${CONV_DROPOUT_MAX:-0.25}"
 
 # optimizer search space
 LR_MIN="${LR_MIN:-1e-4}"
@@ -93,7 +114,7 @@ TIMEOUT_S="${TIMEOUT_S:-0}" # timeout in seconds
 mkdir -p "$SAVE_PATH"
 mkdir -p "$(dirname "$CSV_PATH")"
 mkdir -p "/scratch/$USER/optuna"
-mkdir -p "/scratch/$USER/optuna_ffnn/$SLURM_JOB_ID"
+mkdir -p "/scratch/$USER/optuna_train/$SLURM_JOB_ID"
 
 # load Python Conda environment
 module purge
@@ -113,7 +134,17 @@ fi
 DDP_TIMEOUT_MIN="${DDP_TIMEOUT_MIN:-60}"
 export PEPSEQPRED_DDP_TIMEOUT_MIN="$DDP_TIMEOUT_MIN"
 
-${LAUNCHER} torchrun --nproc_per_node=4 train_ffnn_optuna.pyz \
+POS_WEIGHT_ARGS=()
+if [ -n "$POS_WEIGHT" ]; then
+    POS_WEIGHT_ARGS+=(--pos-weight "$POS_WEIGHT")
+fi
+
+SPLIT_REPORT_ARGS=()
+if [ -n "$SPLIT_REPORT_JSON" ]; then
+    SPLIT_REPORT_ARGS+=(--split-report-json "$SPLIT_REPORT_JSON")
+fi
+
+${LAUNCHER} torchrun --nproc_per_node=4 train_optuna.pyz \
     --embedding-dirs "${EMBEDDING_DIRS[@]}" \
     --label-shards "${LABEL_SHARDS[@]}" \
     --study-name "$STUDY_NAME" \
@@ -122,8 +153,16 @@ ${LAUNCHER} torchrun --nproc_per_node=4 train_ffnn_optuna.pyz \
     --epochs "$EPOCHS" \
     --seed "$SEED" \
     --metric "$METRIC" \
+    --model-head "$MODEL_HEAD" \
+    --seq-len-feature "$SEQ_LEN_FEATURE" \
+    --threshold-policy "$THRESHOLD_POLICY" \
+    --threshold-min-precision "$THRESHOLD_MIN_PRECISION" \
+    --threshold-min-recall "$THRESHOLD_MIN_RECALL" \
+    --threshold-fixed-value "$THRESHOLD_FIXED_VALUE" \
     --val-frac "$VAL_FRAC" \
     --split-type "$SPLIT_TYPE" \
+    --split-strategy "$SPLIT_STRATEGY" \
+    "${SPLIT_REPORT_ARGS[@]}" \
     --subset "$SUBSET" \
     --num-workers "$NUM_WORKERS" \
     --save-path "$SAVE_PATH" \
@@ -133,15 +172,21 @@ ${LAUNCHER} torchrun --nproc_per_node=4 train_ffnn_optuna.pyz \
     --depth-max "$DEPTH_MAX" \
     --width-min "$WIDTH_MIN" \
     --width-max "$WIDTH_MAX" \
+    --conv-channel-choices "$CONV_CHANNEL_CHOICES" \
+    --conv-layers-min "$CONV_LAYERS_MIN" \
+    --conv-layers-max "$CONV_LAYERS_MAX" \
+    --conv-kernel-size-choices "$CONV_KERNEL_SIZE_CHOICES" \
+    --conv-dropout-min "$CONV_DROPOUT_MIN" \
+    --conv-dropout-max "$CONV_DROPOUT_MAX" \
     --batch-sizes "$BATCH_SIZES" \
     --lr-min "$LR_MIN" \
     --lr-max "$LR_MAX" \
     --wd-min "$WD_MIN" \
     --wd-max "$WD_MAX" \
-    --pos-weight "$POS_WEIGHT" \
+    "${POS_WEIGHT_ARGS[@]}" \
     --pruner-warmup "$PRUNER_WARMUP" \
     --timeout-s "$TIMEOUT_S" \
     --window-size "$WINDOW_SIZE" \
     --stride "$STRIDE"
 
-# USAGE: sbatch trainffnnoptuna.sh /scratch/$USER/esm2/artifacts/pts/shard_000 /scratch/$USER/esm2/artifacts/pts/shard_001 /scratch/$USER/esm2/artifacts/pts/shard_002 /scratch/$USER/esm2/artifacts/pts/shard_003 -- /scratch/$USER/labels/labels_shard_000.pt /scratch/$USER/labels/labels_shard_001.pt /scratch/$USER/labels/labels_shard_002.pt /scratch/$USER/labels/labels_shard_003.pt
+# USAGE: sbatch trainoptuna.sh /scratch/$USER/esm2/artifacts/pts/shard_000 /scratch/$USER/esm2/artifacts/pts/shard_001 /scratch/$USER/esm2/artifacts/pts/shard_002 /scratch/$USER/esm2/artifacts/pts/shard_003 -- /scratch/$USER/labels/labels_shard_000.pt /scratch/$USER/labels/labels_shard_001.pt /scratch/$USER/labels/labels_shard_002.pt /scratch/$USER/labels/labels_shard_003.pt

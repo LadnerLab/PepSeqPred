@@ -23,7 +23,10 @@ usage() {
     echo "  USE_SRUN           default: 1 (set 0 to run without srun)"
     echo "  MODEL_NAME         default: esm2_t33_650M_UR50D"
     echo "  MAX_TOKENS         default: 1022"
+    echo "  SEQ_LEN_FEATURE    default: auto (auto, none, raw, inverse)"
     echo "  THRESHOLD          default: unset (use checkpoint threshold)"
+    echo "  ENSEMBLE_AGGREGATION default: majority"
+    echo "  ENSEMBLE_THRESHOLD default: unset"
     echo "  ENSEMBLE_SET_INDEX default: 1 (schema v2 manifest only)"
     echo "  K_FOLDS            default: unset (use all valid members)"
     echo "  LOG_DIR            default: logs"
@@ -58,7 +61,10 @@ OUTPUT_FASTA="$3"
 
 MODEL_NAME="${MODEL_NAME:-esm2_t33_650M_UR50D}"
 MAX_TOKENS="${MAX_TOKENS:-1022}"
+SEQ_LEN_FEATURE="${SEQ_LEN_FEATURE:-auto}"
 THRESHOLD="${THRESHOLD:-}"
+ENSEMBLE_AGGREGATION="${ENSEMBLE_AGGREGATION:-majority}"
+ENSEMBLE_THRESHOLD="${ENSEMBLE_THRESHOLD:-}"
 ENSEMBLE_SET_INDEX="${ENSEMBLE_SET_INDEX:-1}"
 K_FOLDS="${K_FOLDS:-}"
 LOG_DIR="${LOG_DIR:-logs}"
@@ -76,6 +82,7 @@ CLI_ARGS=(
     --output-fasta "${OUTPUT_FASTA}"
     --model-name "${MODEL_NAME}"
     --max-tokens "${MAX_TOKENS}"
+    --seq-len-feature "${SEQ_LEN_FEATURE}"
     --log-dir "${LOG_DIR}"
     --log-level "${LOG_LEVEL}"
     --log-json
@@ -83,6 +90,8 @@ CLI_ARGS=(
 
 # optional decision threshold passes
 [ -n "${THRESHOLD}" ] && CLI_ARGS+=(--threshold "${THRESHOLD}")
+[ -n "${ENSEMBLE_AGGREGATION}" ] && CLI_ARGS+=(--ensemble-aggregation "${ENSEMBLE_AGGREGATION}")
+[ -n "${ENSEMBLE_THRESHOLD}" ] && CLI_ARGS+=(--ensemble-threshold "${ENSEMBLE_THRESHOLD}")
 [ -n "${ENSEMBLE_SET_INDEX}" ] && CLI_ARGS+=(--ensemble-set-index "${ENSEMBLE_SET_INDEX}")
 [ -n "${K_FOLDS}" ] && CLI_ARGS+=(--k-folds "${K_FOLDS}")
 

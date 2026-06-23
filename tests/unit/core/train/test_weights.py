@@ -7,6 +7,7 @@ import torch
 import pepseqpred.core.train.weights as weights_mod
 from pepseqpred.core.train.weights import (
     compute_pos_neg_counts,
+    global_pos_neg_counts,
     global_pos_weight,
     pos_weight_from_label_shards
 )
@@ -68,6 +69,28 @@ def test_compute_pos_neg_counts_with_and_without_masks():
 
 def test_global_pos_weight_without_ddp_uses_safe_denominator():
     assert global_pos_weight(local_pos=0, local_neg=9, ddp=None) == pytest.approx(9.0)
+
+
+def test_global_pos_neg_counts_without_ddp_returns_local_counts():
+    assert global_pos_neg_counts(local_pos=2, local_neg=5, ddp=None) == (2, 5)
+
+
+def test_global_pos_neg_counts_with_ddp_all_reduce(monkeypatch):
+    original_tensor = torch.tensor
+
+    def _cpu_tensor(data, device=None, **kwargs):
+        _ = device
+        return original_tensor(data, device=torch.device("cpu"), **kwargs)
+
+    def _all_reduce(t, op):
+        assert op == weights_mod.dist.ReduceOp.SUM
+        t[0] += 4
+        t[1] += 6
+
+    monkeypatch.setattr(weights_mod.torch, "tensor", _cpu_tensor)
+    monkeypatch.setattr(weights_mod.dist, "all_reduce", _all_reduce)
+
+    assert global_pos_neg_counts(local_pos=1, local_neg=2, ddp={"rank": 0}) == (5, 8)
 
 
 def test_global_pos_weight_with_ddp_all_reduce(monkeypatch):

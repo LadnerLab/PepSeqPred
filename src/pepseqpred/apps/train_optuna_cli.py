@@ -1,9 +1,9 @@
-"""train_ffnn_optuna_cli.py
+"""train_optuna_cli.py
 
-This CLI is very similar to `train_ffnn_cli.py`, except it optimizes for the best possible hyperparameters
-within the user-defined ranges in the shell script `scripts/hpc/trainffnnoptuna.sh`.
+This CLI is very similar to `train_cli.py`, except it optimizes for the best possible hyperparameters
+within the user-defined ranges in the shell script `scripts/hpc/trainoptuna.sh`.
 
-Handles end-to-end training, evaluation, and hyperparameter optimization of a PepSeqPredFFNN with the goal 
+Handles end-to-end training, evaluation, and hyperparameter optimization of a PepSeqPred model head with the goal 
 to predict the locations of antibody epitopes within a protein sequence downstream. The resulting model 
 will make binary predictions: definite epitope or not epitope, it handles residues labeled uncertain through
 a masking process.
@@ -17,14 +17,15 @@ recommend several hours to a few days are allocated per Optuna study session.
 
 Usage
 -----
->>> # from scripts/hpc/trainffnnoptuna.sh (see shell script for CLI config)
->>> sbatch trainffnnoptuna.sh /path/to/emb_shard_dir0 ... /path/to/emb_shard_dirN -- \\ 
+>>> # from scripts/hpc/trainoptuna.sh (see shell script for CLI config)
+>>> sbatch trainoptuna.sh /path/to/emb_shard_dir0 ... /path/to/emb_shard_dirN -- \\ 
                               /path/to/label_shard0.pt ... /path/to/label_shardN.pt
 """
 
 
 import argparse
 import json
+import math
 import time
 import random
 from pathlib import Path
@@ -38,18 +39,36 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from pepseqpred.core.io.logger import setup_logger
 from pepseqpred.core.io.write import append_csv_row
 from pepseqpred.core.data.proteindataset import ProteinDataset, pad_collate
-from pepseqpred.core.models.ffnn import PepSeqFFNN
+from pepseqpred.core.models.factory import (
+    MODEL_HEADS,
+    PepSeqModelConfig,
+    build_pepseq_model,
+    model_config_to_dict,
+    validate_model_config
+)
 from pepseqpred.core.train.trainer import Trainer, TrainerConfig
 from pepseqpred.core.train.ddp import init_ddp
 from pepseqpred.core.train.split import (
+    SPLIT_STRATEGIES,
     split_ids,
     split_ids_grouped,
+    split_ids_label_stratified,
+    build_label_support_by_id,
+    build_split_report,
     partition_ids_weighted,
     sort_ids_for_locality
 )
-from pepseqpred.core.train.weights import pos_weight_from_label_shards
+from pepseqpred.core.train.weights import (
+    compute_pos_neg_counts,
+    global_pos_neg_counts
+)
+from pepseqpred.core.train.threshold import THRESHOLD_POLICIES
 from pepseqpred.core.train.embedding import infer_emb_dim
 from pepseqpred.core.train.seed import set_all_seeds
+from pepseqpred.core.data.seq_len_feature import (
+    EMBEDDING_SEQ_LEN_FEATURES,
+    cli_seq_len_feature_to_model
+)
 
 
 def _broadcast_params(params: Dict[str, Any], ddp: Dict[str, Any] | None) -> Dict[str, Any]:
@@ -59,6 +78,46 @@ def _broadcast_params(params: Dict[str, Any], ddp: Dict[str, Any] | None) -> Dic
     obj = [params]
     dist.broadcast_object_list(obj, src=0)
     return obj[0]
+
+
+def _finite_or_none(value: Any) -> float | None:
+    """Tries to convert number to float if finite, otherwise returns None."""
+    try:
+        num = float(value)
+    except (TypeError, ValueError):
+        return None
+    return num if math.isfinite(num) else None
+
+
+def _parse_int_choices(raw: str, flag: str) -> Tuple[int, ...]:
+    """Parse a comma-separated list of integer choices."""
+    values: list[int] = []
+    for token in str(raw).split(","):
+        token = token.strip()
+        if not token:
+            continue
+        try:
+            values.append(int(token))
+        except ValueError as e:
+            raise ValueError(f"{flag} must contain only integers") from e
+    if len(values) < 1:
+        raise ValueError(f"{flag} must include at least one value")
+    return tuple(values)
+
+
+def _split_summary_csv_fields(
+    prefix: str,
+    summary: Dict[str, Any] | None
+) -> Dict[str, Any]:
+    """Flattens split report summary fields for trial CSV artifacts."""
+    summary = summary or {}
+    return {
+        f"{prefix}Proteins": _finite_or_none(summary.get("protein_count")),
+        f"{prefix}ValidResidues": _finite_or_none(summary.get("valid_residues")),
+        f"{prefix}PosResidues": _finite_or_none(summary.get("positive_residues")),
+        f"{prefix}NegResidues": _finite_or_none(summary.get("negative_residues")),
+        f"{prefix}PositiveRate": _finite_or_none(summary.get("positive_rate")),
+    }
 
 
 def build_hidden_sizes(trial: optuna.trial.Trial,
@@ -124,7 +183,7 @@ def build_hidden_sizes(trial: optuna.trial.Trial,
 def main() -> None:
     """Parses CLI arguments and runs Optuna study."""
     parser = argparse.ArgumentParser(
-        description="Optuna tuning CLI for PepSeqPredFFNN.")
+        description="Optuna tuning CLI for PepSeqPred model heads.")
     parser.add_argument("--embedding-dirs",
                         nargs="+",
                         required=True,
@@ -161,6 +220,37 @@ def main() -> None:
                         choices=["precision", "recall",
                                  "f1", "mcc", "auc", "pr_auc"],
                         help="Metric to maximize")
+    parser.add_argument("--model-head",
+                        action="store",
+                        dest="model_head",
+                        type=str,
+                        choices=list(MODEL_HEADS),
+                        default="ffnn",
+                        help="Classifier head to tune.")
+    parser.add_argument("--seq-len-feature",
+                        action="store",
+                        dest="seq_len_feature",
+                        type=str,
+                        choices=list(EMBEDDING_SEQ_LEN_FEATURES),
+                        default="none",
+                        help="Sequence-length feature mode used in embedding tensors.")
+    parser.add_argument("--threshold-policy",
+                        type=str,
+                        default="max-recall-min-precision",
+                        choices=list(THRESHOLD_POLICIES),
+                        help="Validation threshold selection policy.")
+    parser.add_argument("--threshold-min-precision",
+                        type=float,
+                        default=0.25,
+                        help="Minimum precision for max-recall-min-precision threshold selection.")
+    parser.add_argument("--threshold-min-recall",
+                        type=float,
+                        default=0.80,
+                        help="Minimum recall for min-recall-max-precision threshold selection.")
+    parser.add_argument("--threshold-fixed-value",
+                        type=float,
+                        default=0.50,
+                        help="Fixed threshold used when --threshold-policy=fixed.")
     parser.add_argument("--val-frac",
                         type=float,
                         default=0.2,
@@ -174,6 +264,15 @@ def main() -> None:
                         default="id-family",
                         choices=["id", "id-family"],
                         help="Data partition type, use ID only or ID and taxonomic family.")
+    parser.add_argument("--split-strategy",
+                        type=str,
+                        default="size-balanced",
+                        choices=list(SPLIT_STRATEGIES),
+                        help="Split assignment strategy. Default preserves existing size-balanced behavior.")
+    parser.add_argument("--split-report-json",
+                        type=Path,
+                        default=None,
+                        help="Optional split report JSON path. Defaults to <save-path>/split_report.json.")
     parser.add_argument("--num-workers",
                         type=int,
                         default=4,
@@ -183,7 +282,7 @@ def main() -> None:
                         action="store",
                         type=float,
                         default=None,
-                        help="Optionally include a pre-calculated postive class weight")
+                        help="Optional manual positive class weight; omitted means compute from the current training split")
     parser.add_argument("--save-path",
                         type=Path,
                         default=Path("checkpoints/ffnn_optuna"),
@@ -217,6 +316,30 @@ def main() -> None:
                         type=str,
                         default="32,64,128",
                         help="Comma separated batch sizes")
+    parser.add_argument("--conv-channel-choices",
+                        type=str,
+                        default="32,64,128",
+                        help="Comma-separated Conv1d channel choices used when --model-head=conv1d.")
+    parser.add_argument("--conv-layers-min",
+                        type=int,
+                        default=1,
+                        help="Minimum Conv1d layers used when --model-head=conv1d.")
+    parser.add_argument("--conv-layers-max",
+                        type=int,
+                        default=3,
+                        help="Maximum Conv1d layers used when --model-head=conv1d.")
+    parser.add_argument("--conv-kernel-size-choices",
+                        type=str,
+                        default="3,5,9,15",
+                        help="Comma-separated odd Conv1d kernel choices used when --model-head=conv1d.")
+    parser.add_argument("--conv-dropout-min",
+                        type=float,
+                        default=0.0,
+                        help="Minimum Conv1d dropout used when --model-head=conv1d.")
+    parser.add_argument("--conv-dropout-max",
+                        type=float,
+                        default=0.25,
+                        help="Maximum Conv1d dropout used when --model-head=conv1d.")
     parser.add_argument("--lr-min",
                         type=float,
                         default=1e-4,
@@ -233,9 +356,6 @@ def main() -> None:
                         type=float,
                         default=1e-2,
                         help="Max weight decay")
-    parser.add_argument("--use-pos-weight",
-                        action="store_true",
-                        help="Use positive weight to handle positive vs. negative class imbalances.")
     parser.add_argument("--pruner-warmup",
                         type=int,
                         default=2,
@@ -249,13 +369,13 @@ def main() -> None:
                         dest="window_size",
                         type=int,
                         default=1000,
-                        help="Window size for long protein sequences (<= 0 to disable)")
+                        help="Training window size for long protein sequences (<= 0 to disable; validation uses full proteins)")
     parser.add_argument("--stride",
                         action="store",
                         dest="stride",
                         type=int,
                         default=900,
-                        help="Stride between windows for long proteins")
+                        help="Stride between training windows for long proteins")
     parser.add_argument("--no-collapse-labels",
                         dest="collapse_labels",
                         action="store_false",
@@ -263,7 +383,7 @@ def main() -> None:
     parser.add_argument("--no-pad-last-window",
                         dest="pad_last_window",
                         action="store_false",
-                        help="Disable padding of final short window")
+                        help="Disable padding of final short training window")
     parser.add_argument("--no-cache-label-shard",
                         dest="cache_current_label_shard",
                         action="store_false",
@@ -273,10 +393,24 @@ def main() -> None:
                         action="store_false",
                         help="Keep labels in memory after each protein is processed")
     args = parser.parse_args()
+    if args.threshold_min_precision < 0.0 or args.threshold_min_precision > 1.0:
+        raise ValueError("--threshold-min-precision must be in [0.0, 1.0]")
+    if args.threshold_min_recall < 0.0 or args.threshold_min_recall > 1.0:
+        raise ValueError("--threshold-min-recall must be in [0.0, 1.0]")
+    if args.threshold_fixed_value <= 0.0 or args.threshold_fixed_value >= 1.0:
+        raise ValueError("--threshold-fixed-value must be between (0.0, 1.0)")
+    if args.conv_layers_min < 1:
+        raise ValueError("--conv-layers-min must be >= 1")
+    if args.conv_layers_max < args.conv_layers_min:
+        raise ValueError("--conv-layers-max must be >= --conv-layers-min")
+    if args.conv_dropout_min < 0.0 or args.conv_dropout_min > 1.0:
+        raise ValueError("--conv-dropout-min must be in [0.0, 1.0]")
+    if args.conv_dropout_max < args.conv_dropout_min or args.conv_dropout_max > 1.0:
+        raise ValueError("--conv-dropout-max must be in [--conv-dropout-min, 1.0]")
 
     args.save_path.mkdir(parents=True, exist_ok=True)
     logger = setup_logger(json_lines=True, json_indent=2,
-                          name="optuna_train_ffnn")
+                          name="train_optuna_cli")
 
     ddp = init_ddp()
     rank = ddp["rank"] if ddp is not None else 0
@@ -318,24 +452,55 @@ def main() -> None:
     if args.subset > 0:
         protein_ids = protein_ids[:args.subset]
 
-    # parition data by ID + family or just ID
-    if args.split_type == "id-family":
-        family_groups: Dict[str, str] = {}
-        missing_family_ids = 0
+    split_report_json = args.split_report_json or (
+        args.save_path / "split_report.json")
 
-        for protein_id in protein_ids:
-            family = base_dataset.embedding_family_by_id.get(protein_id)
-            if family is None or str(family).strip() == "":
-                # singleton group when family missing fallback
-                family_groups[protein_id] = f"__missing_family__:{protein_id}"
-                missing_family_ids += 1
-            else:
-                family_groups[protein_id] = str(family)
+    # partition data by ID + family or just ID
+    family_groups: Dict[str, str] = {}
+    missing_family_ids = 0
+    for protein_id in protein_ids:
+        family = base_dataset.embedding_family_by_id.get(protein_id)
+        if family is None or str(family).strip() == "":
+            family_groups[protein_id] = f"__missing_family__:{protein_id}"
+            missing_family_ids += 1
+        else:
+            family_groups[protein_id] = str(family)
+    split_groups = (
+        family_groups
+        if args.split_type == "id-family"
+        else {protein_id: protein_id for protein_id in protein_ids}
+    )
 
+    if ddp is None or rank == 0:
+        label_support_by_id = build_label_support_by_id(
+            protein_ids,
+            base_dataset.label_index,
+        )
+    else:
+        label_support_by_id = {}
+    if ddp is not None:
+        obj = [label_support_by_id]
+        dist.broadcast_object_list(obj, src=0)
+        label_support_by_id = obj[0]
+
+    if args.split_strategy == "label-stratified":
+        train_ids_all, val_ids_all = split_ids_label_stratified(
+            protein_ids,
+            args.val_frac,
+            seed,
+            split_groups,
+            label_support_by_id,
+        )
+    elif args.split_type == "id-family":
         train_ids_all, val_ids_all = split_ids_grouped(
             protein_ids, args.val_frac, seed, family_groups
         )
+    else:
+        train_ids_all, val_ids_all = split_ids(
+            protein_ids, args.val_frac, seed
+        )
 
+    if args.split_type == "id-family":
         train_families = {family_groups[pid] for pid in train_ids_all}
         val_families = {family_groups[pid] for pid in val_ids_all}
         overlap = train_families & val_families
@@ -343,23 +508,53 @@ def main() -> None:
             raise RuntimeError(
                 f"Family leakage detected for split_type='id-family': n_overlap={len(overlap)}"
             )
-
-        if rank == 0:
-            logger.info("family_split_summary",
-                        extra={"extra": {
-                            "split_type": args.split_type,
-                            "train_ids": len(train_ids_all),
-                            "val_ids": len(val_ids_all),
-                            "val_families": len(val_families),
-                            "missing_family_ids": missing_family_ids
-                        }})
     else:
-        train_ids_all, val_ids_all = split_ids(
-            protein_ids, args.val_frac, seed
-        )
+        val_families = set()
 
     if len(train_ids_all) == 0:
         raise ValueError("Global split produced 0 train IDs")
+
+    split_report_payload = None
+    train_split_summary: Dict[str, Any] = {}
+    val_split_summary: Dict[str, Any] = {}
+    if rank == 0:
+        split_report_payload = build_split_report(
+            run_splits=[
+                {
+                    "run_index": 1,
+                    "train_mode": "optuna-holdout",
+                    "split_seed": int(seed),
+                    "train_seed": int(seed),
+                    "fold_index": None,
+                    "n_folds": 1,
+                    "ensemble_set_index": None,
+                    "train_ids": train_ids_all,
+                    "val_ids": val_ids_all,
+                }
+            ],
+            support_by_id=label_support_by_id,
+            families_by_id=family_groups,
+            split_type=str(args.split_type),
+            split_strategy=str(args.split_strategy),
+        )
+        split_report_json.parent.mkdir(parents=True, exist_ok=True)
+        split_report_json.write_text(
+            json.dumps(split_report_payload, indent=2, allow_nan=False),
+            encoding="utf-8",
+        )
+        split_entry = split_report_payload["runs"][0]
+        train_split_summary = dict(split_entry["train"])
+        val_split_summary = dict(split_entry["validation"])
+        logger.info("family_split_summary",
+                    extra={"extra": {
+                        "split_type": args.split_type,
+                        "split_strategy": args.split_strategy,
+                        "split_report_json": str(split_report_json),
+                        "train_ids": len(train_ids_all),
+                        "val_ids": len(val_ids_all),
+                        "val_families": len(val_families),
+                        "missing_family_ids": missing_family_ids
+                    }})
 
     # weight by embedding file size to reduce I/O
     id_weights: Dict[str, float] = {}
@@ -458,10 +653,10 @@ def main() -> None:
             protein_ids=val_ids,
             label_index=base_dataset.label_index,
             embedding_index=base_dataset.embedding_index,
-            window_size=args.window_size if args.window_size > 0 else None,
-            stride=args.stride,
+            window_size=None,
+            stride=1,
             collapse_labels=args.collapse_labels,
-            pad_last_window=args.pad_last_window,
+            pad_last_window=False,
             return_meta=False,
             cache_current_label_shard=args.cache_current_label_shard,
             drop_label_after_use=args.drop_label_after_use
@@ -473,6 +668,60 @@ def main() -> None:
                    for x in args.batch_sizes.split(",") if x.strip()]
     if len(batch_sizes) == 0:
         raise ValueError("No batch sizes provided")
+    conv_channel_choices = _parse_int_choices(
+        args.conv_channel_choices,
+        "--conv-channel-choices",
+    )
+    conv_kernel_size_choices = _parse_int_choices(
+        args.conv_kernel_size_choices,
+        "--conv-kernel-size-choices",
+    )
+    bad_kernels = [x for x in conv_kernel_size_choices if x < 1 or x % 2 != 1]
+    if bad_kernels:
+        raise ValueError(
+            "--conv-kernel-size-choices must contain only positive odd integers"
+        )
+
+    # resolve positive class weight once from the current training split
+    pos_weight_source = "cli"
+    train_pos_residues = None
+    train_neg_residues = None
+    if args.pos_weight is not None:
+        resolved_pos_weight = float(args.pos_weight)
+    else:
+        count_loader_kwargs = {
+            "batch_size": batch_sizes[0],
+            "shuffle": False,
+            "num_workers": args.num_workers,
+            "pin_memory": pin,
+            "collate_fn": pad_collate
+        }
+        if args.num_workers > 0:
+            count_loader_kwargs["multiprocessing_context"] = "spawn"
+            count_loader_kwargs["prefetch_factor"] = 4
+
+        count_loader = DataLoader(train_data, **count_loader_kwargs)
+        local_pos, local_neg = compute_pos_neg_counts(count_loader)
+        train_pos_residues, train_neg_residues = global_pos_neg_counts(
+            local_pos,
+            local_neg,
+            ddp
+        )
+        resolved_pos_weight = float(train_neg_residues / max(train_pos_residues, 1))
+        pos_weight_source = "train_loader"
+
+    if rank == 0:
+        logger.info(
+            "pos_weight_resolved",
+            extra={
+                "extra": {
+                    "source": pos_weight_source,
+                    "train_pos_residues": train_pos_residues,
+                    "train_neg_residues": train_neg_residues,
+                    "pos_weight": float(resolved_pos_weight)
+                }
+            }
+        )
 
     # setup Optuna study
     emb_dim = infer_emb_dim(base_dataset.embedding_index)
@@ -516,13 +765,42 @@ def main() -> None:
         wd = trial.suggest_float(
             "weight_decay", args.wd_min, args.wd_max, log=True)
         batch_size = trial.suggest_categorical("batch_size", batch_sizes)
+        if args.model_head == "conv1d":
+            conv_channels = trial.suggest_categorical(
+                "conv_channels",
+                list(conv_channel_choices),
+            )
+            conv_layers = trial.suggest_int(
+                "conv_layers",
+                args.conv_layers_min,
+                args.conv_layers_max,
+            )
+            conv_kernel_size = trial.suggest_categorical(
+                "conv_kernel_size",
+                list(conv_kernel_size_choices),
+            )
+            conv_dropout = trial.suggest_float(
+                "conv_dropout",
+                args.conv_dropout_min,
+                args.conv_dropout_max,
+            )
+        else:
+            conv_channels = int(conv_channel_choices[0])
+            conv_layers = int(args.conv_layers_min)
+            conv_kernel_size = int(conv_kernel_size_choices[0])
+            conv_dropout = float(args.conv_dropout_min)
 
         return {
+            "model_head": str(args.model_head),
             "hidden_sizes": hidden_sizes,
             "dropouts": dropouts,
             "depth": depth,
             "use_layer_norm": use_layer_norm,
             "use_residual": use_residual,
+            "conv_channels": int(conv_channels),
+            "conv_layers": int(conv_layers),
+            "conv_kernel_size": int(conv_kernel_size),
+            "conv_dropout": float(conv_dropout),
             "learning_rate": lr,
             "weight_decay": wd,
             "batch_size": batch_size
@@ -537,6 +815,10 @@ def main() -> None:
         depth = int(params["depth"])
         use_layer_norm = bool(params["use_layer_norm"])
         use_residual = bool(params["use_residual"])
+        conv_channels = int(params["conv_channels"])
+        conv_layers = int(params["conv_layers"])
+        conv_kernel_size = int(params["conv_kernel_size"])
+        conv_dropout = float(params["conv_dropout"])
         lr = float(params["learning_rate"])
         wd = float(params["weight_decay"])
         batch_size = int(params["batch_size"])
@@ -557,12 +839,24 @@ def main() -> None:
         val_loader = DataLoader(
             val_data, **loader_kwargs) if val_data is not None else None
 
-        model = PepSeqFFNN(emb_dim=emb_dim,
-                           hidden_sizes=hidden_sizes,
-                           dropouts=dropouts,
-                           use_layer_norm=use_layer_norm,
-                           use_residual=use_residual,
-                           num_classes=1)
+        model_config = validate_model_config(
+            PepSeqModelConfig(
+                emb_dim=emb_dim,
+                hidden_sizes=hidden_sizes,
+                dropouts=dropouts,
+                num_classes=1,
+                use_layer_norm=use_layer_norm,
+                use_residual=use_residual,
+                model_head=str(params["model_head"]),
+                conv_channels=conv_channels,
+                conv_layers=conv_layers,
+                conv_kernel_size=conv_kernel_size,
+                conv_dropout=conv_dropout,
+                seq_len_feature=cli_seq_len_feature_to_model(
+                    args.seq_len_feature),
+            )
+        )
+        model = build_pepseq_model(model_config)
 
         device = torch.device(f"cuda:{ddp['local_rank']}") if ddp is not None else torch.device(
             "cuda" if torch.cuda.is_available() else "cpu")
@@ -571,12 +865,8 @@ def main() -> None:
             model = DDP(model, device_ids=[
                         ddp["local_rank"]], output_device=ddp["local_rank"])
 
-        # compute or store positive weight (like class weight)
-        pos_weight = None
-        if args.pos_weight is not None:
-            pos_weight = float(args.pos_weight)
-        else:
-            pos_weight = pos_weight_from_label_shards(label_shards)
+        # use the train-split positive weight resolved before trial search
+        pos_weight = resolved_pos_weight
 
         # setup config and trainer class
         config = TrainerConfig(epochs=args.epochs,
@@ -584,7 +874,11 @@ def main() -> None:
                                learning_rate=lr,
                                weight_decay=wd,
                                device="cuda" if torch.cuda.is_available() else "cpu",
-                               pos_weight=pos_weight)
+                               pos_weight=pos_weight,
+                               threshold_policy=args.threshold_policy,
+                               threshold_min_precision=args.threshold_min_precision,
+                               threshold_min_recall=args.threshold_min_recall,
+                               threshold_fixed_value=args.threshold_fixed_value)
 
         trial_dir = None
         if rank == 0 and trial is not None:
@@ -596,7 +890,8 @@ def main() -> None:
                           train_loader=train_loader,
                           logger=logger,
                           val_loader=val_loader,
-                          config=config)
+                          config=config,
+                          model_config=model_config)
 
         # start and time trial
         start = time.time()
@@ -612,7 +907,9 @@ def main() -> None:
             row: Dict[str, Any] = {
                 "RunID": f"{args.study_name}_trial_{trial.number:04d}",
                 "Timestamp": pd.Timestamp.utcnow().isoformat(),
-                "ModelVersion": "ffnn_optuna",
+                "ModelVersion": "train_optuna",
+                "ModelHead": str(model_config.model_head),
+                "SeqLenFeature": str(args.seq_len_feature),
                 "NumParameters": int(sum(p.numel() for p in model.parameters())),
                 "HiddenLayers": int(depth),
                 "HiddenSizes": ",".join(str(x) for x in hidden_sizes),
@@ -620,11 +917,19 @@ def main() -> None:
                 "Dropout": float(dropouts[0]) if len(dropouts) else 0.0,
                 "UseLayerNorm": bool(use_layer_norm),
                 "UseResidual": bool(use_residual),
+                "ConvChannels": int(model_config.conv_channels),
+                "ConvLayers": int(model_config.conv_layers),
+                "ConvKernelSize": int(model_config.conv_kernel_size),
+                "ConvDropout": float(model_config.conv_dropout),
                 "BatchSize": int(batch_size),
                 "LearningRate": float(lr),
                 "WeightDecay": float(wd),
                 "PosWeight": float(pos_weight) if pos_weight else 1.0,
                 "Epochs": int(args.epochs),
+                "SplitStrategy": str(args.split_strategy),
+                "SplitReportJson": str(split_report_json),
+                **_split_summary_csv_fields("Train", train_split_summary),
+                **_split_summary_csv_fields("Val", val_split_summary),
                 "BestValLossAtScore": float(best_val_loss_at_score),
                 "BestEpoch": int(best_epoch),
                 "Precision": float(best_metrics.get("precision", float("nan"))),
@@ -636,8 +941,12 @@ def main() -> None:
                 "AUC10": float(best_metrics.get("auc10", float("nan"))),
                 "PR_AUC": float(best_metrics.get("pr_auc", float("nan"))),
                 "Threshold": float(best_metrics.get("threshold", float("nan"))),
+                "ThresholdPolicy": str(best_metrics.get("threshold_policy", args.threshold_policy)),
                 "ThresholdStatus": str(best_metrics.get("threshold_status", "")),
                 "ThresholdMinPrecision": float(best_metrics.get("threshold_min_precision", float("nan"))),
+                "ThresholdMinRecall": float(best_metrics.get("threshold_min_recall", float("nan"))),
+                "ThresholdFixedValue": float(best_metrics.get("threshold_fixed_value", float("nan"))),
+                "ThresholdPredPosFrac": float(best_metrics.get("threshold_pred_pos_frac", float("nan"))),
                 "ScoreKey": args.metric,
                 "ScoreValue": float(best_score),
                 "ElapsedSec": float(elapsed),
@@ -650,6 +959,8 @@ def main() -> None:
             trial.set_user_attr("best_val_loss_at_score",
                                 float(best_val_loss_at_score))
             trial.set_user_attr("best_metrics", best_metrics)
+            trial.set_user_attr("seq_len_feature", str(args.seq_len_feature))
+            trial.set_user_attr("model_config", model_config_to_dict(model_config))
 
         return float(best_score)
 
@@ -698,13 +1009,35 @@ def main() -> None:
                         "best_value": float(best.value),
                         "best_params": dict(best.params),
                         "best_user_attrs": dict(best.user_attrs),
-                        "metric": args.metric}
+                        "metric": args.metric,
+                        "model_head": str(args.model_head),
+                        "seq_len_feature": str(args.seq_len_feature),
+                        "split_strategy": str(args.split_strategy),
+                        "split_report_json": str(split_report_json),
+                        "threshold_policy": str(args.threshold_policy),
+                        "threshold_min_precision": float(args.threshold_min_precision),
+                        "threshold_min_recall": float(args.threshold_min_recall),
+                        "threshold_fixed_value": float(args.threshold_fixed_value)}
         best_trial_json.write_text(json.dumps(best_payload, indent=2))
 
         best_trial_dir = Path(best.user_attrs["trial_dir"])
-        src = best_trial_dir / "best_model_by_score.pt"
-        if src.exists():
+        src = next(
+            (
+                path for path in (
+                    best_trial_dir / "best_model_by_score.pt",
+                    best_trial_dir / "fully_connected_by_score.pt",
+                )
+                if path.exists()
+            ),
+            None,
+        )
+        if src is not None:
             best_ckpt_path.write_bytes(src.read_bytes())
+        else:
+            logger.warning(
+                "best_checkpoint_missing",
+                extra={"extra": {"trial_dir": str(best_trial_dir)}}
+            )
 
         logger.info("best_results", extra={"extra": best_payload})
 

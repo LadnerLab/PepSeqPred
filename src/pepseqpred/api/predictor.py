@@ -21,7 +21,8 @@ from pepseqpred.core.predict.inference import (
     embed_protein_seq,
     infer_decision_threshold,
     predict_ensemble_from_embedding,
-    predict_from_embedding
+    predict_from_embedding,
+    resolve_prediction_seq_len_feature,
 )
 
 _DEFAULT_ESM_MODEL = "esm2_t33_650M_UR50D"
@@ -126,6 +127,8 @@ class PepSeqPredictor:
             Name of the ESM backbone used by this predictor instance.
         max_tokens : int
             Maximum residue token budget per ESM pass (excluding CLS/EOS).
+        seq_len_feature : str
+            Resolved sequence-length feature mode used for generated embeddings.
         artifact_mode : str
             Artifact resolution mode (`single-checkpoint` or `ensemble-manifest`).
         artifact_meta : Mapping[str, Any]
@@ -157,6 +160,7 @@ class PepSeqPredictor:
         max_tokens: int,
         artifact_mode: str,
         artifact_meta: Mapping[str, Any],
+        seq_len_feature: str = "none",
         pretrained_meta: Optional[Mapping[str, Any]] = None
     ) -> None:
         """Initialize predictor state from already loaded models and metadata."""
@@ -170,6 +174,7 @@ class PepSeqPredictor:
         self._max_tokens = int(max_tokens)
         self._artifact_mode = artifact_mode
         self._artifact_meta = dict(artifact_meta)
+        self._seq_len_feature = seq_len_feature
         self._pretrained_meta = (
             dict(pretrained_meta) if pretrained_meta is not None else {}
         )
@@ -185,7 +190,8 @@ class PepSeqPredictor:
         model_name: str = _DEFAULT_ESM_MODEL,
         max_tokens: int = 1022,
         device: str = "auto",
-        model_config: Optional[FFNNModelConfig] = None
+        model_config: Optional[FFNNModelConfig] = None,
+        seq_len_feature: str = "auto",
     ) -> "PepSeqPredictor":
         """Build a predictor from a checkpoint `.pt` or manifest `.json` artifact.
 
@@ -207,6 +213,9 @@ class PepSeqPredictor:
                 Device selector string or `"auto"`.
             model_config : FFNNModelConfig | None
                 Optional explicit FFNN architecture config for checkpoint loading.
+            seq_len_feature : str
+                Sequence-length feature override. `"auto"` resolves from checkpoint
+                model_config, with a missing key treated as `"none"`.
 
         Returns
         -------
@@ -286,6 +295,16 @@ class PepSeqPredictor:
                 f"All ensemble members must share emb_dim for shared-embedding inference, "
                 f"got {sorted(emb_dims)}"
             )
+        seq_len_features = {
+            resolve_prediction_seq_len_feature(seq_len_feature, cfg)
+            for cfg in member_model_cfgs
+        }
+        if len(seq_len_features) != 1:
+            raise ValueError(
+                "All ensemble members must share seq_len_feature for shared-embedding inference, "
+                f"got {sorted(seq_len_features)}"
+            )
+        resolved_seq_len_feature = next(iter(seq_len_features))
 
         return cls(
             psp_models=psp_models,
@@ -297,7 +316,8 @@ class PepSeqPredictor:
             model_name=model_name,
             max_tokens=max_tokens,
             artifact_mode=artifact_mode,
-            artifact_meta=artifact_meta
+            artifact_meta=artifact_meta,
+            seq_len_feature=resolved_seq_len_feature,
         )
 
     @classmethod
@@ -309,7 +329,8 @@ class PepSeqPredictor:
         k_folds: Optional[int] = None,
         max_tokens: int = 1022,
         device: str = "auto",
-        model_config: Optional[FFNNModelConfig] = None
+        model_config: Optional[FFNNModelConfig] = None,
+        seq_len_feature: str = "auto",
     ) -> "PepSeqPredictor":
         """Build a predictor from a bundled pretrained model id or alias.
 
@@ -327,6 +348,9 @@ class PepSeqPredictor:
                 Device selector string or `"auto"`.
             model_config : FFNNModelConfig | None
                 Optional explicit FFNN architecture config for checkpoint loading.
+            seq_len_feature : str
+                Sequence-length feature override. `"auto"` resolves from checkpoint
+                model_config, with a missing key treated as `"none"`.
 
         Returns
         -------
@@ -349,7 +373,8 @@ class PepSeqPredictor:
                 model_name=info.expected_esm_model,
                 max_tokens=max_tokens,
                 device=device,
-                model_config=model_config
+                model_config=model_config,
+                seq_len_feature=seq_len_feature,
             )
 
         predictor._pretrained_meta = {
@@ -458,7 +483,8 @@ class PepSeqPredictor:
             "artifact_meta": dict(self._artifact_meta),
             "model_name": self._model_name,
             "device": self._device,
-            "max_tokens": self._max_tokens
+            "max_tokens": self._max_tokens,
+            "seq_len_feature": self._seq_len_feature,
         }
         if self._pretrained_meta:
             meta["pretrained"] = dict(self._pretrained_meta)
@@ -518,7 +544,8 @@ class PepSeqPredictor:
             layer=self._layer,
             batch_converter=self._batch_converter,
             device=self._device,
-            max_tokens=self._max_tokens
+            max_tokens=self._max_tokens,
+            seq_len_feature=self._seq_len_feature,
         )
         payload, used_thresholds = self._predict_from_embedding(
             protein_emb=protein_emb,
@@ -619,7 +646,8 @@ def load_predictor(
     model_name: str = _DEFAULT_ESM_MODEL,
     max_tokens: int = 1022,
     device: str = "auto",
-    model_config: Optional[FFNNModelConfig] = None
+    model_config: Optional[FFNNModelConfig] = None,
+    seq_len_feature: str = "auto",
 ) -> PepSeqPredictor:
     """Create a predictor from an artifact path.
 
@@ -641,6 +669,9 @@ def load_predictor(
             Device selector string or `"auto"`.
         model_config : FFNNModelConfig | None
             Optional explicit FFNN architecture config.
+        seq_len_feature : str
+            Sequence-length feature override. `"auto"` resolves from checkpoint
+            model_config, with a missing key treated as `"none"`.
 
     Returns
     -------
@@ -663,6 +694,7 @@ def load_predictor(
         max_tokens=max_tokens,
         device=device,
         model_config=model_config,
+        seq_len_feature=seq_len_feature,
     )
 
 
@@ -689,7 +721,8 @@ def load_pretrained_predictor(
     k_folds: Optional[int] = None,
     max_tokens: int = 1022,
     device: str = "auto",
-    model_config: Optional[FFNNModelConfig] = None
+    model_config: Optional[FFNNModelConfig] = None,
+    seq_len_feature: str = "auto",
 ) -> PepSeqPredictor:
     """Create a predictor from a bundled pretrained model id or alias.
 
@@ -707,6 +740,9 @@ def load_pretrained_predictor(
             Device selector string or `"auto"`.
         model_config : FFNNModelConfig | None
             Optional explicit FFNN architecture config.
+        seq_len_feature : str
+            Sequence-length feature override. `"auto"` resolves from checkpoint
+            model_config, with a missing key treated as `"none"`.
 
     Returns
     -------
@@ -726,7 +762,8 @@ def load_pretrained_predictor(
         k_folds=k_folds,
         max_tokens=max_tokens,
         device=device,
-        model_config=model_config
+        model_config=model_config,
+        seq_len_feature=seq_len_feature,
     )
 
 
@@ -741,7 +778,8 @@ def predict_sequence(
     model_name: str = _DEFAULT_ESM_MODEL,
     max_tokens: int = 1022,
     device: str = "auto",
-    model_config: Optional[FFNNModelConfig] = None
+    model_config: Optional[FFNNModelConfig] = None,
+    seq_len_feature: str = "auto",
 ) -> PredictionResult:
     """Convenience wrapper that loads a predictor and predicts one sequence.
 
@@ -767,6 +805,9 @@ def predict_sequence(
             Device selector string or `"auto"`.
         model_config : FFNNModelConfig | None
             Optional explicit FFNN architecture config.
+        seq_len_feature : str
+            Sequence-length feature override. `"auto"` resolves from checkpoint
+            model_config, with a missing key treated as `"none"`.
 
     Returns
     -------
@@ -788,7 +829,8 @@ def predict_sequence(
         model_name=model_name,
         max_tokens=max_tokens,
         device=device,
-        model_config=model_config
+        model_config=model_config,
+        seq_len_feature=seq_len_feature,
     )
     return predictor.predict_sequence(
         protein_seq=protein_seq,
@@ -808,7 +850,8 @@ def predict_fasta(
     model_name: str = _DEFAULT_ESM_MODEL,
     max_tokens: int = 1022,
     device: str = "auto",
-    model_config: Optional[FFNNModelConfig] = None
+    model_config: Optional[FFNNModelConfig] = None,
+    seq_len_feature: str = "auto",
 ) -> List[PredictionResult]:
     """Convenience wrapper to predict FASTA input with one artifact load.
 
@@ -834,6 +877,9 @@ def predict_fasta(
             Device selector string or `"auto"`.
         model_config : FFNNModelConfig | None
             Optional explicit FFNN architecture config.
+        seq_len_feature : str
+            Sequence-length feature override. `"auto"` resolves from checkpoint
+            model_config, with a missing key treated as `"none"`.
 
     Returns
     -------
@@ -855,7 +901,8 @@ def predict_fasta(
         model_name=model_name,
         max_tokens=max_tokens,
         device=device,
-        model_config=model_config
+        model_config=model_config,
+        seq_len_feature=seq_len_feature,
     )
     if output_fasta is None:
         return predictor.predict_fasta(

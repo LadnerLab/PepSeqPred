@@ -6,7 +6,7 @@ Defines a modular FFNN classifier with optional layer normalization and
 residual connections, plus a reusable feed-forward block.
 """
 
-from typing import Iterable, Sequence
+from typing import Sequence
 import torch
 import torch.nn as nn
 from .base import PepSeqClassifierBase
@@ -111,7 +111,7 @@ class PepSeqFFNN(PepSeqClassifierBase):
         if len(hidden_sizes) != len(dropouts):
             raise ValueError("hidden_sizes and dropouts must be the same size")
 
-        layers: Iterable[nn.Module] = []
+        layers: list[nn.Module] = []
         in_features = emb_dim
 
         # arbitrary depth FFNN (default is 3 layers)
@@ -140,7 +140,7 @@ class PepSeqFFNN(PepSeqClassifierBase):
         Returns
         -------
             Tensor
-                Logits of shape (B, C), where C is the number of output classes.
+                Logits of shape (B, L).
         """
         if X.dim() != 3:
             raise ValueError(f"Expected shape (B, L, E), got {X.shape}")
@@ -154,4 +154,115 @@ class PepSeqFFNN(PepSeqClassifierBase):
         X = X.view(B * L, D)  # flatten residues
         logits = self.ff_model(X)  # (B * L, 1)
         logits = logits.view(B, L)  # (B, L)
+        return logits
+
+
+class PepSeqConvFFNN(PepSeqClassifierBase):
+    """
+    Residue-level classifier with a lightweight local Conv1d context head.
+
+    The model preserves the same public forward contract as :class:`PepSeqFFNN`:
+    input tensors are shaped `(B, L, E)` and output logits are shaped `(B, L)`.
+    Local residue context is computed by applying Conv1d over the sequence
+    dimension, then concatenating those local features with the original ESM
+    embeddings before the dense FFNN classifier.
+    """
+
+    def __init__(
+        self,
+        emb_dim: int = 1281,
+        hidden_sizes: Sequence[int] = (150, 120, 45),
+        dropouts: Sequence[float] = (0.2, 0.2, 0.2),
+        num_classes: int = 1,
+        use_layer_norm: bool = False,
+        use_residual: bool = False,
+        conv_channels: int = 64,
+        conv_layers: int = 2,
+        conv_kernel_size: int = 9,
+        conv_dropout: float = 0.1,
+    ):
+        super().__init__(emb_dim=emb_dim, num_classes=num_classes)
+
+        if len(hidden_sizes) != len(dropouts):
+            raise ValueError("hidden_sizes and dropouts must be the same size")
+        if int(conv_channels) <= 0:
+            raise ValueError("conv_channels must be > 0")
+        if int(conv_layers) < 1:
+            raise ValueError("conv_layers must be >= 1")
+        if int(conv_kernel_size) < 1 or int(conv_kernel_size) % 2 != 1:
+            raise ValueError("conv_kernel_size must be a positive odd integer")
+        if float(conv_dropout) < 0.0 or float(conv_dropout) > 1.0:
+            raise ValueError("conv_dropout must be in [0.0, 1.0]")
+
+        self.conv_channels = int(conv_channels)
+        self.conv_layers = int(conv_layers)
+        self.conv_kernel_size = int(conv_kernel_size)
+        self.conv_dropout = float(conv_dropout)
+
+        conv_modules: list[nn.Module] = []
+        in_channels = emb_dim
+        padding = self.conv_kernel_size // 2
+        for _ in range(self.conv_layers):
+            conv_modules.append(
+                nn.Conv1d(
+                    in_channels=in_channels,
+                    out_channels=self.conv_channels,
+                    kernel_size=self.conv_kernel_size,
+                    padding=padding,
+                )
+            )
+            conv_modules.append(nn.ReLU())
+            conv_modules.append(nn.Dropout(self.conv_dropout))
+            in_channels = self.conv_channels
+        self.conv_model = nn.Sequential(*conv_modules)
+
+        layers: list[nn.Module] = []
+        in_features = emb_dim + self.conv_channels
+        for hidden_size, p in zip(hidden_sizes, dropouts):
+            layers.append(
+                FFBlock(
+                    in_dim=in_features,
+                    out_dim=hidden_size,
+                    dropout_p=p,
+                    use_layer_norm=use_layer_norm,
+                    use_residual=use_residual,
+                )
+            )
+            in_features = hidden_size
+
+        layers.append(nn.Linear(in_features, num_classes))
+        self.ff_model = nn.Sequential(*layers)
+
+    def forward(self, X: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass for residue-level epitope classification.
+
+        Parameters
+        ----------
+            X : Tensor
+                Input tensor of shape `(B, L, E)`, where B is the batch size,
+                L is the protein length, and E is the embedding dimension.
+
+        Returns
+        -------
+            Tensor
+                Logits of shape `(B, L)`.
+        """
+        if X.dim() != 3:
+            raise ValueError(f"Expected shape (B, L, E), got {X.shape}")
+
+        if X.size(-1) != self.emb_dim:
+            raise ValueError(
+                f"Expected emb_dim {self.emb_dim}, got {X.size(-1)}")
+
+        B, L, D = X.shape
+        local = self.conv_model(X.transpose(1, 2)).transpose(1, 2)
+        if local.shape[:2] != X.shape[:2]:
+            raise ValueError(
+                f"Conv head changed sequence shape from {tuple(X.shape[:2])} "
+                f"to {tuple(local.shape[:2])}"
+            )
+        features = torch.cat((X, local), dim=-1)
+        logits = self.ff_model(features.reshape(B * L, D + self.conv_channels))
+        logits = logits.view(B, L)
         return logits

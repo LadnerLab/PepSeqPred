@@ -8,7 +8,7 @@ import torch
 
 import pepseqpred.apps.esm_cli as esm_cli
 import pepseqpred.apps.labels_cli as labels_cli
-import pepseqpred.apps.train_ffnn_cli as train_cli
+import pepseqpred.apps.train_cli as train_cli
 from pepseqpred.core.io.keys import parse_fullname
 from pepseqpred.core.preprocess.preparedataset import prepare_dataset
 from pepseqpred.core.train.split import split_ids_grouped
@@ -40,7 +40,7 @@ class FakeESMModel(torch.nn.Module):
     def forward(self, batch_tokens, repr_layers, return_contacts=False):
         _ = return_contacts
         batch_size, token_len = batch_tokens.shape
-        rep_dim = 3  # append_seq_len => final emb dim=4
+        rep_dim = 3
         reps = torch.ones((batch_size, token_len, rep_dim),
                           dtype=torch.float32)
         return {"representations": {repr_layers[0]: reps}}
@@ -328,7 +328,7 @@ def test_prepare_dataset_multisource_pipeline_smoke(monkeypatch, tmp_path: Path)
         sys,
         "argv",
         [
-            "train_ffnn_cli.py",
+            "train_cli.py",
             "--embedding-dirs",
             str(emb_dir),
             "--label-shards",

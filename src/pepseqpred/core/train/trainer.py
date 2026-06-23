@@ -7,10 +7,9 @@ metrics, threshold selection, checkpointing, and optional Optuna tuning.
 """
 
 import logging
-import contextlib
 from pathlib import Path
 from dataclasses import dataclass
-from typing import Optional, List, Dict, Any, Tuple
+from typing import Optional, List, Dict, Any, Tuple, Iterator
 import torch
 import torch.nn as nn
 from torch.nn.parallel import DistributedDataParallel as TorchDDP
@@ -19,8 +18,15 @@ import numpy as np
 import optuna
 from .ddp import ddp_rank, ddp_all_reduce_sum, ddp_gather_all_1d
 from .metrics import compute_eval_metrics
-from .threshold import find_threshold_max_recall_min_precision
+from .threshold import select_threshold, threshold_diagnostic_grid
 from .curveartifacts import write_validation_curve_artifacts
+from pepseqpred.core.models.factory import PepSeqModelConfig, model_config_to_dict
+
+
+Batch = (
+    Tuple[torch.Tensor, torch.Tensor]
+    | Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+)
 
 
 @dataclass
@@ -34,6 +40,10 @@ class TrainerConfig:
     # should only train using GPUs (but can be changed to "cpu")
     device: str = "cuda"
     pos_weight: Optional[float] = None
+    threshold_policy: str = "max-recall-min-precision"
+    threshold_min_precision: float = 0.25
+    threshold_min_recall: float = 0.80
+    threshold_fixed_value: float = 0.50
 
 
 @dataclass(frozen=True)
@@ -66,11 +76,13 @@ class Trainer:
                  train_loader: DataLoader,
                  logger: logging.Logger,
                  val_loader: Optional[DataLoader] = None,
-                 config: TrainerConfig = TrainerConfig()):
+                 config: TrainerConfig = TrainerConfig(),
+                 model_config: Optional[PepSeqModelConfig] = None):
         self.model = model
         self.train_loader = train_loader
         self.val_loader = val_loader
         self.config = config
+        self.model_config = model_config
         self.logger = logger
 
         self.device = torch.device(
@@ -102,10 +114,102 @@ class Trainer:
                                  "weight_decay": self.config.weight_decay,
                                  "num_params": num_params,
                                  "has_val_loader": self.val_loader is not None,
-                                 "pos_weight": self.config.pos_weight
+                                 "pos_weight": self.config.pos_weight,
+                                 "threshold_policy": self.config.threshold_policy,
+                                 "threshold_min_precision": self.config.threshold_min_precision,
+                                 "threshold_min_recall": self.config.threshold_min_recall,
+                                 "threshold_fixed_value": self.config.threshold_fixed_value
                              }})
 
-    def _batch_step(self, batch: torch.Tensor, train: bool = True) -> Dict[str, Any]:
+    @staticmethod
+    def _make_zero_valid_dummy_batch(batch: Batch) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Build a minimal graph-compatible batch with no valid residues."""
+        if len(batch) == 2:
+            X, y = batch
+            mask = None
+        elif len(batch) == 3:
+            X, y, mask = batch
+        else:
+            raise ValueError(
+                f"Expected a two- or three-tensor batch, got {len(batch)} elements")
+
+        if X.dim() != 3:
+            raise ValueError(
+                f"Expected embedding shape (B, L, D), got {tuple(X.shape)}")
+        if y.dim() != 2:
+            raise ValueError(
+                f"Expected target shape (B, L), got {tuple(y.shape)}")
+
+        dummy_x = X.new_zeros((1, 1, X.size(-1)))
+        dummy_y = y.new_zeros((1, 1))
+        if mask is None:
+            dummy_mask = torch.zeros(
+                (1, 1), dtype=torch.long, device=y.device)
+        else:
+            dummy_mask = mask.new_zeros((1, 1))
+        return dummy_x, dummy_y, dummy_mask
+
+    def _synchronized_training_batches(
+        self,
+        loader: DataLoader
+    ) -> Iterator[Tuple[Batch, bool]]:
+        """Yield real or zero-valid batches until every DDP rank is exhausted.
+
+        Every rank performs the same active-rank collective before a forward
+        pass. Once a rank exhausts its local loader, it continues yielding a
+        minimal zero-valid batch so custom loss collectives, DDP backward, and
+        optimizer state remain synchronized. The current model heads do not use
+        batch-statistics layers; adding BatchNorm or SyncBatchNorm requires
+        revisiting this dummy-forward behavior.
+        """
+        iterator = iter(loader)
+        dummy_batch: Optional[Tuple[
+            torch.Tensor, torch.Tensor, torch.Tensor
+        ]] = None
+        first_iteration = True
+
+        while True:
+            try:
+                batch = next(iterator)
+                has_local_batch = True
+                if dummy_batch is None:
+                    dummy_batch = self._make_zero_valid_dummy_batch(batch)
+            except StopIteration:
+                batch = None
+                has_local_batch = False
+
+            sync_state = torch.tensor(
+                [1 if has_local_batch else 0, 1],
+                device=self.device,
+                dtype=torch.int64,
+            )
+            sync_state = ddp_all_reduce_sum(sync_state)
+            active_ranks = int(sync_state[0].item())
+            world_size = int(sync_state[1].item())
+
+            if active_ranks == 0:
+                return
+
+            if first_iteration and active_ranks != world_size:
+                raise RuntimeError(
+                    "At least one DDP rank has no initial training batch; "
+                    "training requires every rank to start with data"
+                )
+            first_iteration = False
+
+            if has_local_batch:
+                if batch is None:
+                    raise RuntimeError("Training iterator lost a local batch")
+                yield batch, True
+            else:
+                if dummy_batch is None:
+                    raise RuntimeError(
+                        "Cannot construct a synchronized dummy batch before "
+                        "receiving a real training batch"
+                    )
+                yield dummy_batch, False
+
+    def _batch_step(self, batch: Batch, train: bool = True) -> Dict[str, Any]:
         """Steps through a batch to train and optimize the model."""
         # ensure we grab mask when applicable
         if len(batch) == 2:
@@ -140,23 +244,49 @@ class Trainer:
             if mask.shape != y.shape:
                 raise ValueError(
                     f"Expected mask shape {tuple(y.shape)}, got {tuple(mask.shape)}")
-            denom = mask.float().sum()
-            if denom.item() == 0.0:
-                loss = loss_raw.sum() * 0.0
-                # if train:
-                #     return {"loss": 0.0, "n": 0}
-            else:
-                loss = (loss_raw * mask.float()).sum() / denom
+            mask_float = mask.float()
+            loss_num = (loss_raw * mask_float).sum()
+            n_tensor = mask_float.sum()
         else:
-            loss = loss_raw.mean()
+            loss_num = loss_raw.sum()
+            n_tensor = loss_raw.new_tensor(y.numel())
+
+        if n_tensor.item() == 0.0:
+            loss = loss_num * 0.0
+        else:
+            loss = loss_num / n_tensor
+
+        n = int(n_tensor.item())
 
         # optimize model in training batch
         if train:
             self.optimizer.zero_grad(set_to_none=True)
-            loss.backward()
+            # keep DDP ranks aligned before deciding whether to skip backward
+            step_stats = ddp_all_reduce_sum(torch.stack((
+                n_tensor.detach().to(dtype=torch.float64),
+                torch.ones((), device=y.device, dtype=torch.float64)
+            )))
+            global_valid_count = int(step_stats[0].item())
+            # complete DDP's backward sequence without advancing Adam when the
+            # entire synchronized step contains no valid residues
+            if global_valid_count == 0:
+                (loss_num * 0.0).backward()
+                return {
+                    "loss": float(loss.item()),
+                    "n": n,
+                    "global_valid_count": 0,
+                    "optimizer_step": False
+                }
+            train_loss = loss_num * (
+                step_stats[1] / step_stats[0]).to(dtype=loss_num.dtype)
+            train_loss.backward()
             self.optimizer.step()
-            n = int(mask.sum().item() if mask is not None else int(y.numel()))
-            return {"loss": float(loss.item()), "n": n}
+            return {
+                "loss": float(loss.item()),
+                "n": n,
+                "global_valid_count": global_valid_count,
+                "optimizer_step": True
+            }
 
         probs = torch.sigmoid(logits)  # (B, L)
         y_flat = y.to(torch.long).view(-1)
@@ -197,18 +327,32 @@ class Trainer:
         total_samples = 0
         total_pos = 0
         total_neg = 0
+        synchronized_steps = 0
+        optimizer_steps = 0
+        zero_valid_steps = 0
+        real_batches = 0
+        dummy_batches = 0
 
         all_y: List[torch.Tensor] = []
         all_probs: List[torch.Tensor] = []
 
+        if train:
+            batches = self._synchronized_training_batches(loader)
+        else:
+            batches = ((batch, True) for batch in loader)
+
         # use inference mode for eval
         torch_ctx = torch.enable_grad() if train else torch.inference_mode()
-        loop_ctx = self.model.join() if train and hasattr(
-            self.model, "join") else contextlib.nullcontext()
-        with loop_ctx:
-            for batch in loader:
-                with torch_ctx:
-                    out = self._batch_step(batch, train=train)
+        with torch_ctx:
+            for batch, is_real_batch in batches:
+                out = self._batch_step(batch, train=train)
+
+                if train:
+                    synchronized_steps += 1
+                    real_batches += int(is_real_batch)
+                    dummy_batches += int(not is_real_batch)
+                    optimizer_steps += int(out["optimizer_step"])
+                    zero_valid_steps += int(out["global_valid_count"] == 0)
 
                 # collect data for metrics
                 if not train and out["n"] > 0:
@@ -259,6 +403,47 @@ class Trainer:
         total_pos = int(pos_sum.item())
         total_neg = int(neg_sum.item())
 
+        sync_summary = None
+        if train:
+            local_sync_stats = torch.tensor(
+                [real_batches, dummy_batches],
+                device=self.device,
+                dtype=torch.int64
+            )
+            gathered_sync_stats, sync_sizes = ddp_gather_all_1d(
+                local_sync_stats, self.device)
+            if ddp_rank() == 0:
+                per_rank = []
+                for rank_index, size in enumerate(sync_sizes):
+                    if size != 2:
+                        raise RuntimeError(
+                            "Expected two training synchronization counters "
+                            f"from rank {rank_index}, got {size}"
+                        )
+                    rank_stats = gathered_sync_stats[rank_index][:size]
+                    per_rank.append({
+                        "rank": int(rank_index),
+                        "real_batches": int(rank_stats[0].item()),
+                        "dummy_batches": int(rank_stats[1].item())
+                    })
+
+                total_dummy_batches = sum(
+                    entry["dummy_batches"] for entry in per_rank)
+                total_rank_steps = synchronized_steps * len(per_rank)
+                sync_summary = {
+                    "synchronized_steps": int(synchronized_steps),
+                    "optimizer_steps": int(optimizer_steps),
+                    "zero_valid_steps": int(zero_valid_steps),
+                    "dummy_batch_fraction": (
+                        float(total_dummy_batches / total_rank_steps)
+                        if total_rank_steps > 0
+                        else 0.0
+                    ),
+                    "per_rank": per_rank
+                }
+                self.logger.info(
+                    "train_sync_summary", extra={"extra": sync_summary})
+
         # compute eval metrics
         cm = None
         eval_metrics = None
@@ -308,14 +493,37 @@ class Trainer:
                         "auc10": float("nan"),
                         "pr_auc": float("nan"),
                         "threshold": float("nan"),
+                        "threshold_policy": str(self.config.threshold_policy),
                         "threshold_status": "no_valid_residues",
-                        "threshold_min_precision": 0.25
+                        "threshold_min_precision": float(self.config.threshold_min_precision),
+                        "threshold_min_recall": float(self.config.threshold_min_recall),
+                        "threshold_fixed_value": float(self.config.threshold_fixed_value),
+                        "threshold_precision": float("nan"),
+                        "threshold_recall": float("nan"),
+                        "threshold_f1": float("nan"),
+                        "threshold_mcc": float("nan"),
+                        "threshold_tp": 0,
+                        "threshold_fp": 0,
+                        "threshold_tn": 0,
+                        "threshold_fn": 0,
+                        "threshold_support_pos": 0,
+                        "threshold_support_neg": 0,
+                        "threshold_pred_pos_residues": 0,
+                        "threshold_pred_neg_residues": 0,
+                        "threshold_pred_pos_frac": float("nan"),
+                        "threshold_grid": []
                     }
                     avg_acc = float("nan")
                 else:
                     # compute predictions at most optimal threshold calculated
-                    thresh_out = find_threshold_max_recall_min_precision(
-                        y_true, y_prob, min_precision=0.25)
+                    thresh_out = select_threshold(
+                        y_true,
+                        y_prob,
+                        policy=self.config.threshold_policy,
+                        min_precision=self.config.threshold_min_precision,
+                        min_recall=self.config.threshold_min_recall,
+                        fixed_threshold=self.config.threshold_fixed_value
+                    )
                     best_thresh = float(thresh_out["threshold"])
                     y_pred = (y_prob >= best_thresh).astype(np.int64)
 
@@ -332,8 +540,31 @@ class Trainer:
 
                     eval_metrics = compute_eval_metrics(y_true, y_pred, y_prob)
                     eval_metrics["threshold"] = best_thresh
+                    eval_metrics["threshold_policy"] = thresh_out["policy"]
                     eval_metrics["threshold_status"] = thresh_out["status"]
                     eval_metrics["threshold_min_precision"] = thresh_out["min_precision"]
+                    eval_metrics["threshold_min_recall"] = thresh_out["min_recall"]
+                    eval_metrics["threshold_fixed_value"] = thresh_out["fixed_threshold"]
+                    eval_metrics["threshold_precision"] = thresh_out["precision"]
+                    eval_metrics["threshold_recall"] = thresh_out["recall"]
+                    eval_metrics["threshold_f1"] = thresh_out["f1"]
+                    eval_metrics["threshold_mcc"] = thresh_out["mcc"]
+                    eval_metrics["threshold_tp"] = int(thresh_out["tp"])
+                    eval_metrics["threshold_fp"] = int(thresh_out["fp"])
+                    eval_metrics["threshold_tn"] = int(thresh_out["tn"])
+                    eval_metrics["threshold_fn"] = int(thresh_out["fn"])
+                    eval_metrics["threshold_support_pos"] = int(
+                        thresh_out["support_pos"])
+                    eval_metrics["threshold_support_neg"] = int(
+                        thresh_out["support_neg"])
+                    eval_metrics["threshold_pred_pos_residues"] = int(
+                        thresh_out["pred_pos"])
+                    eval_metrics["threshold_pred_neg_residues"] = int(
+                        thresh_out["pred_neg"])
+                    eval_metrics["threshold_pred_pos_frac"] = float(
+                        thresh_out["pred_pos_frac"])
+                    eval_metrics["threshold_grid"] = list(
+                        threshold_diagnostic_grid(y_true, y_prob))
 
         # log confusion matrix
         if (not train and cm is not None
@@ -351,8 +582,12 @@ class Trainer:
                                  "balanced_acc": balanced_acc,
                                  "per_class_acc": per_class_acc.tolist(),
                                  "threshold": eval_metrics["threshold"],
+                                 "threshold_policy": eval_metrics["threshold_policy"],
                                  "threshold_status": eval_metrics["threshold_status"],
                                  "threshold_min_precision": eval_metrics["threshold_min_precision"],
+                                 "threshold_min_recall": eval_metrics["threshold_min_recall"],
+                                 "threshold_fixed_value": eval_metrics["threshold_fixed_value"],
+                                 "threshold_pred_pos_frac": eval_metrics["threshold_pred_pos_frac"],
                                  "precision": eval_metrics["precision"],
                                  "recall": eval_metrics["recall"],
                                  "f1": eval_metrics["f1"],
@@ -365,7 +600,16 @@ class Trainer:
         # handle training vs eval output
         out = {"loss": avg_loss, "n_residues": total_samples,
                "pos_residues": total_pos, "neg_residues": total_neg}
-        if not train:
+        if train:
+            out.update({
+                "synchronized_steps": int(synchronized_steps),
+                "optimizer_steps": int(optimizer_steps),
+                "zero_valid_steps": int(zero_valid_steps),
+                "real_batches": int(real_batches),
+                "dummy_batches": int(dummy_batches),
+                "sync_summary": sync_summary
+            })
+        else:
             out["acc"] = avg_acc
             out["eval_metrics"] = eval_metrics
             if capture_eval_arrays and ddp_rank() == 0:
@@ -551,6 +795,11 @@ class Trainer:
                  "optim_state_dict": self.optimizer.state_dict(),
                  "epoch": epoch,
                  "config": self.config.__dict__,
+                 "model_config": (
+                     model_config_to_dict(self.model_config)
+                     if self.model_config is not None
+                     else None
+                 ),
                  "best_loss": loss,
                  "metrics": metrics}
         torch.save(state, path)

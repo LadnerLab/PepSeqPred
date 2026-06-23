@@ -26,6 +26,7 @@ usage() {
     echo "  N_FOLDS               default: 1 (1=single holdout, >1=K-fold ensemble)"
     echo "  SPLIT_SEEDS           default: 11,22,33,44,55"
     echo "  TRAIN_SEEDS           default: 101,202,303,404,505"
+    echo "  SUBSET                default: 0 (all proteins)"
     echo "  SPLIT_STRATEGY        default: size-balanced"
     echo "  SPLIT_REPORT_JSON     default: unset (<save-path>/split_report.json)"
     echo "  THRESHOLD_POLICY      default: max-recall-min-precision"
@@ -81,6 +82,7 @@ SPLIT_SEEDS="${SPLIT_SEEDS:-11,22,33,44,55}"
 TRAIN_SEEDS="${TRAIN_SEEDS:-101,202,303,404,505}"
 SPLIT_STRATEGY="${SPLIT_STRATEGY:-size-balanced}"
 SPLIT_REPORT_JSON="${SPLIT_REPORT_JSON:-}"
+SUBSET="${SUBSET:-0}"
 N_FOLDS="${N_FOLDS:-1}"
 BATCH_SIZE="${BATCH_SIZE:-64}" # ensure you account for number of GPUs (ex. 64 * 4 GPUs = 256 total batch size)
 LR="${LR:-0.001}"
@@ -165,6 +167,7 @@ ${LAUNCHER} torchrun --nproc_per_node=4 train.pyz \
     --threshold-min-recall "$THRESHOLD_MIN_RECALL" \
     --threshold-fixed-value "$THRESHOLD_FIXED_VALUE" \
     --val-frac "$VAL_FRAC" \
+    --subset "$SUBSET" \
     --split-type "$SPLIT_TYPE" \
     --split-strategy "$SPLIT_STRATEGY" \
     "${SPLIT_REPORT_ARGS[@]}" \

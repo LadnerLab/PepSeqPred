@@ -55,7 +55,7 @@ There is currently no dedicated "multi-source merge" CLI, and the datasets remai
 2. Row-concatenate all `prepared_labels_metadata.tsv` files.
 3. Row-concatenate all `prepared_embedding_metadata.tsv` files, then de-duplicate on `["Name", "Family"]`.
 
-That is the behavior exercised in `tests/integration/test_prepare_dataset_multisource_pipeline.py` and is used to form shared inputs for embedding, label generation, and training. However, generating both embeddings and labels can be done separately, and training can be done by passing in all dataset files as outlined [here](../README.md#stage-4-train-ffnn).
+That is the behavior exercised in `tests/integration/test_prepare_dataset_multisource_pipeline.py` and is used to form shared inputs for embedding, label generation, and training. However, generating both embeddings and labels can be done separately, and training can be done by passing in all dataset files as outlined [here](../README.md#stage-4-train-model-head).
 
 ## 3) How training/validation partitioning is done
 
@@ -74,29 +74,37 @@ So split candidates are only proteins that exist in both embeddings and labels.
   - `__missing_family__:<protein_id>`
 - Global split then uses grouped split functions so a family/group cannot appear in both train and validation.
 
-### Seeded mode (`--train-mode seeded`)
+### Holdout mode (`--n-folds 1`)
 
 - Uses `split_ids_grouped(ids, val_frac, split_seed, family_groups)`.
 - Target val size is `floor(len(ids) * val_frac)`, but exact fraction can differ because whole groups move together.
 - A leakage check is run after splitting and raises if any family overlaps.
 
-### Ensemble-kfold mode (`--train-mode ensemble-kfold`)
+### K-fold ensemble mode (`--n-folds K`, where `K > 1`)
 
 - `--val-frac` is ignored.
 - Uses grouped k-fold (`build_grouped_kfold_splits`) when `split_type=id-family`.
 - Groups/families are assigned to folds intact, then each fold is one validation set.
 - Leakage check is run per fold.
 
-### 3.3 `split_type=id`
+### 3.3 Split strategy
+
+The default `--split-strategy size-balanced` assigns groups primarily to balance split/fold protein counts while preserving group integrity.
+
+The opt-in `--split-strategy label-stratified` still keeps groups intact, but uses per-protein valid/positive/negative residue support to balance label support and positive rates across holdout or K-fold validation assignments.
+
+Both `pepseqpred-train` and `pepseqpred-train-optuna` write a split report JSON by default to `<save-path>/split_report.json` unless `--split-report-json` is supplied. The report includes per-run train/validation protein counts, valid residue counts, positive/negative residue counts, positive rates, family counts, and label-shard counts. Pathogen/source metadata is not currently available in the report.
+
+### 3.4 `split_type=id`
 
 - No family grouping; IDs are split directly.
-- Seeded mode uses `split_ids`:
+- Holdout mode (`--n-folds 1`) uses `split_ids`:
   - shuffle IDs with `split_seed`
   - validation = first `floor(N * val_frac)` IDs
   - training = remaining IDs
-- Ensemble-kfold mode uses plain `build_kfold_splits`.
+- K-fold ensemble mode (`--n-folds K`, where `K > 1`) uses plain `build_kfold_splits`.
 
-### 3.4 DDP rank partitioning after global train/val split
+### 3.5 DDP rank partitioning after global train/val split
 
 For multi-rank training, each run's already-determined global train/val ID lists are partitioned across ranks using `partition_ids_weighted`:
 
@@ -121,8 +129,8 @@ There are two connected pieces:
 
 2. Train time (`pepseqpred-train`)
    - If `--pos-weight` is provided, that value is used directly.
-   - Otherwise it reads `class_stats` from all provided label shards and recomputes:
-     - `total_neg / max(1, total_pos)`
+   - Otherwise it counts valid positive and negative residues from the current run's training loader after split planning and DDP rank partitioning, then computes:
+     - `train_neg / max(1, train_pos)`
    - That scalar is passed to `BCEWithLogitsLoss(pos_weight=...)`.
 
-Note: automatic train-time `pos_weight` uses shard-level totals, not run-specific train-only IDs.
+The same train-split automatic behavior is used by `pepseqpred-train-optuna` when `--pos-weight` is omitted. The helper that reads `class_stats` from full label shards remains available for backwards-compatible utility use, but it is not the default train-time resolution path.

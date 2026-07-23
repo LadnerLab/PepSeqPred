@@ -250,9 +250,17 @@ pepseqpred-labels \
 - `--n-folds 1`: one holdout run per split/train seed pair (uses `--val-frac`)
 - `--n-folds K` (`K > 1`): K-fold members per split/train seed pair set
 - `--split-seeds` and `--train-seeds` are paired by index; if both are omitted, both default to `--seed`
+- `--split-strategy size-balanced` is the default; `--split-strategy label-stratified` keeps `id-family` groups intact while also balancing valid/positive/negative residue support
+- `--split-report-json` defaults to `<save-path>/split_report.json` and records per-run train/validation protein counts, residue counts, positive rates, family counts, and label-shard counts
+- `--threshold-policy` controls validation-threshold selection (`max-recall-min-precision`, `best-f1`, `best-mcc`, `min-recall-max-precision`, or `fixed`)
 - `--model-head ffnn` is the default and preserves existing dense-head behavior
 - `--model-head conv1d` adds a local Conv1d feature stack before the dense residue classifier
 - `--seq-len-feature {none,raw,inverse}` records whether embeddings include an appended sequence-length feature; use the same mode used during embedding generation
+
+Positive class weighting:
+
+- If `--pos-weight` is provided, that manual scalar is used.
+- If `--pos-weight` is omitted, `pepseqpred-train` computes `negative / positive` from the current run's training loader after split planning and DDP rank partitioning.
 
 **Core modules**
 
@@ -321,12 +329,15 @@ sbatch train.sh "${EMB_DIRS[@]}" -- "${LABEL_SHARDS[@]}"
 Notes:
 
 - Keep `SPLIT_TYPE=id-family` for family-aware leakage control across PV1/CWP/BKP.
+- Use `SPLIT_STRATEGY=label-stratified` when you want the grouped split assignment to balance residue-label support as well as group integrity.
+- Leave `POS_WEIGHT` unset to use train-split automatic class weighting; set it only for an explicit manual override.
 - Protein IDs should be globally unique across all provided label shards/embedding dirs.
 
 **Outputs**
 
 - run checkpoint(s), usually `fully_connected.pt`
 - per-run CSV (`runs.csv` or `multi_run_results.csv`)
+- split report JSON (`split_report.json` by default)
 - aggregate `multi_run_summary.json`
 - ensemble manifest JSON when `--n-folds > 1`
 
@@ -381,8 +392,9 @@ Architecture shaping behavior:
 
 Not tuned by Optuna in the current setup:
 
-- `pos_weight` (fixed for the study via `--pos-weight`, or computed once from label shards if omitted)
-- split strategy and validation fraction (`--split-type`, `--val-frac`)
+- `pos_weight` (fixed for the study via `--pos-weight`, or computed once from the selected training split if omitted)
+- split strategy and validation fraction (`--split-type`, `--split-strategy`, `--val-frac`)
+- threshold policy settings (`--threshold-policy`, `--threshold-min-precision`, `--threshold-min-recall`, `--threshold-fixed-value`)
 - sequence windowing (`--window-size`, `--stride`) and data-loader behavior
 - sequence-length feature mode (`--seq-len-feature`; defaults to `none`)
 - trial budget/pruning controls (`--n-trials`, `--epochs`, `--pruner-warmup`, `--timeout-s`)

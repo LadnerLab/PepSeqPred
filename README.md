@@ -17,6 +17,7 @@
 This README is the developer-facing reference for the full PepSeqPred training and evaluation pipeline.
 
 For lightweight inference usage and API quickstart, use [README.pypi.md](README.pypi.md).
+For first-day developer and researcher orientation, use [docs/ONBOARDING.md](docs/ONBOARDING.md).
 
 ## Scope
 
@@ -62,7 +63,7 @@ Stage 7  evaluate residue metrics (+ optional Cocci peptide compare)
 
 ### Stage 1: Multi-Dataset Prepare (PV1/CWP/BKP)
 
-***Note:** [`data/sample/`](data/sample/) contains the expected dataset sample formats.  
+**Note:** [`data/sample/`](data/sample/) contains the expected dataset sample formats.
 
 **CLI:** `pepseqpred-prepare-dataset` (`src/pepseqpred/apps/prepare_dataset_cli.py`)
 
@@ -574,7 +575,7 @@ These wrappers are production-facing interfaces and should be treated as first-c
 
 - `evaluateffnn.sh` orchestrates prepare, embed, labels, predict, eval, and peptide compare stages with stage toggles (`RUN_PREP`, `RUN_EMBED`, `RUN_LABELS`, `RUN_PREDICT`, `RUN_EVAL`, `RUN_COMPARE`).
 - `evaluateffnn.sh` and `evalffnnsweep.sh` depend on `scripts/tools/cocci_eval_pipeline.py`.
-- HPC wrappers expect `.pyz` runtime artifacts in the working directory (for example `esm.pyz`, `train.pyz`, `predict.pyz`).
+- HPC wrappers expect fixed-name `.pyz` runtime artifacts in the working directory (for example `esm.pyz`, `labels.pyz`, `train.pyz`, `train_optuna.pyz`, `predict.pyz`, and `evaluate_ffnn.pyz`).
 
 ## Zipapp and Tooling (`scripts/tools`)
 
@@ -592,6 +593,10 @@ python scripts/tools/buildpyz.py --list
 python scripts/tools/buildpyz.py esm
 python scripts/tools/buildpyz.py all
 ```
+
+Current zipapp targets are `esm`, `evaluate_ffnn`, `labels`, `predict`, `preprocess`, `train`, and `train_optuna`. `pepseqpred-prepare-dataset` is available as an installed console script/module, but it is not currently a `buildpyz.py` target.
+
+`buildpyz.py` writes revisioned archives such as `esm_<gitrev>.pyz` and, by default, an `esm_latest.pyz` copy. For HPC wrapper use, deploy the needed archive under the fixed filename expected by the shell script, such as `esm.pyz`.
 
 ## Testing Map
 
